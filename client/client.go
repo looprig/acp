@@ -184,7 +184,10 @@ func (c *Client) spawnAndConnect(ctx context.Context) error {
 // negotiation and handshake logic is exercised identically by both. On
 // success it stores proc/conn/agent/initRes and starts watchDeath; on
 // failure it tears down whatever it started (never leaking the conn or the
-// process) and returns the error untouched.
+// process) and returns a typed error (wrapConnError: a peer that dies
+// before, during, or right after answering "initialize" surfaces here as a
+// *protocol.ConnClosedError, normalized to *ClosedError like every other
+// Client method's connection-loss error).
 func (c *Client) finishConnect(ctx context.Context, proc *stdio.Proc, r io.Reader, w io.Writer) error {
 	conn := protocol.NewConn(r, w, protocol.ConnOptions{})
 	c.registerClientHandlers(conn)
@@ -196,7 +199,7 @@ func (c *Client) finishConnect(ctx context.Context, proc *stdio.Proc, r io.Reade
 		if proc != nil {
 			_ = proc.Kill()
 		}
-		return err
+		return wrapConnError(err)
 	}
 
 	c.mu.Lock()
