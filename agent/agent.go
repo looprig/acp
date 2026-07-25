@@ -102,6 +102,10 @@ type Agent struct {
 	// Harness session UUID (see session.go's resolveSession and
 	// handleSessionNew, and registry.go's sessionRegistry).
 	sessions *sessionRegistry
+
+	// prompts enforces "at most one session/prompt in flight per ACP
+	// session" (see prompt.go's promptTracker).
+	prompts *promptTracker
 }
 
 // New validates opts and constructs the facade.
@@ -122,21 +126,26 @@ func New(opts Options) (*Agent, error) {
 		authenticated: opts.Authenticator == nil,
 		clientCaps:    protocol.DefaultClientCapabilities(),
 		sessions:      newSessionRegistry(MaxLiveSessions),
+		prompts:       newPromptTracker(),
 	}, nil
 }
 
 // Register binds the facade's currently implemented handlers onto conn:
-// initialize and session/new unconditionally (every product-facing agent
-// needs Options.Host, so session/new has no capability gate of its own —
-// only the AuthorizeSessionCreation gate it consults internally), and
+// initialize, session/new, session/prompt, and session/cancel
+// unconditionally (every product-facing agent needs Options.Host, so none of
+// these have a capability gate of their own — session/new and session/prompt
+// each consult AuthorizeSessionCreation/resolveSession internally), and
 // authenticate/logout only when their backing Options field is supplied.
-// Every other ACP method (session/prompt and later) is intentionally left
-// unregistered here — Conn's own method-not-found fallback rejects them (see
-// conn.go's dispatchRequest) until a later task wires them up, which is
-// exactly the fail-closed behavior an unadvertised capability must have.
+// Every other ACP method (session/load, session/close, and later) is
+// intentionally left unregistered here — Conn's own method-not-found
+// fallback rejects them (see conn.go's dispatchRequest) until a later task
+// wires them up, which is exactly the fail-closed behavior an unadvertised
+// capability must have.
 func (a *Agent) Register(conn *protocol.Conn) {
 	conn.Handle(string(protocol.MethodInitialize), a.handleInitialize)
 	conn.Handle(string(protocol.MethodSessionNew), a.handleSessionNew)
+	conn.Handle(string(protocol.MethodSessionPrompt), a.handlePrompt)
+	conn.HandleNotify(string(protocol.MethodSessionCancel), a.handleSessionCancel)
 	if a.opts.Authenticator != nil {
 		conn.Handle(string(protocol.MethodAuthenticate), a.handleAuthenticate)
 	}
