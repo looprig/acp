@@ -106,6 +106,14 @@ type Agent struct {
 	// prompts enforces "at most one session/prompt in flight per ACP
 	// session" (see prompt.go's promptTracker).
 	prompts *promptTracker
+
+	// client is the agent-calls-client method surface bound to the same Conn
+	// Register was given. handlePrompt's drain loop (prompt.go) uses it to
+	// send session/update notifications for the live events it observes on
+	// the way to a turn's terminal (see translate.go's liveTranslator). It is
+	// nil until Register runs, which happens before any wire traffic can
+	// reach a handler.
+	client *protocol.ClientConn
 }
 
 // New validates opts and constructs the facade.
@@ -142,6 +150,7 @@ func New(opts Options) (*Agent, error) {
 // wires them up, which is exactly the fail-closed behavior an unadvertised
 // capability must have.
 func (a *Agent) Register(conn *protocol.Conn) {
+	a.client = protocol.NewClientConn(conn)
 	conn.Handle(string(protocol.MethodInitialize), a.handleInitialize)
 	conn.Handle(string(protocol.MethodSessionNew), a.handleSessionNew)
 	conn.Handle(string(protocol.MethodSessionPrompt), a.handlePrompt)

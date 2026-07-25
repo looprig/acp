@@ -2,6 +2,7 @@ package agent_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -813,6 +814,151 @@ func TestHandlePromptSubmitErrorReleasesInFlightTracker(t *testing.T) {
 	case <-done:
 	case <-time.After(testTimeout):
 		t.Fatal("timed out waiting for second Prompt to return")
+	}
+}
+
+// --- Behavior 6: live progress events are actually streamed to the client
+// (Task 2.5's wiring of translate.go into the drain loop) --------------------
+
+// TestHandlePromptStreamsLiveUpdatesOverTheWire is the integration-style
+// check the task calls for: a real session/prompt drain, over a real
+// piped protocol.Conn, must actually emit session/update notifications the
+// client can observe on the wire — not just translate events correctly in
+// isolation (translate_test.go already covers that unit by unit). It sends
+// one TokenDelta, one ToolCallStarted, and one ToolCallCompleted from the
+// correlated loop/turn, plus one decoy TokenDelta from a different loop
+// (which must never surface as a client-visible update), before the
+// terminal, and asserts the client received exactly the three real updates
+// in order with the correct sessionId and a stamped _meta.
+func TestHandlePromptStreamsLiveUpdatesOverTheWire(t *testing.T) {
+	fake := newFakeLiveSession(t)
+	host := &promptHostStub{session: fake}
+	a, err := agent.New(agent.Options{Host: host})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	updates := make(chan protocol.SessionNotification, 8)
+	client.HandleNotify(string(protocol.MethodSessionUpdate), func(_ context.Context, _ string, params json.RawMessage) {
+		var n protocol.SessionNotification
+		if err := json.Unmarshal(params, &n); err != nil {
+			t.Errorf("unmarshal session/update notification: %v", err)
+			return
+		}
+		updates <- n
+	})
+
+	resp, err := agentConn.NewSession(context.Background(), protocol.NewSessionRequest{Cwd: "/workspace"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	sessionID := resp.SessionID
+
+	type result struct {
+		resp *protocol.PromptResponse
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := agentConn.Prompt(context.Background(), protocol.PromptRequest{
+			SessionID: sessionID,
+			Prompt:    textPrompt("hello"),
+		})
+		done <- result{resp, err}
+	}()
+
+	cmdID := awaitSubmittedCommandID(t, fake)
+	sessUUID, err := coreuuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	loopID, err := coreuuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	turnID, err := coreuuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	hdr := turnHeader(sessUUID, loopID, turnID, cmdID)
+	send(t, fake.events, event.TurnStarted{Header: hdr})
+
+	// Decoy: Ephemeral traffic from a completely different loop, arriving
+	// after correlation, must never surface as a session/update.
+	decoyLoop, err := coreuuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	send(t, fake.events, event.TokenDelta{
+		Header: turnHeader(sessUUID, decoyLoop, turnID, cmdID),
+		Chunk:  &content.TextChunk{Text: "decoy, must never surface"},
+	})
+
+	toolExecID, err := coreuuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	send(t, fake.events, event.TokenDelta{Header: hdr, Chunk: &content.TextChunk{Text: "hi there"}})
+	send(t, fake.events, event.ToolCallStarted{Header: hdr, ToolExecutionID: toolExecID, ToolName: "bash", Summary: "listing files"})
+	send(t, fake.events, event.ToolCallCompleted{Header: hdr, ToolExecutionID: toolExecID, ResultPreview: "a.txt\nb.txt"})
+	send(t, fake.events, event.TurnDone{Header: hdr})
+
+	wantSessionID := sessionID
+	assertUpdate := func(want string) protocol.SessionNotification {
+		t.Helper()
+		select {
+		case n := <-updates:
+			if n.SessionID != wantSessionID {
+				t.Errorf("SessionID = %q, want %q", n.SessionID, wantSessionID)
+			}
+			if len(n.Meta) == 0 {
+				t.Error("_meta was not stamped on the wire notification")
+			}
+			switch want {
+			case "agent_message_chunk":
+				if n.Update.AgentMessageChunk == nil {
+					t.Errorf("update = %+v, want agent_message_chunk", n.Update)
+				}
+			case "tool_call":
+				if n.Update.ToolCall == nil {
+					t.Errorf("update = %+v, want tool_call", n.Update)
+				}
+			case "tool_call_update":
+				if n.Update.ToolCallUpdate == nil {
+					t.Errorf("update = %+v, want tool_call_update", n.Update)
+				}
+			}
+			return n
+		case <-time.After(testTimeout):
+			t.Fatalf("timed out waiting for a %s session/update notification", want)
+			return protocol.SessionNotification{}
+		}
+	}
+
+	assertUpdate("agent_message_chunk")
+	assertUpdate("tool_call")
+	assertUpdate("tool_call_update")
+
+	// No fourth update (in particular, not the decoy) must ever arrive.
+	select {
+	case n := <-updates:
+		t.Fatalf("unexpected extra session/update notification: %+v", n)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Prompt: unexpected error: %v", r.err)
+		}
+		if r.resp.StopReason != protocol.StopReasonEndTurn {
+			t.Errorf("StopReason = %v, want %v", r.resp.StopReason, protocol.StopReasonEndTurn)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for Prompt to return")
 	}
 }
 

@@ -129,11 +129,17 @@ func (a *Agent) handlePrompt(ctx context.Context, _ string, params json.RawMessa
 	// Phase 1: subscribe BEFORE submitting. The correlated loop is not known
 	// yet (it is only learned from TurnStarted, below), so this asks for
 	// every loop's Enduring events — TurnStarted/TurnDone/TurnFailed/
-	// TurnInterrupted are all Enduring by construction — and none of the
-	// Ephemeral firehose (TokenDelta, tool progress), which this correlation
-	// engine has no use for.
+	// TurnInterrupted are all Enduring by construction — for correlation, AND
+	// every loop's Ephemeral firehose (TokenDelta, tool progress) so the live
+	// translator (translate.go) has something to forward once correlation
+	// lands. Subscribing to Ephemeral from every loop — not just the eventual
+	// correlated one, which is not known yet — means other loops'/prompts'
+	// Ephemeral traffic is observed too until correlation happens; drainToTerminal
+	// discards it exactly like it already discards Enduring decoys, via the
+	// same post-correlation LoopID/TurnID check.
 	sub, err := live.SubscribeEvents(event.EventFilter{
-		Enduring: event.LoopScope{All: true},
+		Ephemeral: event.LoopScope{All: true},
+		Enduring:  event.LoopScope{All: true},
 	})
 	if err != nil {
 		return nil, protocol.InternalError("session/prompt: subscribe: "+err.Error(), err)
@@ -151,7 +157,17 @@ func (a *Agent) handlePrompt(ctx context.Context, _ string, params json.RawMessa
 		return nil, protocol.InternalError("session/prompt: submit: "+err.Error(), err)
 	}
 
-	return drainToTerminal(ctx, sub, cmdID)
+	return drainToTerminal(ctx, sub, cmdID, req.SessionID, a.client)
+}
+
+// liveUpdateSender is the narrow capability drainToTerminal needs to forward
+// a translated live update to the ACP client: exactly protocol.ClientConn's
+// SessionUpdate method, named here so this file depends on the capability it
+// uses rather than the concrete type (a fake in tests never needs the rest
+// of ClientConn's surface — RequestPermission, file I/O, terminals — to
+// exercise this path).
+type liveUpdateSender interface {
+	SessionUpdate(ctx context.Context, n protocol.SessionNotification) error
 }
 
 // drainToTerminal reads sub's event stream until it observes the terminal
@@ -160,9 +176,20 @@ func (a *Agent) handlePrompt(ctx context.Context, _ string, params json.RawMessa
 // (anything other than the matching TurnStarted), and — once correlation is
 // established — any event from a different loop or turn. It never returns a
 // successful response without having observed that exact terminal.
-func drainToTerminal(ctx context.Context, sub event.Subscription, cmdID uuid.UUID) (protocol.PromptResponse, error) {
+//
+// Every correlated event it observes along the way — not just the terminal
+// — is also offered to a liveTranslator (translate.go): a translatable,
+// Public event becomes a session/update notification sent through sender
+// before drainToTerminal continues (or, for a terminal event, before it
+// returns), so the client actually sees live progress rather than only the
+// eventual PromptResponse. A send failure aborts the drain with a typed
+// error: sender is a real network write, and a wedged or gone connection
+// means continuing to drain silently would misrepresent what the client
+// actually received.
+func drainToTerminal(ctx context.Context, sub event.Subscription, cmdID uuid.UUID, wireSessionID protocol.SessionID, sender liveUpdateSender) (protocol.PromptResponse, error) {
 	var loopID, turnID uuid.UUID
 	correlated := false
+	var translator *liveTranslator
 
 	for {
 		select {
@@ -187,12 +214,19 @@ func drainToTerminal(ctx context.Context, sub event.Subscription, cmdID uuid.UUI
 				loopID = ts.Header.LoopID
 				turnID = ts.Header.TurnID
 				correlated = true
+				translator = newLiveTranslator(wireSessionID, loopID, turnID, cmdID)
 				continue
 			}
 
 			hdr := ev.EventHeader()
 			if hdr.LoopID != loopID || hdr.TurnID != turnID {
 				continue // decoy: interleaved activity from another loop/turn
+			}
+
+			if n, ok := translator.Translate(ev); ok {
+				if err := sender.SessionUpdate(ctx, n); err != nil {
+					return protocol.PromptResponse{}, protocol.InternalError("session/prompt: session/update: "+err.Error(), err)
+				}
 			}
 
 			switch e := ev.(type) {
