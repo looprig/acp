@@ -21,8 +21,10 @@ build: boundary
 test: boundary
 	go test -race ./...
 
-# Task 1.9 adds protocol, transport/stdio, client, and agent to this package
-# list as their boundary/API-surface tests land.
+# internal/boundary walks the whole module's import graph (see its deps_test.go),
+# so it automatically covers acp/protocol, acp/transport/stdio, acp/client, and
+# acp/agent the moment those packages exist; nothing here needs updating when
+# they land.
 boundary: root-check vendor-check
 	go test ./internal/boundary -run 'Dependencies|Boundaries|Public|Scan'
 
@@ -74,3 +76,4 @@ secure: lint vuln
 
 fuzz:
 	@echo "Usage: go test -fuzz=FuzzXxx ./path/to/pkg -fuzztime=30s"
+	@echo "Current targets: FuzzEnvelope (./protocol), FuzzFrameReader (./protocol)"

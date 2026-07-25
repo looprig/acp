@@ -7,17 +7,41 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 )
 
+// Layering rule for this module (see acp/CLAUDE.md): acp/agent is the only
+// package that may import Harness's or Core's *public* packages, and even it
+// must not reach into their internal/ packages. Every other package in this
+// module (protocol, transport/stdio, client, and all internal/* tooling) must
+// not import Harness or Core at all, directly or transitively through another
+// local acp package. No package anywhere in the module may import
+// github.com/looprig/foreignloops.
+//
+// scanModuleBoundaries enforces this by building the local import graph from
+// source (go/parser, not go/packages or `go list`: see acp/CLAUDE.md on
+// external dependencies) and computing, for every local package directory,
+// the set of interesting external imports reachable from it — directly or
+// through any chain of local acp imports. That reachability computation is
+// what makes the guard automatically cover acp/agent and acp/client the
+// moment those packages exist: nothing here hard-codes a package list.
 type boundaryViolationKind string
 
 const (
-	boundaryRootGoFile            boundaryViolationKind = "root Go file"
-	boundaryHarnessInternalImport boundaryViolationKind = "Harness internal import"
-	harnessInternalImportRoot                           = "github.com/looprig/harness/internal"
+	boundaryRootGoFile          boundaryViolationKind = "root Go file"
+	boundaryAgentInternalImport boundaryViolationKind = "agent package importing Harness/Core internal package"
+	boundaryWireLayerImport     boundaryViolationKind = "non-agent package importing Harness or Core"
+	boundaryForeignloopsImport  boundaryViolationKind = "package importing foreignloops"
+
+	moduleImportRoot          = "github.com/looprig/acp"
+	harnessImportRoot         = "github.com/looprig/harness"
+	harnessInternalImportRoot = "github.com/looprig/harness/internal"
+	coreImportRoot            = "github.com/looprig/core"
+	coreInternalImportRoot    = "github.com/looprig/core/internal"
+	foreignloopsImportRoot    = "github.com/looprig/foreignloops"
 )
 
 type boundaryViolation struct {
@@ -45,11 +69,11 @@ import _ "github.com/looprig/harness/internal/sessionruntime"
 	}
 	if !hasBoundaryViolation(
 		violations,
-		boundaryHarnessInternalImport,
+		boundaryAgentInternalImport,
 		filepath.Join("agent", "nested", "bad.go"),
 		"github.com/looprig/harness/internal/sessionruntime",
 	) {
-		t.Errorf("violations = %#v, want nested Harness-internal import rejection", violations)
+		t.Errorf("violations = %#v, want nested agent Harness-internal import rejection", violations)
 	}
 	if len(violations) != 2 {
 		t.Errorf("len(violations) = %d, want 2: %#v", len(violations), violations)
@@ -79,20 +103,117 @@ import _ "github.com/looprig/harness/internal/sessionruntime"
 		t.Fatalf("scan synthetic module: %v", err)
 	}
 	wantFile := filepath.Join("agent", "nested", "bad_plan9_test.go")
-	if !hasBoundaryViolation(violations, boundaryHarnessInternalImport, wantFile, "github.com/looprig/harness/internal/sessionruntime") {
-		t.Errorf("violations = %#v, want inactive test Harness-internal import rejection", violations)
+	if !hasBoundaryViolation(violations, boundaryAgentInternalImport, wantFile, "github.com/looprig/harness/internal/sessionruntime") {
+		t.Errorf("violations = %#v, want inactive test agent Harness-internal import rejection", violations)
 	}
 	if len(violations) != 1 {
 		t.Errorf("len(violations) = %d, want 1: %#v", len(violations), violations)
 	}
 }
 
-// TestModuleBoundaries scans the real module tree. Today the module has no
-// packages beyond internal/boundary and internal/buildtest, so it trivially
-// finds no violations; it starts enforcing the moment protocol, transport,
-// client, or agent packages land. The finer-grained layering rule (protocol,
-// transport/stdio, and client must not import harness or core at all; only
-// agent may import harness) is a dependency-guard test added in Task 1.9.
+func TestScanModuleBoundariesAllowsAgentHarnessAndCorePublicImports(t *testing.T) {
+	root := t.TempDir()
+	writeBoundaryFixture(t, filepath.Join(root, "agent", "ok.go"), `package agent
+
+import (
+	_ "github.com/looprig/harness/pkg/foreign"
+	_ "github.com/looprig/core/content"
+)
+`)
+
+	violations, err := scanModuleBoundaries(root)
+	if err != nil {
+		t.Fatalf("scan synthetic module: %v", err)
+	}
+	if len(violations) != 0 {
+		t.Errorf("violations = %#v, want none: acp/agent may import Harness/Core public packages", violations)
+	}
+}
+
+func TestScanModuleBoundariesRejectsWireLayerHarnessOrCoreImport(t *testing.T) {
+	root := t.TempDir()
+	writeBoundaryFixture(t, filepath.Join(root, "protocol", "bad.go"), `package protocol
+
+import (
+	_ "github.com/looprig/harness/pkg/foreign"
+	_ "github.com/looprig/core/content"
+)
+`)
+
+	violations, err := scanModuleBoundaries(root)
+	if err != nil {
+		t.Fatalf("scan synthetic module: %v", err)
+	}
+	wantFile := filepath.Join("protocol", "bad.go")
+	for _, importPath := range []string{"github.com/looprig/harness/pkg/foreign", "github.com/looprig/core/content"} {
+		if !hasBoundaryViolation(violations, boundaryWireLayerImport, wantFile, importPath) {
+			t.Errorf("violations = %#v, want wire-layer rejection of %q", violations, importPath)
+		}
+	}
+	if len(violations) != 2 {
+		t.Errorf("len(violations) = %d, want 2: %#v", len(violations), violations)
+	}
+}
+
+func TestScanModuleBoundariesRejectsForeignloopsImportEverywhere(t *testing.T) {
+	root := t.TempDir()
+	writeBoundaryFixture(t, filepath.Join(root, "protocol", "bad.go"), `package protocol
+
+import _ "github.com/looprig/foreignloops/backend"
+`)
+	writeBoundaryFixture(t, filepath.Join(root, "agent", "bad.go"), `package agent
+
+import _ "github.com/looprig/foreignloops"
+`)
+
+	violations, err := scanModuleBoundaries(root)
+	if err != nil {
+		t.Fatalf("scan synthetic module: %v", err)
+	}
+	if !hasBoundaryViolation(violations, boundaryForeignloopsImport, filepath.Join("protocol", "bad.go"), "github.com/looprig/foreignloops/backend") {
+		t.Errorf("violations = %#v, want protocol foreignloops rejection", violations)
+	}
+	if !hasBoundaryViolation(violations, boundaryForeignloopsImport, filepath.Join("agent", "bad.go"), "github.com/looprig/foreignloops") {
+		t.Errorf("violations = %#v, want agent foreignloops rejection (foreignloops is banned everywhere, not just outside agent)", violations)
+	}
+	if len(violations) != 2 {
+		t.Errorf("len(violations) = %d, want 2: %#v", len(violations), violations)
+	}
+}
+
+// TestScanModuleBoundariesRejectsTransitiveHarnessThroughLocalPackage proves
+// the guard walks the local import graph rather than only inspecting direct
+// imports: "client" never mentions Harness itself, but it imports "agent",
+// which legitimately does, so client transitively depends on Harness and
+// must be rejected exactly as if it had imported Harness directly.
+func TestScanModuleBoundariesRejectsTransitiveHarnessThroughLocalPackage(t *testing.T) {
+	root := t.TempDir()
+	writeBoundaryFixture(t, filepath.Join(root, "agent", "agent.go"), `package agent
+
+import _ "github.com/looprig/harness/pkg/foreign"
+`)
+	writeBoundaryFixture(t, filepath.Join(root, "client", "bad.go"), `package client
+
+import _ "github.com/looprig/acp/agent"
+`)
+
+	violations, err := scanModuleBoundaries(root)
+	if err != nil {
+		t.Fatalf("scan synthetic module: %v", err)
+	}
+	wantFile := filepath.Join("client", "bad.go")
+	if !hasBoundaryViolation(violations, boundaryWireLayerImport, wantFile, "github.com/looprig/harness/pkg/foreign") {
+		t.Errorf("violations = %#v, want client rejected for transitively reaching Harness via acp/agent", violations)
+	}
+	if len(violations) != 1 {
+		t.Errorf("len(violations) = %d, want 1: %#v", len(violations), violations)
+	}
+}
+
+// TestModuleBoundaries scans the real module tree. It enforces every rule
+// above against whatever packages currently exist below the module root, and
+// starts enforcing against acp/agent and acp/client automatically the moment
+// those packages land — nothing here needs updating when they do.
 func TestModuleBoundaries(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
 	violations, err := scanModuleBoundaries(root)
@@ -103,16 +224,33 @@ func TestModuleBoundaries(t *testing.T) {
 		switch violation.Kind {
 		case boundaryRootGoFile:
 			t.Errorf("forbidden root-level Go file: %s", violation.File)
-		case boundaryHarnessInternalImport:
-			t.Errorf("%s imports forbidden Harness internal package %q", violation.File, violation.ImportPath)
+		case boundaryAgentInternalImport:
+			t.Errorf("%s imports forbidden Harness/Core internal package %q (acp/agent may use Harness/Core public packages, never internal)", violation.File, violation.ImportPath)
+		case boundaryWireLayerImport:
+			t.Errorf("%s imports %q, which is forbidden outside acp/agent (directly or transitively)", violation.File, violation.ImportPath)
+		case boundaryForeignloopsImport:
+			t.Errorf("%s imports forbidden package %q: no package in this module may depend on foreignloops", violation.File, violation.ImportPath)
 		default:
 			t.Errorf("unknown module-boundary violation: %#v", violation)
 		}
 	}
 }
 
+// packageImports collects, per local package directory (relative to the
+// module root, forward-slash separated), the information scanModuleBoundaries
+// needs to compute layering violations.
+type packageImports struct {
+	// directExternal maps an interesting external import path (Harness, Core,
+	// or foreignloops) to the first file in this directory that imports it.
+	directExternal map[string]string
+	// localEdges maps a local acp package directory imported from this
+	// directory to the first file that imports it.
+	localEdges map[string]string
+}
+
 func scanModuleBoundaries(root string) ([]boundaryViolation, error) {
 	var violations []boundaryViolation
+	packages := make(map[string]*packageImports)
 	fset := token.NewFileSet()
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -143,10 +281,13 @@ func scanModuleBoundaries(root string) ([]boundaryViolation, error) {
 		if err != nil {
 			return err
 		}
-		if filepath.Dir(rel) == "." {
+		dir := filepath.Dir(rel)
+		if dir == "." {
 			violations = append(violations, boundaryViolation{Kind: boundaryRootGoFile, File: rel})
 			return nil
 		}
+		dirSlash := filepath.ToSlash(dir)
+
 		parsed, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
 		if err != nil {
 			return err
@@ -156,17 +297,140 @@ func scanModuleBoundaries(root string) ([]boundaryViolation, error) {
 			if err != nil {
 				return err
 			}
-			if importPath == harnessInternalImportRoot || strings.HasPrefix(importPath, harnessInternalImportRoot+"/") {
-				violations = append(violations, boundaryViolation{
-					Kind:       boundaryHarnessInternalImport,
-					File:       rel,
-					ImportPath: importPath,
-				})
+			switch {
+			case hasImportPrefix(importPath, harnessImportRoot),
+				hasImportPrefix(importPath, coreImportRoot),
+				hasImportPrefix(importPath, foreignloopsImportRoot):
+				pkg := packages[dirSlash]
+				if pkg == nil {
+					pkg = &packageImports{directExternal: map[string]string{}, localEdges: map[string]string{}}
+					packages[dirSlash] = pkg
+				}
+				if _, seen := pkg.directExternal[importPath]; !seen {
+					pkg.directExternal[importPath] = rel
+				}
+			case hasImportPrefix(importPath, moduleImportRoot):
+				neighbor := strings.TrimPrefix(strings.TrimPrefix(importPath, moduleImportRoot), "/")
+				if neighbor == "" || neighbor == dirSlash {
+					continue
+				}
+				pkg := packages[dirSlash]
+				if pkg == nil {
+					pkg = &packageImports{directExternal: map[string]string{}, localEdges: map[string]string{}}
+					packages[dirSlash] = pkg
+				}
+				if _, seen := pkg.localEdges[neighbor]; !seen {
+					pkg.localEdges[neighbor] = rel
+				}
 			}
 		}
 		return nil
 	})
-	return violations, err
+	if err != nil {
+		return nil, err
+	}
+
+	reach := transitiveExternalImports(packages)
+	for _, dir := range sortedKeys(packages) {
+		pkg := packages[dir]
+		for _, importPath := range sortedSet(reach[dir]) {
+			kind, ok := classifyBoundaryViolation(dir, importPath)
+			if !ok {
+				continue
+			}
+			file, ok := pkg.directExternal[importPath]
+			if !ok {
+				file = firstLocalEdgeFile(pkg)
+			}
+			violations = append(violations, boundaryViolation{Kind: kind, File: file, ImportPath: importPath})
+		}
+	}
+	return violations, nil
+}
+
+// classifyBoundaryViolation decides, for a package directory and an external
+// import path reachable from it (directly or transitively), whether that
+// combination violates this module's layering rule.
+func classifyBoundaryViolation(dir, importPath string) (boundaryViolationKind, bool) {
+	if hasImportPrefix(importPath, foreignloopsImportRoot) {
+		return boundaryForeignloopsImport, true
+	}
+	if isAgentGroupDir(dir) {
+		if hasImportPrefix(importPath, harnessInternalImportRoot) || hasImportPrefix(importPath, coreInternalImportRoot) {
+			return boundaryAgentInternalImport, true
+		}
+		return "", false
+	}
+	if hasImportPrefix(importPath, harnessImportRoot) || hasImportPrefix(importPath, coreImportRoot) {
+		return boundaryWireLayerImport, true
+	}
+	return "", false
+}
+
+// transitiveExternalImports computes, for every local package directory, the
+// set of interesting external import paths reachable from it by following
+// zero or more local acp import edges. It is a fixed-point computation over
+// the (small, module-local) import graph, so it is correct even in the
+// presence of import cycles between local packages.
+func transitiveExternalImports(packages map[string]*packageImports) map[string]map[string]struct{} {
+	reach := make(map[string]map[string]struct{}, len(packages))
+	for dir, pkg := range packages {
+		set := make(map[string]struct{}, len(pkg.directExternal))
+		for importPath := range pkg.directExternal {
+			set[importPath] = struct{}{}
+		}
+		reach[dir] = set
+	}
+	for changed := true; changed; {
+		changed = false
+		for dir, pkg := range packages {
+			for neighbor := range pkg.localEdges {
+				for importPath := range reach[neighbor] {
+					if _, ok := reach[dir][importPath]; !ok {
+						reach[dir][importPath] = struct{}{}
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	return reach
+}
+
+func firstLocalEdgeFile(pkg *packageImports) string {
+	var best string
+	for _, file := range pkg.localEdges {
+		if best == "" || file < best {
+			best = file
+		}
+	}
+	return best
+}
+
+func isAgentGroupDir(dir string) bool {
+	return dir == "agent" || strings.HasPrefix(dir, "agent/")
+}
+
+func hasImportPrefix(importPath, root string) bool {
+	return importPath == root || strings.HasPrefix(importPath, root+"/")
+}
+
+func sortedKeys(packages map[string]*packageImports) []string {
+	keys := make([]string, 0, len(packages))
+	for dir := range packages {
+		keys = append(keys, dir)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedSet(set map[string]struct{}) []string {
+	values := make([]string, 0, len(set))
+	for value := range set {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	return values
 }
 
 func skipBoundaryDirectory(name string) bool {
