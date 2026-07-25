@@ -1,0 +1,235 @@
+package protocol
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"runtime"
+	"sync"
+	"testing"
+	"time"
+)
+
+// assertNoGoroutineLeakInternal mirrors conn_test.go's assertNoGoroutineLeak.
+// Duplicated (rather than shared) because this file lives in package
+// protocol (white-box) while conn_test.go lives in package protocol_test.
+func assertNoGoroutineLeakInternal(t *testing.T) {
+	t.Helper()
+	runtime.Gosched()
+	baseline := runtime.NumGoroutine()
+	t.Cleanup(func() {
+		deadline := time.Now().Add(1 * time.Second)
+		for {
+			n := runtime.NumGoroutine()
+			if n <= baseline {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("goroutine leak: NumGoroutine() = %d, want <= %d (baseline) within 1s", n, baseline)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+}
+
+// --- pending-request table ---
+
+func TestConnPendingTableTracksInFlightCalls(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	server.Handle("slow", func(ctx context.Context, method string, params json.RawMessage) (any, error) {
+		close(reached)
+		<-release
+		return "done", nil
+	})
+
+	if got := client.pendingLen(); got != 0 {
+		t.Fatalf("pendingLen() before Call = %d, want 0", got)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		var result string
+		done <- client.Call(context.Background(), "slow", nil, &result)
+	}()
+
+	<-reached
+	// The handler is now blocked server-side, which only happens after the
+	// client's Call has sent its request and registered the pending entry.
+	deadline := time.Now().Add(time.Second)
+	for client.pendingLen() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := client.pendingLen(); got != 1 {
+		t.Fatalf("pendingLen() while in-flight = %d, want 1", got)
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Call() error = %v", err)
+	}
+	if got := client.pendingLen(); got != 0 {
+		t.Fatalf("pendingLen() after completion = %d, want 0", got)
+	}
+}
+
+func TestConnCallContextCancelRemovesPendingEntry(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	server.Handle("slow", func(ctx context.Context, method string, params json.RawMessage) (any, error) {
+		close(reached)
+		<-release
+		return "done", nil
+	})
+	t.Cleanup(func() { close(release) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		var result string
+		done <- client.Call(ctx, "slow", nil, &result)
+	}()
+
+	<-reached
+	deadline := time.Now().Add(time.Second)
+	for client.pendingLen() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := client.pendingLen(); got != 1 {
+		t.Fatalf("pendingLen() before cancel = %d, want 1", got)
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("Call() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Call() never returned after ctx cancel")
+	}
+
+	deadline = time.Now().Add(time.Second)
+	for client.pendingLen() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := client.pendingLen(); got != 0 {
+		t.Fatalf("pendingLen() after cancel = %d, want 0 (leaked pending entry)", got)
+	}
+}
+
+// --- disjoint id spaces ---
+
+func TestConnDisjointIDSpacesNoCollisionUnderConcurrency(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	server.Handle("callSpace", func(ctx context.Context, method string, params json.RawMessage) (any, error) {
+		return string(params), nil
+	})
+	server.Handle("extSpace", func(ctx context.Context, method string, params json.RawMessage) (any, error) {
+		return string(params), nil
+	})
+
+	const n = 200
+	var wg sync.WaitGroup
+	callErrs := make([]error, n)
+	extErrs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var result string
+			callErrs[i] = client.Call(context.Background(), "callSpace", i, &result)
+			if result != jsonNum(i) {
+				t.Errorf("Call[%d] result = %q, want %q (cross-talk between concurrent calls)", i, result, jsonNum(i))
+			}
+		}(i)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var result string
+			extErrs[i] = client.callExt(context.Background(), "extSpace", i, &result)
+			if result != jsonNum(i) {
+				t.Errorf("callExt[%d] result = %q, want %q (cross-talk between concurrent calls)", i, result, jsonNum(i))
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range callErrs {
+		if err != nil {
+			t.Errorf("Call[%d] error = %v", i, err)
+		}
+	}
+	for i, err := range extErrs {
+		if err != nil {
+			t.Errorf("callExt[%d] error = %v", i, err)
+		}
+	}
+
+	// The two counters must have advanced independently and without any lost
+	// update (a race in the atomic increment would under-count and manifest
+	// as a duplicate minted id, which the map-keyed pending table would
+	// silently coalesce, producing exactly this kind of counter mismatch).
+	wantCallID := (int64(1) << 32) - 1 + int64(n)
+	if got := client.nextCallID.Load(); got != wantCallID {
+		t.Errorf("nextCallID = %d, want %d", got, wantCallID)
+	}
+	wantExtID := int64(n)
+	if got := client.nextExtID.Load(); got != wantExtID {
+		t.Errorf("nextExtID = %d, want %d", got, wantExtID)
+	}
+	if wantCallID <= wantExtID {
+		t.Fatalf("test setup bug: call id space (%d) does not start above ext id space (%d)", wantCallID, wantExtID)
+	}
+}
+
+func TestConnExtIDBaseOptionSetsStartingValue(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{ExtIDBase: 1000})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	server.Handle("m", func(ctx context.Context, method string, params json.RawMessage) (any, error) {
+		return "ok", nil
+	})
+
+	var result string
+	if err := client.callExt(context.Background(), "m", nil, &result); err != nil {
+		t.Fatalf("callExt() error = %v", err)
+	}
+	if got := client.nextExtID.Load(); got != 1000 {
+		t.Fatalf("nextExtID after first callExt = %d, want 1000 (ExtIDBase)", got)
+	}
+}
+
+func jsonNum(i int) string {
+	raw, _ := json.Marshal(i)
+	return string(raw)
+}
+
+// pendingLen and callExt are exercised above via direct unexported access,
+// confirming Task 1.5's white-box test hooks work as intended.
