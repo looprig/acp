@@ -47,6 +47,21 @@ import (
 	"github.com/looprig/acp/protocol"
 )
 
+// ErrUnknownConfigOption is the local cause applyConfigOption attaches to the
+// InvalidParams fault it returns when optionID names no option in the latest
+// RuntimeConfigCatalog snapshot. It never crosses the wire itself (only
+// Message/Code/Data do — see protocol.Fault) but lets a caller use errors.Is
+// to distinguish this SPECIFIC condition from any other InvalidParams fault.
+// handleSessionSetMode uses it this way: ModeConfigOptionID (host.go) is a
+// package constant, never client-supplied, so if applyConfigOption ever
+// fails with ErrUnknownConfigOption on that call path, the only possible
+// cause is a misconfigured RuntimeConfigCatalog that omits the well-known
+// "mode" option entirely — a host bug, not a client mistake — and
+// handleSessionSetMode reports that as a distinct, louder diagnostic instead
+// of silently reusing the ordinary "unknown configId" a real client would
+// get for an arbitrary bad session/set_config_option request.
+var ErrUnknownConfigOption = errors.New("agent: config option: unknown configId")
+
 // handleSessionSetConfigOption answers the session/set_config_option method.
 // It is only ever registered when both Options.ConfigCatalog and
 // Options.ConfigController are non-nil (see Register): validating a change
@@ -114,6 +129,20 @@ func (a *Agent) handleSessionSetMode(ctx context.Context, _ string, params json.
 	}
 
 	if _, err := a.applyConfigOption(ctx, sessionID, ModeConfigOptionID, protocol.SessionConfigValueID(req.ModeID)); err != nil {
+		if errors.Is(err, ErrUnknownConfigOption) {
+			// ModeConfigOptionID is a package constant, never client input:
+			// this can only mean the configured RuntimeConfigCatalog itself
+			// does not honor the documented mode<->"mode" convergence
+			// contract (see ErrUnknownConfigOption's doc and host.go's
+			// ModeConfigOptionID doc) — a host misconfiguration, not a
+			// client mistake, so it is reported distinctly rather than
+			// reusing applyConfigOption's ordinary "unknown configId"
+			// InvalidParams a bad session/set_config_option request gets.
+			return nil, protocol.InternalError(
+				`session/set_mode: host misconfiguration: RuntimeConfigCatalog does not offer the well-known "mode" config option (see ModeConfigOptionID)`,
+				err,
+			)
+		}
 		return nil, err
 	}
 	return protocol.SetSessionModeResponse{}, nil
@@ -134,7 +163,7 @@ func (a *Agent) applyConfigOption(ctx context.Context, sessionID SessionID, opti
 
 	option, ok := findRuntimeConfigOption(latest, optionID)
 	if !ok {
-		return nil, protocol.InvalidParams("config option: unknown configId", nil)
+		return nil, protocol.InvalidParams("config option: unknown configId", ErrUnknownConfigOption)
 	}
 	if !runtimeConfigOptionHasValue(option, valueID) {
 		return nil, protocol.InvalidParams("config option: unknown value for this configId", nil)

@@ -474,6 +474,66 @@ func TestHandleSessionSetConfigOptionAndSetModeNotRegisteredWithoutBothCapabilit
 	}
 }
 
+// TestHandleSessionSetModeFailsDistinctlyWhenCatalogLacksModeOption is Minor
+// 2 of the Phase 4 follow-up review: ModeConfigOptionID's convergence
+// contract ("a RuntimeConfigCatalog implementation MUST offer an option with
+// this id" — host.go) is otherwise enforced only by doc comment/test
+// convention, so a misconfigured catalog that omits it must fail LOUDLY and
+// DIAGNOSABLY — a distinct internal error, not the ordinary "unknown
+// configId" InvalidParams a real client gets for an arbitrary bad
+// session/set_config_option request. This test asserts both that
+// session/set_mode gets a different Code (InternalError, not InvalidParams)
+// AND a different Message from that ordinary client-error case, proving the
+// two are genuinely distinguishable, not just cosmetically different.
+func TestHandleSessionSetModeFailsDistinctlyWhenCatalogLacksModeOption(t *testing.T) {
+	catalog := &stubConfigCatalog{options: []agent.RuntimeConfigOption{
+		modelOption("fast", agent.RuntimeConfigValue{ID: "fast", Name: "Fast"}),
+	}}
+	controller := &stubConfigController{}
+
+	agentConn, sessionID, _ := newConfigTestAgent(t, catalog, controller)
+
+	_, err := agentConn.SetMode(context.Background(), protocol.SetSessionModeRequest{
+		SessionID: sessionID, ModeID: "plan",
+	})
+	if err == nil {
+		t.Fatal("SetMode with no \"mode\" option in the catalog: error = nil, want a distinct internal (host misconfiguration) error")
+	}
+	var f *protocol.Fault
+	if !errors.As(err, &f) {
+		t.Fatalf("error = %v (%T), want *protocol.Fault", err, err)
+	}
+	if f.Code != protocol.ErrorCodeInternalError {
+		t.Errorf("Fault.Code = %v, want %v (InternalError: a misconfigured host, not a client mistake)", f.Code, protocol.ErrorCodeInternalError)
+	}
+	if got := controller.callCount(); got != 0 {
+		t.Errorf("controller calls = %d, want 0 (must fail before ever touching the controller)", got)
+	}
+
+	// The ordinary client-error case: an arbitrary bad configId via
+	// session/set_config_option. This must stay InvalidParams, and must be
+	// genuinely distinguishable from session/set_mode's misconfiguration
+	// error above (different Code AND different Message), not merely two
+	// different strings that a client would otherwise have to sniff apart.
+	valueID := protocol.SessionConfigValueID("x")
+	_, ordinaryErr := agentConn.SetConfigOption(context.Background(), protocol.SetSessionConfigOptionRequest{
+		SessionID: sessionID, ConfigID: "nonexistent", ValueID: &valueID,
+	})
+	var ordinaryFault *protocol.Fault
+	if !errors.As(ordinaryErr, &ordinaryFault) {
+		t.Fatalf("ordinary unknown configId error = %v (%T), want *protocol.Fault", ordinaryErr, ordinaryErr)
+	}
+	if ordinaryFault.Code != protocol.ErrorCodeInvalidParams {
+		t.Fatalf("test setup sanity check: ordinary unknown configId Fault.Code = %v, want InvalidParams", ordinaryFault.Code)
+	}
+	if f.Code == ordinaryFault.Code {
+		t.Error("session/set_mode's misconfiguration error must not share the ordinary client-error Code")
+	}
+	if f.Message == ordinaryFault.Message {
+		t.Error("session/set_mode's misconfiguration error must not share the ordinary client-error Message")
+	}
+}
+
 func assertMethodNotFoundErr(t *testing.T, err error, method string) {
 	t.Helper()
 	if err == nil {
