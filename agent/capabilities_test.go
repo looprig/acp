@@ -286,6 +286,43 @@ func TestCapabilityAdvertisementMatrix(t *testing.T) {
 	}
 }
 
+// TestSessionResumeAlwaysAdvertised asserts AgentCapabilities.SessionCapabilities.Resume
+// is present even with only the always-required Host set (baseOptions,
+// nothing else configured): unlike EventReplayer/SessionCatalog/
+// SessionDeleter, resume has no separate optional Options field gating it —
+// SessionHost.ResumeSession (host.go) is a required method every SessionHost
+// implements — so a facade unconditionally advertises it and unconditionally
+// wires session/resume (agent.go's Register).
+func TestSessionResumeAlwaysAdvertised(t *testing.T) {
+	a, err := agent.New(baseOptions())
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	resp := mustInitialize(t, a, client, server)
+
+	if resp.AgentCapabilities == nil || resp.AgentCapabilities.SessionCapabilities == nil ||
+		resp.AgentCapabilities.SessionCapabilities.Resume == nil {
+		t.Fatalf("AgentCapabilities.SessionCapabilities.Resume = %+v, want non-nil with only Host configured", resp.AgentCapabilities)
+	}
+
+	agentConn := protocol.NewAgentConn(client)
+	validID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	_, err = agentConn.ResumeSession(context.Background(), protocol.ResumeSessionRequest{
+		SessionID: protocol.SessionID(validID.String()), Cwd: "/workspace",
+	})
+	// fakeHost.ResumeSession always errors; the point here is only that the
+	// method is REGISTERED (not MethodNotFound), matching the advertised
+	// capability.
+	if err == nil {
+		t.Fatal("ResumeSession: error = nil, want fakeHost's stub error")
+	}
+	var f *protocol.Fault
+	if errors.As(err, &f) && f.Code == protocol.ErrorCodeMethodNotFound {
+		t.Error("ResumeSession: MethodNotFound, want the method to be registered (resume has no capability gate)")
+	}
+}
+
 // TestNewRequiresHost asserts Options.Host is required: the facade has
 // nothing to wire session creation to without it (fail closed on missing
 // required configuration).
