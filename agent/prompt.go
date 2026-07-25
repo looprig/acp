@@ -191,6 +191,14 @@ const cancelInterruptTimeout = 30 * time.Second
 // enforces per-session serialization (promptTracker), converts the request's
 // content blocks, subscribes, submits, and drains the event stream to the
 // correlated terminal.
+//
+// When Options.Compactor is configured, it also lazily advertises
+// `/compact` (ensureAvailableCommandsAdvertised) and, when the request's
+// prompt content is exactly that literal command (isCompactSlashCommand),
+// routes to handleCompactPrompt instead of the ordinary
+// blocksFromPrompt/Submit path below — see compact.go's package doc for the
+// full contract. Any other content, including "/compact" itself when no
+// Compactor is configured, falls through unchanged.
 func (a *Agent) handlePrompt(ctx context.Context, _ string, params json.RawMessage) (any, error) {
 	var req protocol.PromptRequest
 	if err := json.Unmarshal(params, &req); err != nil {
@@ -211,6 +219,15 @@ func (a *Agent) handlePrompt(ctx context.Context, _ string, params json.RawMessa
 		return nil, protocol.InvalidRequest("session/prompt: a prompt is already in flight for this session", ErrPromptAlreadyInFlight)
 	}
 	defer a.prompts.end(sessionID)
+
+	if a.opts.Compactor != nil {
+		if err := a.ensureAvailableCommandsAdvertised(ctx, req.SessionID, sessionID); err != nil {
+			return nil, err
+		}
+		if isCompactSlashCommand(req.Prompt) {
+			return a.handleCompactPrompt(ctx, live)
+		}
+	}
 
 	blocks, err := blocksFromPrompt(req.Prompt)
 	if err != nil {

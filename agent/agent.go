@@ -129,6 +129,15 @@ type Agent struct {
 	sessionInfoMu       sync.Mutex
 	sessionInfoObserved map[SessionID]observedSessionInfo
 
+	// commandsMu guards commandsAdvertised: the set of ACP session ids that
+	// have already received an available_commands_update notification
+	// advertising `/compact` (see compact.go's ensureAvailableCommandsAdvertised).
+	// Advertisement happens lazily, at the first session/prompt call for a
+	// session, rather than eagerly at session establishment — see compact.go's
+	// package doc for why.
+	commandsMu         sync.Mutex
+	commandsAdvertised map[SessionID]struct{}
+
 	// client is the agent-calls-client method surface bound to the same Conn
 	// Register was given. handlePrompt's drain loop (prompt.go) uses it to
 	// send session/update notifications for the live events it observes on
@@ -166,6 +175,7 @@ func New(opts Options) (*Agent, error) {
 		gates:               newGateTracker(),
 		cursorKey:           cursorKey,
 		sessionInfoObserved: make(map[SessionID]observedSessionInfo),
+		commandsAdvertised:  make(map[SessionID]struct{}),
 	}, nil
 }
 
