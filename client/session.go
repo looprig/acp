@@ -9,15 +9,59 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/looprig/acp/protocol"
 )
 
 // sessionUpdateQueueHint is an initial capacity hint for a Session's
-// internal update queue slice. It bounds nothing (the queue is never
-// capped — see Session.deliver's doc) — it only avoids a few early
-// reallocations for the common case.
+// internal update queue slice. It bounds nothing by itself — it only avoids
+// a few early reallocations for the common case — the actual bound is
+// UpdateQueueDepth, enforced by deliver.
 const sessionUpdateQueueHint = 8
+
+// UpdateQueueDepth bounds how many not-yet-delivered updates a Session's
+// internal queue holds before it starts dropping the OLDEST queued update to
+// make room for the newest, mirroring protocol.Conn's NotifyBufferDepth
+// (see Conn.DroppedNotifications) for the identical bounded-buffer,
+// drop-oldest, observable-counter shape. A caller that calls Updates() and
+// drains it promptly — the expected steady state, and the shape of every
+// existing Task 5.1 test — never sees a drop: this bound only bites a
+// consumer that falls behind delivery by more than UpdateQueueDepth updates,
+// trading unbounded memory growth in a permanently-non-draining session for
+// bounded, observable loss (see Session.DroppedUpdates). The oldest entry is
+// dropped rather than the newest because a client actively draining
+// Updates() cares about catching up to CURRENT state, not preserving
+// ancient history it may never read anyway. 512 matches NotifyBufferDepth's
+// existing precedent in this module rather than inventing a new value.
+const UpdateQueueDepth = 512
+
+// EventDedupWindowDepth bounds how many distinct live _meta.eventIds a
+// Session remembers for dedup (see deliver). Harness event ids
+// (event.Header.EventID, minted by event.Factory.Stamp via
+// github.com/looprig/core/uuid.New, which reads crypto/rand) are random
+// UUIDv4 values, so the id VALUE itself carries no ordering information a
+// highwater mark could compare against.
+//
+// Delivery ORDER does, however, carry a real ordering guarantee: every
+// session/update notification for one Client is drained by
+// protocol.Conn's single notifyWorker goroutine strictly in wire order,
+// completing each job before starting the next (see Conn.notifyWorker's
+// doc), so successive calls to deliver for one session happen in true
+// chronological order even though the ids themselves are unordered. A
+// genuine duplicate (redelivery/retry) is therefore expected to reappear
+// shortly after the original, not arbitrarily far in the future — so
+// remembering only the most recently delivered EventDedupWindowDepth ids
+// (an insertion-order window; the oldest is evicted first once the window
+// is full) is enough to catch every realistic duplicate while keeping the
+// dedup map's memory bounded across a session's full, potentially
+// unbounded, lifetime. An id that reappears after it has aged out of the
+// window is (by this deliberate tradeoff) no longer recognized as a
+// duplicate and is delivered again — bounded, observable-in-principle loss
+// traded for bounded memory, exactly as UpdateQueueDepth trades update loss
+// for the same property. 512 matches UpdateQueueDepth/NotifyBufferDepth's
+// existing precedent rather than inventing a new value.
+const EventDedupWindowDepth = 512
 
 // NewSessionParams are the caller-supplied parameters for Client.NewSession.
 type NewSessionParams struct {
@@ -61,9 +105,22 @@ type Session struct {
 	cond   *sync.Cond
 	queue  []Update
 	closed bool
+	// inFlight is 1 while pump has dequeued an update and is blocked handing
+	// it to Updates() (an unbuffered channel with no guaranteed reader), 0
+	// otherwise. deliver counts it as still "resident" toward
+	// UpdateQueueDepth (see deliver's doc) so the bound is exact regardless
+	// of whether pump has had a chance to run: without this, an update
+	// pump happens to dequeue early would silently escape the cap
+	// accounting (the queue slice alone would look under-full while an
+	// extra item sat parked on pump's stack), making both the true resident
+	// count and DroppedUpdates undercount by however many times pump won
+	// that race.
+	inFlight       int
+	droppedUpdates atomic.Uint64
 
-	seenMu sync.Mutex
-	seen   map[string]struct{}
+	seenMu    sync.Mutex
+	seen      map[string]struct{}
+	seenOrder []string
 
 	promptSem chan struct{}
 }
@@ -90,35 +147,57 @@ func newSession(client *Client, id protocol.SessionID) *Session {
 // on, typed and decoded. It is ready to receive from immediately: delivery
 // begins the moment the Session is registered (at NewSession/LoadSession/
 // ResumeSession time, before the caller could possibly have called Updates()
-// yet), buffered internally by an unbounded queue (see deliver) so nothing
-// arriving before the caller starts reading is ever dropped. The channel is
-// closed once the session is closed (Client.Close, connection death, or a
-// future explicit session close) and every already-queued update has been
-// delivered.
+// yet), buffered internally by a queue (see deliver) so nothing arriving
+// before the caller starts reading is dropped, up to UpdateQueueDepth. The
+// channel is closed once the session is closed (Client.Close, connection
+// death, or a future explicit session close) and every already-queued
+// update has been delivered.
 func (s *Session) Updates() <-chan Update { return s.out }
+
+// DroppedUpdates reports how many queued session/update notifications have
+// been dropped (oldest-first) for this Session because its internal queue
+// exceeded UpdateQueueDepth — see deliver. This mirrors
+// protocol.Conn.DroppedNotifications' shape (a diagnostic counter, never a
+// silent failure with no way to observe it) and is distinct from
+// Client.DroppedUpdates: the Client-level counter tracks updates that could
+// not be routed to any session at all (unknown/unregistered sessionId),
+// while this one tracks updates that WERE routed to this exact session but
+// then evicted by its own queue bound because the consumer fell behind.
+// Zero in the expected steady state of an actively-drained session.
+func (s *Session) DroppedUpdates() uint64 { return s.droppedUpdates.Load() }
 
 // deliver routes one decoded update into the session's queue, applying
 // live-update dedup: a non-replay update whose _meta.eventId has already
-// been seen for this session is dropped (never delivered twice), while a
-// replay update (Meta.IsReplay) is exempt from dedup and always delivered —
-// per the design doc, replay reconstruction and live streaming are tracked
-// as separate concerns, and a replayed update's eventId legitimately
-// reappearing (for example, if a client independently retains a replay's
-// eventIds across a later live-observed duplicate is never expected in
-// practice) must not be silently suppressed. An update with no eventId at
-// all (Meta.EventID == "") is never deduplicated: there is nothing to key a
-// highwater check on, so it is always delivered.
+// been seen for this session (within the retained EventDedupWindowDepth
+// window — see recordSeenLocked) is dropped (never delivered twice), while
+// a replay update (Meta.IsReplay) is exempt from dedup and always delivered
+// — per the design doc, replay reconstruction and live streaming are
+// tracked as separate concerns, and a replayed update's eventId
+// legitimately reappearing (for example, if a client independently retains
+// a replay's eventIds across a later live-observed duplicate is never
+// expected in practice) must not be silently suppressed. An update with no
+// eventId at all (Meta.EventID == "") is never deduplicated: there is
+// nothing to key a highwater check on, so it is always delivered.
 //
-// The internal queue is unbounded (a plain growable slice guarded by mu, not
-// a fixed-capacity channel) so a slow consumer can never cause an update to
-// be dropped — mirroring protocol.Conn's own notifyQueue/notifyWorker
-// pattern for the identical "never drop, never block the sender" property.
+// The internal queue is bounded at UpdateQueueDepth (a growable slice
+// guarded by mu, trimmed from the front on overflow), so a consumer that
+// never calls Updates() (or falls far enough behind) cannot grow it without
+// bound. This deliberately does NOT mirror protocol.Conn's own internal
+// notifyQueue, which stays unbounded because it only ever holds already-
+// dispatched handler jobs a single worker is actively draining as fast as
+// each job completes (see Conn.enqueueNotifyJob's doc) — there is no
+// equivalent "always being drained" guarantee here, since draining this
+// queue is Updates(), and the whole point of this bound is that the caller
+// might never call it. The shape instead mirrors Conn's OTHER bounded
+// structure, notifyBuffers (see NotifyBufferDepth): a buffer that holds data
+// for a reader who may not show up promptly, capped with the same
+// drop-oldest-and-count discipline.
 func (s *Session) deliver(u Update) {
 	if !u.Meta.IsReplay && u.Meta.EventID != "" {
 		s.seenMu.Lock()
 		_, dup := s.seen[u.Meta.EventID]
 		if !dup {
-			s.seen[u.Meta.EventID] = struct{}{}
+			s.recordSeenLocked(u.Meta.EventID)
 		}
 		s.seenMu.Unlock()
 		if dup {
@@ -132,15 +211,56 @@ func (s *Session) deliver(u Update) {
 		return
 	}
 	s.queue = append(s.queue, u)
+	// Resident count includes the one update pump may already be holding
+	// in flight (see inFlight's doc): that item is just as "not yet
+	// delivered to the caller" as anything still in the slice, so it must
+	// count against the same bound rather than escaping it for free.
+	if drop := len(s.queue) + s.inFlight - UpdateQueueDepth; drop > 0 {
+		if drop > len(s.queue) {
+			// Can never actually happen at UpdateQueueDepth=512 (inFlight
+			// is always 0 or 1), but guards the slice bound generically
+			// rather than assuming today's constant forever.
+			drop = len(s.queue)
+		}
+		// Zero the dropped entries' slots before advancing the slice's start
+		// so their referenced content is released promptly rather than kept
+		// alive by the backing array until a future reallocation.
+		for i := 0; i < drop; i++ {
+			s.queue[i] = Update{}
+		}
+		s.queue = s.queue[drop:]
+		// drop is bounded above by len(s.queue) (an in-memory slice length,
+		// never anywhere near the uint64 boundary), so this conversion
+		// cannot wrap.
+		s.droppedUpdates.Add(uint64(drop))
+	}
 	s.mu.Unlock()
 	s.cond.Signal()
 }
 
+// recordSeenLocked records eventID as seen for dedup and evicts the oldest
+// recorded id (by insertion/delivery order, not by id value — see
+// EventDedupWindowDepth's doc) once the retained window would otherwise
+// exceed EventDedupWindowDepth. Caller must hold seenMu.
+func (s *Session) recordSeenLocked(eventID string) {
+	s.seen[eventID] = struct{}{}
+	s.seenOrder = append(s.seenOrder, eventID)
+	if drop := len(s.seenOrder) - EventDedupWindowDepth; drop > 0 {
+		for _, old := range s.seenOrder[:drop] {
+			delete(s.seen, old)
+		}
+		s.seenOrder = s.seenOrder[drop:]
+	}
+}
+
 // pump drains the internal queue in order onto the exposed Updates()
-// channel, blocking (never dropping) when the consumer is slower than
-// delivery. Once closeUpdates has been called AND the queue has been fully
-// drained, it closes out and returns: every update queued before closing is
-// still delivered, matching Session's "nothing dropped" contract even at
+// channel, blocking (never dropping, from pump's own perspective) when the
+// consumer is slower than delivery — deliver is what enforces
+// UpdateQueueDepth on the producing side, by counting the one update pump
+// may be sitting on (see inFlight) as still resident. Once closeUpdates has
+// been called AND the queue has been fully drained, it closes out and
+// returns: every update still resident at closing time is still delivered,
+// matching Session's "nothing dropped once accepted" contract even at
 // shutdown.
 func (s *Session) pump() {
 	for {
@@ -156,9 +276,14 @@ func (s *Session) pump() {
 		u := s.queue[0]
 		s.queue[0] = Update{}
 		s.queue = s.queue[1:]
+		s.inFlight = 1
 		s.mu.Unlock()
 
 		s.out <- u
+
+		s.mu.Lock()
+		s.inFlight = 0
+		s.mu.Unlock()
 	}
 }
 

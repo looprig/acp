@@ -359,6 +359,16 @@ func TestEndToEndInitializeNewPromptUpdatesPermissionCancelClose(t *testing.T) {
 		t.Errorf("decoded RequestPermissionRequest.SessionID = %q, want %q", gotPermissionReq.SessionID, sessionID)
 	}
 
+	// The wire response is confirmed above, but the server-side handler's
+	// own call to RespondGate happens in a goroutine not synchronized with
+	// the moment that response hit the wire (mirroring the same poll used by
+	// gates_test.go's TestGateRequestPermissionConnectionDeathFailsClosed and
+	// close_test.go's TestHandleSessionCloseStateMachine): poll for it
+	// rather than assuming it has already run.
+	deadline := time.Now().Add(testTimeout)
+	for len(fake.gateResponses()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	responses := fake.gateResponses()
 	if len(responses) != 1 || responses[0].GateID != gateID || responses[0].Action != string(gate.ApprovalApprove) {
 		t.Fatalf("RespondGate calls = %+v, want exactly one Approve for gate %v", responses, gateID)
