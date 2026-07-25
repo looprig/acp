@@ -18,6 +18,7 @@ func chunkText(text string) protocol.SessionUpdate {
 // contract Session.Updates documents.
 func TestBufferedEarlyUpdatesAreNotDropped(t *testing.T) {
 	sess := newSession(nil, "sess-buffered")
+	defer sess.closeUpdates()
 
 	const n = 50
 	for i := 0; i < n; i++ {

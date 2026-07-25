@@ -15,14 +15,24 @@ import (
 // flight fails with a typed *ClosedError and the session's Updates()
 // channel closes rather than hanging forever.
 func TestConnectionDeathFailsPendingPromptAndClosesUpdates(t *testing.T) {
+	assertNoGoroutineLeak(t)
 	c, fa := dialTestClient(t, Options{})
 
 	promptEntered := make(chan struct{})
+	release := make(chan struct{})
+	// Conn's own contract (see protocol/conn.go's Close doc) is that Close
+	// does not wait for an in-flight handler callback to finish, and
+	// dispatchRequest always hands handlers context.Background() (never a
+	// context tied to the connection's lifetime) — so this handler must be
+	// released by an explicit signal, not ctx.Done(), or its goroutine would
+	// leak for the rest of the process's life instead of just until release
+	// is closed below.
 	fa.onPrompt = func(ctx context.Context, fa *fakeAgent, req protocol.PromptRequest) (protocol.PromptResponse, error) {
 		close(promptEntered)
-		<-ctx.Done() // never respond; the peer is about to die
-		return protocol.PromptResponse{}, ctx.Err()
+		<-release
+		return protocol.PromptResponse{}, errors.New("fake agent: torn down mid-prompt")
 	}
+	defer close(release)
 	sess := newSessionForTest(t, c, fa, "sess-death")
 
 	promptDone := make(chan error, 1)
