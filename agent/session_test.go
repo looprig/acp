@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/looprig/acp/agent"
 	"github.com/looprig/acp/protocol"
@@ -311,5 +312,244 @@ func TestHandleSessionNewRegistryBounded(t *testing.T) {
 	}
 	if host.callCount() != agent.MaxLiveSessions {
 		t.Errorf("Host.NewSession calls = %d, want unchanged %d (capacity pre-check must short-circuit before touching host)", host.callCount(), agent.MaxLiveSessions)
+	}
+}
+
+// raceLiveSession is a minimal LiveSession that also implements
+// agent.SessionCloser with a call counter, used by
+// TestHandleSessionNewOrphanedSessionShutdownOnRegistryRace to prove the
+// loser of a session/new registry-capacity race has Shutdown called on the
+// host-backed session that was created for it but never registered.
+type raceLiveSession struct {
+	id coreuuid.UUID
+
+	mu                  sync.Mutex
+	shutdownCalls       int
+	shutdownHadDeadline bool
+}
+
+func (s *raceLiveSession) SessionID() coreuuid.UUID { return s.id }
+
+func (s *raceLiveSession) Submit(context.Context, []content.Block) (coreuuid.UUID, error) {
+	return coreuuid.UUID{}, errors.New("raceLiveSession: Submit not implemented")
+}
+
+func (s *raceLiveSession) SubscribeEvents(event.EventFilter) (event.Subscription, error) {
+	return nil, errors.New("raceLiveSession: SubscribeEvents not implemented")
+}
+
+func (s *raceLiveSession) RespondGate(context.Context, gate.GateResponse) error {
+	return errors.New("raceLiveSession: RespondGate not implemented")
+}
+
+func (s *raceLiveSession) Interrupt(context.Context) (bool, error) {
+	return false, errors.New("raceLiveSession: Interrupt not implemented")
+}
+
+// Shutdown implements agent.SessionCloser.
+func (s *raceLiveSession) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.shutdownCalls++
+	_, hasDeadline := ctx.Deadline()
+	s.shutdownHadDeadline = hasDeadline
+	return nil
+}
+
+func (s *raceLiveSession) shutdownState() (calls int, hadDeadline bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shutdownCalls, s.shutdownHadDeadline
+}
+
+// gatingHostStub is a SessionHost whose NewSession mints a fresh
+// raceLiveSession every call and records it, optionally gating on a
+// barrier armed by arm: once armed, NewSession signals entry on entered and
+// then blocks until the test closes release. This is how
+// TestHandleSessionNewOrphanedSessionShutdownOnRegistryRace forces two
+// concurrent session/new calls to both pass handleSessionNew's atCapacity
+// pre-check and both genuinely create a real host-backed session before
+// either's sessions.add call can run — the actual race window the
+// registry-capacity leak lives in, not an accidental scheduling artifact.
+type gatingHostStub struct {
+	mu      sync.Mutex
+	created []*raceLiveSession
+
+	armed   bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *gatingHostStub) arm(entered, release chan struct{}) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.armed = true
+	h.entered = entered
+	h.release = release
+}
+
+func (h *gatingHostStub) NewSession(_ context.Context, _ agent.Setup) (agent.LiveSession, error) {
+	h.mu.Lock()
+	armed := h.armed
+	entered := h.entered
+	release := h.release
+	h.mu.Unlock()
+
+	if armed {
+		entered <- struct{}{}
+		<-release
+	}
+
+	id, err := coreuuid.New()
+	if err != nil {
+		return nil, err
+	}
+	live := &raceLiveSession{id: id}
+	h.mu.Lock()
+	h.created = append(h.created, live)
+	h.mu.Unlock()
+	return live, nil
+}
+
+func (h *gatingHostStub) LoadSession(context.Context, agent.SessionID, agent.Setup) (agent.LoadedSession, error) {
+	return agent.LoadedSession{}, errors.New("gatingHostStub: LoadSession not implemented")
+}
+
+func (h *gatingHostStub) ResumeSession(context.Context, agent.SessionID, agent.Setup) (agent.LiveSession, error) {
+	return nil, errors.New("gatingHostStub: ResumeSession not implemented")
+}
+
+func (h *gatingHostStub) createdSessions() []*raceLiveSession {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]*raceLiveSession(nil), h.created...)
+}
+
+// resetCreated clears the created-session log, so a test can discard the
+// bookkeeping from an unraced fill phase and observe only what the racing
+// calls themselves create.
+func (h *gatingHostStub) resetCreated() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.created = nil
+}
+
+// TestHandleSessionNewOrphanedSessionShutdownOnRegistryRace reproduces the
+// exact race a Phase 2 review flagged: two concurrent session/new calls at
+// MaxLiveSessions-1 already registered, both passing atCapacity's advisory
+// pre-check before either's Host.NewSession call completes, so both
+// genuinely create a real host-backed session and only one can win the
+// registry's last slot. The loser's live session must not be silently
+// abandoned: handleSessionNew must best-effort call SessionCloser.Shutdown
+// on it with a bounded context before returning the capacity-exceeded
+// error, exactly like session/close's own optional Shutdown step
+// (close.go).
+func TestHandleSessionNewOrphanedSessionShutdownOnRegistryRace(t *testing.T) {
+	host := &gatingHostStub{}
+	a, err := agent.New(agent.Options{Host: host})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	// Fill to MaxLiveSessions-1 with ordinary, unraced session/new calls
+	// (the barrier is not armed yet, so these return immediately).
+	for i := 0; i < agent.MaxLiveSessions-1; i++ {
+		if _, err := agentConn.NewSession(context.Background(), protocol.NewSessionRequest{Cwd: "/workspace"}); err != nil {
+			t.Fatalf("NewSession #%d (filling to MaxLiveSessions-1): unexpected error: %v", i+1, err)
+		}
+	}
+
+	host.resetCreated()
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	host.arm(entered, release)
+
+	type result struct {
+		sessionID protocol.SessionID
+		err       error
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			resp, err := agentConn.NewSession(context.Background(), protocol.NewSessionRequest{Cwd: "/workspace"})
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			results <- result{sessionID: resp.SessionID}
+		}()
+	}
+
+	// Wait for BOTH goroutines to be blocked inside Host.NewSession: proof
+	// both already passed the atCapacity pre-check (which runs before
+	// Host.NewSession in handleSessionNew) before either has a chance to
+	// register or fail to register.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(testTimeout):
+			t.Fatalf("timed out waiting for both concurrent session/new calls to enter Host.NewSession (only %d entered)", i)
+		}
+	}
+	close(release)
+
+	var got [2]result
+	for i := 0; i < 2; i++ {
+		select {
+		case got[i] = <-results:
+		case <-time.After(testTimeout):
+			t.Fatal("timed out waiting for both concurrent session/new calls to return")
+		}
+	}
+
+	var successes, failures int
+	var winnerID protocol.SessionID
+	for _, r := range got {
+		if r.err == nil {
+			successes++
+			winnerID = r.sessionID
+			continue
+		}
+		failures++
+		var f *protocol.Fault
+		if !errors.As(r.err, &f) {
+			t.Fatalf("loser NewSession: error = %v (%T), want *protocol.Fault", r.err, r.err)
+		}
+		if f.Code != protocol.ErrorCodeInternalError {
+			t.Errorf("loser NewSession: Fault.Code = %v, want %v", f.Code, protocol.ErrorCodeInternalError)
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("successes = %d, failures = %d, want exactly 1 and 1", successes, failures)
+	}
+
+	created := host.createdSessions()
+	if len(created) != 2 {
+		t.Fatalf("Host.NewSession created %d sessions during the race, want exactly 2", len(created))
+	}
+
+	var winner, loser *raceLiveSession
+	for _, s := range created {
+		if s.id.String() == string(winnerID) {
+			winner = s
+		} else {
+			loser = s
+		}
+	}
+	if winner == nil || loser == nil {
+		t.Fatalf("could not identify winner/loser among created sessions (winnerID=%s)", winnerID)
+	}
+
+	if loserCalls, loserHadDeadline := loser.shutdownState(); loserCalls != 1 {
+		t.Errorf("loser SessionCloser.Shutdown calls = %d, want exactly 1 (orphaned host session must not be silently abandoned)", loserCalls)
+	} else if !loserHadDeadline {
+		t.Error("loser SessionCloser.Shutdown: ctx had no deadline, want a bounded context")
+	}
+
+	if winnerCalls, _ := winner.shutdownState(); winnerCalls != 0 {
+		t.Errorf("winner SessionCloser.Shutdown calls = %d, want 0 (a registered session must not be torn down)", winnerCalls)
 	}
 }

@@ -153,11 +153,21 @@ func (a *Agent) handleSessionNew(ctx context.Context, _ string, params json.RawM
 
 	if err := a.sessions.add(live); err != nil {
 		// The host has already created a live resource this facade can no
-		// longer track. It is deliberately left running rather than
-		// force-closed: LiveSession carries no close capability of its own
-		// (SessionCloser is a separate optional capability not surfaced
-		// through this path), and this branch is only reachable via the
-		// race atCapacity's doc describes, not the common case.
+		// longer track: another concurrent session/new call won the
+		// registry's last slot first (this branch is only reachable via the
+		// race atCapacity's doc describes, not the common case). Rather than
+		// silently abandoning it, make the same best-effort optional-capability
+		// cleanup attempt session/close makes on its own Shutdown step
+		// (close.go): a live value that never implements SessionCloser is
+		// left as-is (there is nothing more this facade can do without a
+		// wider LiveSession contract), and a Shutdown call that itself
+		// errors is not fatal either — the error below, not Shutdown's, is
+		// what the caller sees.
+		if closer, ok := live.(SessionCloser); ok {
+			sctx, scancel := context.WithTimeout(context.Background(), closeShutdownGrace)
+			_ = closer.Shutdown(sctx)
+			scancel()
+		}
 		return nil, protocol.InternalError("session/new: "+err.Error(), err)
 	}
 
