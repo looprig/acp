@@ -200,6 +200,32 @@ func emitDefaultConstructor(b *strings.Builder, d TypeDecl) {
 	b.WriteString("\t}\n}\n\n")
 }
 
+// emitVariantDecode emits one UnmarshalJSON switch case's body: it decodes
+// v's payload out of data and assigns it to v.GoName. When v.WrapKey == "",
+// the payload is itself an object spread across the whole wire object, so
+// data unmarshals into it directly (the original, pre-WrapKey behavior).
+// When v.WrapKey != "" (a bare-scalar inline branch, e.g.
+// SetSessionConfigOptionRequest's "boolean" variant), the payload instead
+// sits nested under that one wire property, so it is extracted from there
+// rather than from the whole object. errFmt is the fmt.Errorf format string
+// to use on failure: it already carries this variant's context (struct/tag
+// names) and exactly one %w verb for the wrapped error.
+func emitVariantDecode(b *strings.Builder, v Variant, errFmt string) {
+	if v.WrapKey != "" {
+		fmt.Fprintf(b, "\t\tvar wrap struct {\n\t\t\tValue %s `json:%q`\n\t\t}\n", v.Type, v.WrapKey)
+		b.WriteString("\t\tif err := json.Unmarshal(data, &wrap); err != nil {\n")
+		fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(%q, err)\n", errFmt)
+		b.WriteString("\t\t}\n")
+		fmt.Fprintf(b, "\t\tv.%s = &wrap.Value\n", v.GoName)
+		return
+	}
+	fmt.Fprintf(b, "\t\tvar payload %s\n", v.Type)
+	b.WriteString("\t\tif err := json.Unmarshal(data, &payload); err != nil {\n")
+	fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(%q, err)\n", errFmt)
+	b.WriteString("\t\t}\n")
+	fmt.Fprintf(b, "\t\tv.%s = &payload\n", v.GoName)
+}
+
 // emitDiscriminatedCodec emits MarshalJSON/UnmarshalJSON for a struct whose
 // variants are told apart by a shared tag field (d.DiscKey) carrying a
 // distinct string const. MarshalJSON rejects zero or multiple variants set;
@@ -219,7 +245,14 @@ func emitDiscriminatedCodec(b *strings.Builder, d TypeDecl) error {
 		b.WriteString("\t\tset++\n")
 		fmt.Fprintf(b, "\t\traw, err := json.Marshal(v.%s)\n", v.GoName)
 		b.WriteString("\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
-		b.WriteString("\t\tif err := json.Unmarshal(raw, &merged); err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
+		if v.WrapKey != "" {
+			// This variant's payload is a bare scalar (or otherwise not an
+			// object of its own): nest raw under its wire property instead
+			// of trying to merge it as if it were a whole object.
+			fmt.Fprintf(b, "\t\tmerged[%q] = raw\n", v.WrapKey)
+		} else {
+			b.WriteString("\t\tif err := json.Unmarshal(raw, &merged); err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
+		}
 		if !v.IsFallback {
 			fmt.Fprintf(b, "\t\ttagBytes, err := json.Marshal(%q)\n", v.Tag)
 			b.WriteString("\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n")
@@ -265,11 +298,7 @@ func emitDiscriminatedCodec(b *strings.Builder, d TypeDecl) error {
 			continue
 		}
 		fmt.Fprintf(b, "\tcase tag.Value != nil && *tag.Value == %q:\n", v.Tag)
-		fmt.Fprintf(b, "\t\tvar payload %s\n", v.Type)
-		b.WriteString("\t\tif err := json.Unmarshal(data, &payload); err != nil {\n")
-		fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"%s: %s: %%w\", err)\n", name, v.Tag)
-		b.WriteString("\t\t}\n")
-		fmt.Fprintf(b, "\t\tv.%s = &payload\n", v.GoName)
+		emitVariantDecode(b, v, fmt.Sprintf("%s: %s: %%w", name, v.Tag))
 	}
 	if fallback != "" {
 		var fv Variant
@@ -279,11 +308,7 @@ func emitDiscriminatedCodec(b *strings.Builder, d TypeDecl) error {
 			}
 		}
 		b.WriteString("\tdefault:\n")
-		fmt.Fprintf(b, "\t\tvar payload %s\n", fv.Type)
-		b.WriteString("\t\tif err := json.Unmarshal(data, &payload); err != nil {\n")
-		fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"%s: %%w\", err)\n", name)
-		b.WriteString("\t\t}\n")
-		fmt.Fprintf(b, "\t\tv.%s = &payload\n", fv.GoName)
+		emitVariantDecode(b, fv, fmt.Sprintf("%s: %%w", name))
 	} else {
 		b.WriteString("\tcase tag.Value == nil:\n")
 		fmt.Fprintf(b, "\t\treturn fmt.Errorf(\"%s: missing discriminator field %s\")\n", name, d.DiscKey)

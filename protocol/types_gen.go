@@ -2635,9 +2635,7 @@ func (v SetSessionConfigOptionRequest) MarshalJSON() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal(raw, &merged); err != nil {
-			return nil, err
-		}
+		merged["value"] = raw
 		tagBytes, err := json.Marshal("boolean")
 		if err != nil {
 			return nil, err
@@ -2650,9 +2648,7 @@ func (v SetSessionConfigOptionRequest) MarshalJSON() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal(raw, &merged); err != nil {
-			return nil, err
-		}
+		merged["value"] = raw
 	}
 	if set == 0 {
 		return nil, fmt.Errorf("SetSessionConfigOptionRequest: no variant set")
@@ -2696,17 +2692,21 @@ func (v *SetSessionConfigOptionRequest) UnmarshalJSON(data []byte) error {
 	*v = SetSessionConfigOptionRequest{}
 	switch {
 	case tag.Value != nil && *tag.Value == "boolean":
-		var payload bool
-		if err := json.Unmarshal(data, &payload); err != nil {
+		var wrap struct {
+			Value bool `json:"value"`
+		}
+		if err := json.Unmarshal(data, &wrap); err != nil {
 			return fmt.Errorf("SetSessionConfigOptionRequest: boolean: %w", err)
 		}
-		v.Boolean = &payload
+		v.Boolean = &wrap.Value
 	default:
-		var payload SessionConfigValueID
-		if err := json.Unmarshal(data, &payload); err != nil {
+		var wrap struct {
+			Value SessionConfigValueID `json:"value"`
+		}
+		if err := json.Unmarshal(data, &wrap); err != nil {
 			return fmt.Errorf("SetSessionConfigOptionRequest: %w", err)
 		}
-		v.ValueID = &payload
+		v.ValueID = &wrap.Value
 	}
 	var base struct {
 		ConfigID  SessionConfigID `json:"configId"`

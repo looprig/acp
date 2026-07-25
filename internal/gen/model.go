@@ -156,6 +156,13 @@ type Variant struct {
 	Tag        string // discriminator wire value; "" for the fallback variant
 	IsFallback bool
 	Doc        string
+	// WrapKey is the wire property name this variant's payload sits under
+	// when the branch is declared inline (no $ref) with exactly one
+	// non-discriminator property, e.g. SetSessionConfigOptionRequest's
+	// "boolean" branch carries its bool under "value" rather than being an
+	// object itself. Empty for $ref/array branches, whose payload type is
+	// already an object (or slice) spread directly into the wire object.
+	WrapKey string
 }
 
 // TypeDecl is one generated top-level type.
@@ -551,7 +558,7 @@ func (b *builder) buildUnionOrHybrid(name string, s *Schema, branches []*Schema,
 
 	if discKey == "" {
 		if len(branches) == 1 {
-			target, err := b.resolveVariantPayload(branches[0], "")
+			target, _, err := b.resolveVariantPayload(branches[0], "")
 			if err != nil {
 				return TypeDecl{}, fmt.Errorf("alias target: %w", err)
 			}
@@ -567,7 +574,7 @@ func (b *builder) buildUnionOrHybrid(name string, s *Schema, branches []*Schema,
 
 		variants := make([]Variant, 0, len(branches))
 		for _, m := range branches {
-			target, err := b.resolveVariantPayload(m, "")
+			target, wrapKey, err := b.resolveVariantPayload(m, "")
 			if err != nil {
 				return TypeDecl{}, fmt.Errorf("structural variant: %w", err)
 			}
@@ -575,7 +582,7 @@ func (b *builder) buildUnionOrHybrid(name string, s *Schema, branches []*Schema,
 			if err != nil {
 				return TypeDecl{}, err
 			}
-			variants = append(variants, Variant{GoName: fname, Type: target, Doc: m.Description})
+			variants = append(variants, Variant{GoName: fname, Type: target, WrapKey: wrapKey, Doc: m.Description})
 		}
 		return TypeDecl{
 			Name:      goTypeName(name),
@@ -598,7 +605,7 @@ func (b *builder) buildUnionOrHybrid(name string, s *Schema, branches []*Schema,
 			}
 			hasTag = true
 		}
-		target, err := b.resolveVariantPayload(m, discKey)
+		target, wrapKey, err := b.resolveVariantPayload(m, discKey)
 		if err != nil {
 			return TypeDecl{}, fmt.Errorf("discriminated variant %q: %w", tag, err)
 		}
@@ -618,6 +625,7 @@ func (b *builder) buildUnionOrHybrid(name string, s *Schema, branches []*Schema,
 			Tag:        tag,
 			IsFallback: !hasTag,
 			Doc:        m.Description,
+			WrapKey:    wrapKey,
 		})
 	}
 	return TypeDecl{
@@ -634,15 +642,27 @@ func (b *builder) buildUnionOrHybrid(name string, s *Schema, branches []*Schema,
 // resolveVariantPayload resolves one union branch's payload type: a
 // referenced named type (branch.allOf==[{$ref}] or a bare {$ref}), or — for
 // branches with fields declared inline instead of via a $ref — the type of
-// its single non-discriminator property. The pinned schema never declares
-// more than one such inline field per branch; that shape is rejected rather
-// than silently handled.
-func (b *builder) resolveVariantPayload(branch *Schema, discKey string) (string, error) {
+// its single non-discriminator property, plus the wire property name (the
+// returned wrapKey) that property sits under. The pinned schema never
+// declares more than one such inline field per branch; that shape is
+// rejected rather than silently handled.
+//
+// wrapKey is "" for $ref/array branches, whose payload type is itself an
+// object (or slice) meant to be spread directly into the wire object
+// (emit.go's discriminated codec merges it key-by-key). It is non-empty for
+// an inline branch with exactly one non-discriminator property whose value
+// is not itself spread — e.g. SetSessionConfigOptionRequest's "boolean"
+// branch is `{"type":"boolean","value":true}`: the bool payload must be
+// nested under "value" on encode and extracted from "value" on decode,
+// never merged/unmarshaled as if it were a whole object in its own right.
+func (b *builder) resolveVariantPayload(branch *Schema, discKey string) (goType string, wrapKey string, err error) {
 	switch {
 	case len(branch.AllOf) == 1 && branch.AllOf[0].Ref != "":
-		return b.resolveRef(branch.AllOf[0].Ref)
+		t, err := b.resolveRef(branch.AllOf[0].Ref)
+		return t, "", err
 	case branch.Ref != "":
-		return b.resolveRef(branch.Ref)
+		t, err := b.resolveRef(branch.Ref)
+		return t, "", err
 	case len(branch.Type) == 1 && branch.Type[0] == "array":
 		// A branch that is itself an array (e.g. SessionConfigSelectOptions:
 		// a flat list of options vs. a list of groups) — the payload is a
@@ -650,9 +670,9 @@ func (b *builder) resolveVariantPayload(branch *Schema, discKey string) (string,
 		// the first element's shape rather than the top-level object's keys.
 		item, _, err := b.resolveTypeExpr(branch.Items)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
-		return "[]" + item, nil
+		return "[]" + item, "", nil
 	default:
 		var extra []string
 		for pname := range branch.Properties {
@@ -664,12 +684,12 @@ func (b *builder) resolveVariantPayload(branch *Schema, discKey string) (string,
 		sort.Strings(extra)
 		switch len(extra) {
 		case 0:
-			return "struct{}", nil
+			return "struct{}", "", nil
 		case 1:
 			t, _, err := b.resolveTypeExpr(branch.Properties[extra[0]])
-			return t, err
+			return t, extra[0], err
 		default:
-			return "", fmt.Errorf("inline union branch with multiple payload fields is unsupported")
+			return "", "", fmt.Errorf("inline union branch with multiple payload fields is unsupported")
 		}
 	}
 }
