@@ -53,9 +53,7 @@ type liveTranslator struct {
 	turnID    uuid.UUID
 	promptID  uuid.UUID
 
-	haveMessage    bool
-	messageThought bool
-	messageSeq     uint64
+	msgSeq messageIDSeq
 }
 
 // newLiveTranslator constructs the translator for one correlated turn.
@@ -158,19 +156,46 @@ func (t *liveTranslator) translateTokenDelta(e event.TokenDelta) (protocol.Sessi
 // messageID returns the deterministic message id for the current run of
 // same-kind (thought vs non-thought) chunks, minting the next sequence
 // number the first time it observes a switch away from the previously seen
-// kind (see liveTranslator's doc comment). The format is
+// kind (see liveTranslator's doc comment and messageIDSeq). The format is
 // "msg:{sessionID}:{loopID}:{turnID}:{seq}": deterministic and reproducible
 // given the same ordered event stream, never a random value.
 func (t *liveTranslator) messageID(thought bool) protocol.MessageID {
+	return formatMessageID(t.sessionID, t.loopID, t.turnID, t.msgSeq.next(thought))
+}
+
+// messageIDSeq implements the message-boundary sequencing rule shared by the
+// live translator (this file) and the replay translator (replay.go): a
+// MessageID groups consecutive same-kind (thought vs non-thought) chunks, and
+// a change in kind mints the next sequence number. It is factored out of
+// liveTranslator (rather than duplicated in replay.go) so both translators
+// derive message ids via the IDENTICAL algorithm: the same ordered sequence
+// of chunk kinds produces the same ids whether observed live or reconstructed
+// from durable history — see replay.go's doc for why this matters.
+type messageIDSeq struct {
+	have    bool
+	thought bool
+	seq     uint64
+}
+
+// next returns the sequence number for one chunk of the given kind, advancing
+// it exactly once per kind transition (see the type doc). The zero value is
+// ready to use: the first call always returns 0.
+func (s *messageIDSeq) next(thought bool) uint64 {
 	switch {
-	case !t.haveMessage:
-		t.haveMessage = true
-		t.messageThought = thought
-	case t.messageThought != thought:
-		t.messageSeq++
-		t.messageThought = thought
+	case !s.have:
+		s.have = true
+		s.thought = thought
+	case s.thought != thought:
+		s.seq++
+		s.thought = thought
 	}
-	return protocol.MessageID(fmt.Sprintf("msg:%s:%s:%s:%d", t.sessionID, t.loopID, t.turnID, t.messageSeq))
+	return s.seq
+}
+
+// formatMessageID renders the deterministic "msg:{sessionID}:{loopID}:{turnID}:{seq}"
+// scheme both translators use for assistant/thought chunk message ids.
+func formatMessageID(sessionID protocol.SessionID, loopID, turnID uuid.UUID, seq uint64) protocol.MessageID {
+	return protocol.MessageID(fmt.Sprintf("msg:%s:%s:%s:%d", sessionID, loopID, turnID, seq))
 }
 
 // toolCallID derives the deterministic ACP tool call id from a Harness
@@ -270,20 +295,33 @@ func translateTurnUsage(_ content.Usage) (protocol.SessionUpdate, bool) {
 
 // updateMeta is the wire shape stamped into every session/update
 // notification's _meta object. eventId identifies the exact Harness event
-// (Header.EventID) that produced this update; promptId is the session/
+// (Header.EventID) that produced this update. promptId is the session/
 // prompt command id this update belongs to, letting a client correlate a
 // live update against the in-flight prompt it is currently awaiting a
-// terminal response for. Replay adds isReplay in Phase 3.
+// terminal response for; it is only ever set by the live translator (see
+// meta below) — replay.go's updates have no correlated prompt, so
+// PromptID is omitted (omitempty) rather than stamped as a zero UUID
+// string. isReplay is stamped true only by replay.go's reconstruction (see
+// its replayMeta), never by the live translator, so a capable client can
+// distinguish reconstruction from live streaming (see design doc "Load
+// replay versus live streaming").
 type updateMeta struct {
 	EventID  string `json:"eventId"`
-	PromptID string `json:"promptId"`
+	PromptID string `json:"promptId,omitempty"`
+	IsReplay bool   `json:"isReplay,omitempty"`
 }
 
-// meta builds the _meta payload for one update. json.Marshal cannot fail
-// here: updateMeta is exactly two plain strings (UUID.String() always
+// marshalUpdateMeta encodes m as the _meta payload both translators stamp
+// onto a session/update notification. json.Marshal cannot fail here:
+// updateMeta is exactly two plain strings and a bool (UUID.String() always
 // produces the fixed-width canonical hex-and-hyphen form), so there is no
 // cyclic reference, channel, or function value it could ever choke on.
-func (t *liveTranslator) meta(eventID uuid.UUID) json.RawMessage {
-	raw, _ := json.Marshal(updateMeta{EventID: eventID.String(), PromptID: t.promptID.String()})
+func marshalUpdateMeta(m updateMeta) json.RawMessage {
+	raw, _ := json.Marshal(m)
 	return raw
+}
+
+// meta builds the _meta payload for one live update.
+func (t *liveTranslator) meta(eventID uuid.UUID) json.RawMessage {
+	return marshalUpdateMeta(updateMeta{EventID: eventID.String(), PromptID: t.promptID.String()})
 }

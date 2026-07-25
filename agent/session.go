@@ -156,18 +156,11 @@ func (a *Agent) handleSessionNew(ctx context.Context, _ string, params json.RawM
 		// longer track: another concurrent session/new call won the
 		// registry's last slot first (this branch is only reachable via the
 		// race atCapacity's doc describes, not the common case). Rather than
-		// silently abandoning it, make the same best-effort optional-capability
-		// cleanup attempt session/close makes on its own Shutdown step
-		// (close.go): a live value that never implements SessionCloser is
-		// left as-is (there is nothing more this facade can do without a
-		// wider LiveSession contract), and a Shutdown call that itself
-		// errors is not fatal either — the error below, not Shutdown's, is
-		// what the caller sees.
-		if closer, ok := live.(SessionCloser); ok {
-			sctx, scancel := context.WithTimeout(context.Background(), closeShutdownGrace)
-			_ = closer.Shutdown(sctx)
-			scancel()
-		}
+		// silently abandoning it, make the same best-effort cleanup attempt
+		// session/close makes on its own Shutdown step (close.go) — see
+		// replay.go's shutdownOrphanedSession, shared with session/load's
+		// identical orphan cleanup.
+		shutdownOrphanedSession(live)
 		return nil, protocol.InternalError("session/new: "+err.Error(), err)
 	}
 

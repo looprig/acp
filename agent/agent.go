@@ -150,12 +150,15 @@ func New(opts Options) (*Agent, error) {
 // unconditionally (every product-facing agent needs Options.Host, so none of
 // these have a capability gate of their own — session/new, session/prompt,
 // and session/close each consult AuthorizeSessionCreation/resolveSession
-// internally), and authenticate/logout only when their backing Options field
-// is supplied. Every other ACP method (session/load, and later) is
-// intentionally left unregistered here — Conn's own method-not-found
-// fallback rejects them (see conn.go's dispatchRequest) until a later task
-// wires them up, which is exactly the fail-closed behavior an unadvertised
-// capability must have.
+// internally), authenticate/logout only when their backing Options field is
+// supplied, and session/load only when Options.Replayer is supplied —
+// matching capabilities.go's LoadSession advertisement gate: a client is
+// never told loadSession is supported yet has the method rejected, and never
+// told it is unsupported yet has it accepted. Every other ACP method (later
+// Phase 3/4 tasks) is intentionally left unregistered here — Conn's own
+// method-not-found fallback rejects them (see conn.go's dispatchRequest)
+// until a later task wires them up, which is exactly the fail-closed
+// behavior an unadvertised capability must have.
 func (a *Agent) Register(conn *protocol.Conn) {
 	a.client = protocol.NewClientConn(conn)
 	conn.Handle(string(protocol.MethodInitialize), a.handleInitialize)
@@ -163,6 +166,9 @@ func (a *Agent) Register(conn *protocol.Conn) {
 	conn.Handle(string(protocol.MethodSessionPrompt), a.handlePrompt)
 	conn.HandleNotify(string(protocol.MethodSessionCancel), a.handleSessionCancel)
 	conn.Handle(string(protocol.MethodSessionClose), a.handleSessionClose)
+	if a.opts.Replayer != nil {
+		conn.Handle(string(protocol.MethodSessionLoad), a.handleSessionLoad)
+	}
 	if a.opts.Authenticator != nil {
 		conn.Handle(string(protocol.MethodAuthenticate), a.handleAuthenticate)
 	}
