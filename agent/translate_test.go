@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/looprig/acp/protocol"
@@ -305,20 +306,66 @@ func TestToolCallIDIsToolExecutionIDString(t *testing.T) {
 }
 
 // --- usage_update: ContextMeasured / ContextPressure ------------------------
+//
+// event.ContextMeasurement (harness/pkg/event/context.go) carries six fields:
+// Basis (Revision, ThroughEventID), Model, RequestFingerprint, InputTokens,
+// InputLimit, Quality. ACP's UsageUpdate (protocol/types_gen.go) carries
+// exactly four: Cost, Size, Used, Meta. Only InputTokens->Used and
+// InputLimit->Size have any representable counterpart; Basis,
+// RequestFingerprint, Model, and Quality have no field of matching name,
+// type, or concept anywhere on UsageUpdate, and Cost requires an
+// Amount+Currency this measurement never carries. Every fixture below
+// populates the droppable fields with realistic non-zero values (not left at
+// their zero value) so the golden JSON — which must still come out as
+// exactly {sessionUpdate, size, used} — proves those fields are dropped by
+// construction, not coincidentally absent because the input happened to be
+// empty.
+//
+// Model (inference/model.ModelKey) and Quality (inference/contextcount.
+// CountQuality) are the two exceptions: this module's approved external
+// package list (CLAUDE.md) is core+harness only, and neither type is
+// reachable without importing github.com/looprig/inference directly, which
+// is not on that list. They are left at their Go zero value here rather than
+// pulling in a new direct dependency without approval; this does not weaken
+// the mapping-bug-detection bar those fixtures exist for, since UsageUpdate
+// has no field of matching type for either (a ModelKey or a CountQuality
+// could never silently land in a uint64 Size/Used the way a genuine
+// InputTokens/InputLimit swap could).
+
+// realisticMeasurement returns a ContextMeasurement with every field this
+// translator must NOT read populated with a realistic non-zero value, so a
+// hypothetical future mapping bug that reached into Basis/RequestFingerprint
+// instead of InputTokens/InputLimit would be caught by the golden JSON below
+// still coming out as exactly {size, used} — not by coincidence.
+func realisticMeasurement(inputTokens, inputLimit content.TokenCount) event.ContextMeasurement {
+	return event.ContextMeasurement{
+		Basis: event.ContextBasis{
+			Revision:       7,
+			ThroughEventID: uuid.MustParse("88888888-8888-4888-8888-888888888888"),
+		},
+		RequestFingerprint: [32]byte{0x01, 0x02, 0x03, 0xff},
+		InputTokens:        inputTokens,
+		InputLimit:         inputLimit,
+	}
+}
 
 func TestTranslateContextMeasured(t *testing.T) {
 	tr := newTestTranslator()
 	ev := event.ContextMeasured{
-		Header: testHeader(event.Public),
-		Measurement: event.ContextMeasurement{
-			InputTokens: 12345,
-			InputLimit:  200000,
-		},
+		Header:      testHeader(event.Public),
+		Measurement: realisticMeasurement(12345, 200000),
 	}
 
 	got, ok := tr.Translate(ev)
 	if !ok {
 		t.Fatal("Translate(ContextMeasured): ok = false, want true")
+	}
+
+	if got.Update.UsageUpdate == nil {
+		t.Fatal("Update.UsageUpdate is nil")
+	}
+	if got.Update.UsageUpdate.Cost != nil {
+		t.Errorf("UsageUpdate.Cost = %+v, want nil (Harness carries no pricing/currency data)", got.Update.UsageUpdate.Cost)
 	}
 
 	want := `{"sessionId":"11111111-1111-4111-8111-111111111111",` +
@@ -333,17 +380,23 @@ func TestTranslateContextMeasured(t *testing.T) {
 func TestTranslateContextPressure(t *testing.T) {
 	tr := newTestTranslator()
 	ev := event.ContextPressure{
-		Header: testHeader(event.Public),
-		Measurement: event.ContextMeasurement{
-			InputTokens: 99,
-			InputLimit:  1000,
-		},
-		Current: event.PressureCompact,
+		Header:      testHeader(event.Public),
+		Measurement: realisticMeasurement(99, 1000),
+		Occupancy:   9900,
+		Previous:    event.PressureNormal,
+		Current:     event.PressureCompact,
 	}
 
 	got, ok := tr.Translate(ev)
 	if !ok {
 		t.Fatal("Translate(ContextPressure): ok = false, want true")
+	}
+
+	if got.Update.UsageUpdate == nil {
+		t.Fatal("Update.UsageUpdate is nil")
+	}
+	if got.Update.UsageUpdate.Cost != nil {
+		t.Errorf("UsageUpdate.Cost = %+v, want nil (Harness carries no pricing/currency data)", got.Update.UsageUpdate.Cost)
 	}
 
 	want := `{"sessionId":"11111111-1111-4111-8111-111111111111",` +
@@ -355,24 +408,76 @@ func TestTranslateContextPressure(t *testing.T) {
 	}
 }
 
+// ContextPressure carries three fields ContextMeasured does not have at all
+// (Occupancy, Previous, Current) — a droppable level-change signal layered on
+// top of the identical Measurement payload (see context.go's doc comments:
+// ContextMeasured "durably publishes the latest authoritative measurement",
+// ContextPressure is "a droppable public level-change signal"). Given the
+// same underlying Measurement, both event kinds must still map to byte-
+// identical usage_update output: the single translateContextMeasurement code
+// path is correct for both, not conflating ContextPressure's extra fields
+// with ContextMeasured's simpler shape.
+func TestContextMeasuredAndContextPressureMapMeasurementIdentically(t *testing.T) {
+	measurement := realisticMeasurement(4096, 128000)
+
+	tr1 := newTestTranslator()
+	measured, ok := tr1.Translate(event.ContextMeasured{
+		Header:      testHeader(event.Public),
+		Measurement: measurement,
+	})
+	if !ok {
+		t.Fatal("Translate(ContextMeasured): ok = false, want true")
+	}
+
+	tr2 := newTestTranslator()
+	pressure, ok := tr2.Translate(event.ContextPressure{
+		Header:      testHeader(event.Public),
+		Measurement: measurement,
+		Occupancy:   3200,
+		Previous:    event.PressureNormal,
+		Current:     event.PressureHardLimit,
+	})
+	if !ok {
+		t.Fatal("Translate(ContextPressure): ok = false, want true")
+	}
+
+	if measured.Update.UsageUpdate == nil || pressure.Update.UsageUpdate == nil {
+		t.Fatal("expected both updates to carry a UsageUpdate")
+	}
+	if !reflect.DeepEqual(*measured.Update.UsageUpdate, *pressure.Update.UsageUpdate) {
+		t.Errorf("ContextMeasured and ContextPressure produced different UsageUpdate from the same Measurement:\nmeasured=%+v\npressure=%+v",
+			*measured.Update.UsageUpdate, *pressure.Update.UsageUpdate)
+	}
+}
+
 // --- "drop, don't guess": TurnDone.Usage never produces a usage_update -----
 
 // content.Usage carries token-spend totals, not a context-window size; there
 // is no non-fabricated Size this translator could supply from it alone, so
 // per "drop, don't guess" it must never be translated into a usage_update —
-// even when Usage carries real, non-zero data.
+// even when Usage carries real, non-zero data. All five of content.Usage's
+// fields (core/content/usage.go: InputTokens, OutputTokens, CacheReadTokens,
+// CacheCreationTokens, ReasoningTokens) are populated with distinct,
+// realistic non-zero values here — a fully populated Usage is strictly
+// stronger evidence than an empty one, since it rules out an
+// implementation that only checks for a specific zero-valued field
+// (e.g. "no update when InputTokens == 0") rather than genuinely never
+// projecting TurnDone.Usage at all.
 func TestTranslateTurnDoneUsageNeverProducesUsageUpdate(t *testing.T) {
 	tr := newTestTranslator()
 	ev := event.TurnDone{
 		Header: testHeader(event.Public),
 		Usage: content.Usage{
-			InputTokens:  500,
-			OutputTokens: 250,
+			InputTokens:         500,
+			OutputTokens:        250,
+			CacheReadTokens:     1200,
+			CacheCreationTokens: 300,
+			ReasoningTokens:     64,
 		},
 	}
 
 	if _, ok := tr.Translate(ev); ok {
-		t.Fatal("Translate(TurnDone with non-zero Usage): ok = true, want false (drop, don't guess: no window size available)")
+		t.Fatal("Translate(TurnDone with fully populated non-zero Usage): ok = true, want false (drop, don't guess: no window size available)")
 	}
 }
 
