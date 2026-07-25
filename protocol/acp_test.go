@@ -258,6 +258,17 @@ func TestAgentConnCloseSession(t *testing.T) {
 	runCallFixture(t, server, protocol.MethodSessionClose, reqFixture, respFixture, agent.CloseSession)
 }
 
+func TestAgentConnDeleteSession(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	client, server := pipeConns(t)
+	agent := protocol.NewAgentConn(client)
+
+	reqFixture := json.RawMessage(`{"sessionId": "sess_1"}`)
+	respFixture := json.RawMessage(`{}`)
+
+	runCallFixture(t, server, protocol.MethodSessionDelete, reqFixture, respFixture, agent.DeleteSession)
+}
+
 func TestAgentConnPrompt(t *testing.T) {
 	assertNoGoroutineLeak(t)
 	client, server := pipeConns(t)

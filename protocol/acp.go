@@ -93,6 +93,15 @@ func (a *AgentConn) CloseSession(ctx context.Context, req CloseSessionRequest) (
 	return &resp, nil
 }
 
+// DeleteSession calls the agent's "session/delete" method.
+func (a *AgentConn) DeleteSession(ctx context.Context, req DeleteSessionRequest) (*DeleteSessionResponse, error) {
+	var resp DeleteSessionResponse
+	if err := a.conn.Call(ctx, string(MethodSessionDelete), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Prompt calls the agent's "session/prompt" method.
 func (a *AgentConn) Prompt(ctx context.Context, req PromptRequest) (*PromptResponse, error) {
 	var resp PromptResponse

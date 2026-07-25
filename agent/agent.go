@@ -178,14 +178,16 @@ func New(opts Options) (*Agent, error) {
 // session/close, and session/resume consults
 // AuthorizeSessionCreation/resolveSession internally), authenticate/logout
 // only when their backing Options field is supplied, session/load only when
-// Options.Replayer is supplied, and session/list only when Options.Catalog is
-// supplied — matching capabilities.go's LoadSession/SessionCapabilities.List
-// advertisement gates: a client is never told a capability is supported yet
-// has the method rejected, and never told it is unsupported yet has it
-// accepted. Every other ACP method (later Phase 3/4 tasks) is intentionally
-// left unregistered here — Conn's own method-not-found fallback rejects them
-// (see conn.go's dispatchRequest) until a later task wires them up, which is
-// exactly the fail-closed behavior an unadvertised capability must have.
+// Options.Replayer is supplied, session/list only when Options.Catalog is
+// supplied, and session/delete only when Options.Deleter is supplied —
+// matching capabilities.go's LoadSession/SessionCapabilities.List/
+// SessionCapabilities.Delete advertisement gates: a client is never told a
+// capability is supported yet has the method rejected, and never told it is
+// unsupported yet has it accepted. Every other ACP method (later Phase 4
+// tasks) is intentionally left unregistered here — Conn's own
+// method-not-found fallback rejects them (see conn.go's dispatchRequest)
+// until a later task wires them up, which is exactly the fail-closed
+// behavior an unadvertised capability must have.
 func (a *Agent) Register(conn *protocol.Conn) {
 	a.client = protocol.NewClientConn(conn)
 	conn.Handle(string(protocol.MethodInitialize), a.handleInitialize)
@@ -199,6 +201,9 @@ func (a *Agent) Register(conn *protocol.Conn) {
 	}
 	if a.opts.Catalog != nil {
 		conn.Handle(string(protocol.MethodSessionList), a.handleSessionList)
+	}
+	if a.opts.Deleter != nil {
+		conn.Handle(string(protocol.MethodSessionDelete), a.handleSessionDelete)
 	}
 	if a.opts.Authenticator != nil {
 		conn.Handle(string(protocol.MethodAuthenticate), a.handleAuthenticate)
