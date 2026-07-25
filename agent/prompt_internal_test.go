@@ -24,12 +24,13 @@ func (s *internalFakeSubscription) Events() <-chan event.Delivery { return s.ch 
 func (s *internalFakeSubscription) Close() error                  { return nil }
 func (s *internalFakeSubscription) Err() error                    { return nil }
 
-// erroringSender is a liveUpdateSender that always fails, so
+// erroringSender is a liveClient whose SessionUpdate always fails, so
 // drainToTerminal's send-error abort path (a live update failing to reach
 // the wire) can be exercised directly without tearing down a real Conn (see
-// prompt.go: "sender is a real network write, and a wedged or gone
+// prompt.go: "client is a real network write, and a wedged or gone
 // connection means continuing to drain silently would misrepresent what the
-// client actually received").
+// client actually received"). RequestPermission is never exercised by this
+// test (no event.GateOpened is ever sent), so it is a trivial stub.
 type erroringSender struct {
 	err   error
 	calls int
@@ -38,6 +39,10 @@ type erroringSender struct {
 func (s *erroringSender) SessionUpdate(context.Context, protocol.SessionNotification) error {
 	s.calls++
 	return s.err
+}
+
+func (s *erroringSender) RequestPermission(context.Context, protocol.RequestPermissionRequest) (*protocol.RequestPermissionResponse, error) {
+	return nil, errors.New("erroringSender: RequestPermission not implemented")
 }
 
 func TestDrainToTerminalAbortsWhenLiveUpdateSendFails(t *testing.T) {
@@ -75,7 +80,10 @@ func TestDrainToTerminalAbortsWhenLiveUpdateSendFails(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		resp, err := drainToTerminal(context.Background(), sub, cmdID, wireSessionID, sender)
+		// live is nil: no event.GateOpened is ever sent on sub.ch in this
+		// test, so drainToTerminal's gate-handling branch (the only place
+		// that would dereference it) is never reached.
+		resp, err := drainToTerminal(context.Background(), sub, cmdID, wireSessionID, nil, sender, newGateTracker())
 		done <- result{resp, err}
 	}()
 

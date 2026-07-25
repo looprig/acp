@@ -157,7 +157,7 @@ func (a *Agent) handlePrompt(ctx context.Context, _ string, params json.RawMessa
 		return nil, protocol.InternalError("session/prompt: submit: "+err.Error(), err)
 	}
 
-	return drainToTerminal(ctx, sub, cmdID, req.SessionID, a.client)
+	return drainToTerminal(ctx, sub, cmdID, req.SessionID, live, a.client, a.gates)
 }
 
 // liveUpdateSender is the narrow capability drainToTerminal needs to forward
@@ -179,14 +179,23 @@ type liveUpdateSender interface {
 //
 // Every correlated event it observes along the way — not just the terminal
 // — is also offered to a liveTranslator (translate.go): a translatable,
-// Public event becomes a session/update notification sent through sender
+// Public event becomes a session/update notification sent through client
 // before drainToTerminal continues (or, for a terminal event, before it
 // returns), so the client actually sees live progress rather than only the
 // eventual PromptResponse. A send failure aborts the drain with a typed
-// error: sender is a real network write, and a wedged or gone connection
+// error: client is a real network write, and a wedged or gone connection
 // means continuing to drain silently would misrepresent what the client
 // actually received.
-func drainToTerminal(ctx context.Context, sub event.Subscription, cmdID uuid.UUID, wireSessionID protocol.SessionID, sender liveUpdateSender) (protocol.PromptResponse, error) {
+//
+// A correlated event.GateOpened for a translatable permission gate (gates.go,
+// Task 2.6) runs its full session/request_permission round trip inline,
+// right here mid-drain, before drainToTerminal continues: the turn is
+// already parked on that gate regardless, so blocking this loop on the round
+// trip loses nothing, and it keeps the gate's resolution strictly ordered
+// with respect to every other event this turn produces. gates is the
+// tracking structure Task 2.7's session/close orchestration hooks into to
+// force any gate still open when a session closes (see gateTracker).
+func drainToTerminal(ctx context.Context, sub event.Subscription, cmdID uuid.UUID, wireSessionID protocol.SessionID, live LiveSession, client liveClient, gates *gateTracker) (protocol.PromptResponse, error) {
 	var loopID, turnID uuid.UUID
 	correlated := false
 	var translator *liveTranslator
@@ -224,7 +233,7 @@ func drainToTerminal(ctx context.Context, sub event.Subscription, cmdID uuid.UUI
 			}
 
 			if n, ok := translator.Translate(ev); ok {
-				if err := sender.SessionUpdate(ctx, n); err != nil {
+				if err := client.SessionUpdate(ctx, n); err != nil {
 					return protocol.PromptResponse{}, protocol.InternalError("session/prompt: session/update: "+err.Error(), err)
 				}
 			}
@@ -239,6 +248,30 @@ func drainToTerminal(ctx context.Context, sub event.Subscription, cmdID uuid.UUI
 				return protocol.PromptResponse{StopReason: protocol.StopReasonCancelled}, nil
 			case event.TurnFailed:
 				return protocol.PromptResponse{}, sanitizedPromptFailure(e.Err)
+			case event.GateOpened:
+				// Defense in depth, matching translate.go's own rule for
+				// every other event kind: never act on a non-public gate
+				// envelope, even though the hub's own delivery filter
+				// (event.ShouldDeliver) should already have kept an Internal
+				// one from ever reaching this subscription.
+				if e.Visibility() != event.Public {
+					continue
+				}
+				opts, ok := permissionOptionsFromGate(e.Gate)
+				if !ok {
+					// Not translatable (ask-user, a host-owned form/open-url
+					// gate, or anything else) — see gates.go's package doc.
+					// Falls through exactly like any other untranslatable
+					// progress event: the drain continues, the gate stays
+					// open until something else resolves it.
+					continue
+				}
+				gctx, release := gates.begin(ctx, live.SessionID(), e.Gate.ID)
+				fault := runPermissionGateRoundTrip(gctx, client, live, wireSessionID, e.Gate, opts)
+				release()
+				if fault != nil {
+					return protocol.PromptResponse{}, fault
+				}
 			default:
 				continue // progress event (StepDone, TokenDelta, ...): not a terminal
 			}

@@ -73,6 +73,14 @@ type fakeLiveSession struct {
 	interruptCalls int
 	interruptOK    bool
 	interruptErr   error
+
+	// respondGateCalls records every gate.GateResponse RespondGate was
+	// called with, in order, so gates_test.go's fidelity/fail-closed tests
+	// can assert exactly what (if anything) was delivered. respondGateErr,
+	// when non-nil, is returned by every call (simulating a harness-side
+	// RespondGate failure).
+	respondGateCalls []gate.GateResponse
+	respondGateErr   error
 }
 
 func newFakeLiveSession(t *testing.T) *fakeLiveSession {
@@ -121,8 +129,20 @@ func (f *fakeLiveSession) Submit(_ context.Context, _ []content.Block) (coreuuid
 	return cmdID, nil
 }
 
-func (f *fakeLiveSession) RespondGate(context.Context, gate.GateResponse) error {
-	return errors.New("fakeLiveSession: RespondGate not implemented")
+func (f *fakeLiveSession) RespondGate(_ context.Context, resp gate.GateResponse) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "respond_gate")
+	f.respondGateCalls = append(f.respondGateCalls, resp)
+	return f.respondGateErr
+}
+
+// gateResponses returns a snapshot of every gate.GateResponse RespondGate has
+// been called with so far, in order.
+func (f *fakeLiveSession) gateResponses() []gate.GateResponse {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]gate.GateResponse(nil), f.respondGateCalls...)
 }
 
 func (f *fakeLiveSession) Interrupt(context.Context) (bool, error) {

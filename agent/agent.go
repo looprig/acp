@@ -107,6 +107,12 @@ type Agent struct {
 	// session" (see prompt.go's promptTracker).
 	prompts *promptTracker
 
+	// gates tracks permission-gate round trips currently in flight per ACP
+	// session (see gates.go's gateTracker). It is the integration point
+	// Task 2.7's session/close orchestration uses to force any gate still
+	// open for a closing session.
+	gates *gateTracker
+
 	// client is the agent-calls-client method surface bound to the same Conn
 	// Register was given. handlePrompt's drain loop (prompt.go) uses it to
 	// send session/update notifications for the live events it observes on
@@ -135,6 +141,7 @@ func New(opts Options) (*Agent, error) {
 		clientCaps:    protocol.DefaultClientCapabilities(),
 		sessions:      newSessionRegistry(MaxLiveSessions),
 		prompts:       newPromptTracker(),
+		gates:         newGateTracker(),
 	}, nil
 }
 
