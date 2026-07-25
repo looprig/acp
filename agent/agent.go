@@ -146,12 +146,12 @@ func New(opts Options) (*Agent, error) {
 }
 
 // Register binds the facade's currently implemented handlers onto conn:
-// initialize, session/new, session/prompt, and session/cancel
+// initialize, session/new, session/prompt, session/cancel, and session/close
 // unconditionally (every product-facing agent needs Options.Host, so none of
-// these have a capability gate of their own — session/new and session/prompt
-// each consult AuthorizeSessionCreation/resolveSession internally), and
-// authenticate/logout only when their backing Options field is supplied.
-// Every other ACP method (session/load, session/close, and later) is
+// these have a capability gate of their own — session/new, session/prompt,
+// and session/close each consult AuthorizeSessionCreation/resolveSession
+// internally), and authenticate/logout only when their backing Options field
+// is supplied. Every other ACP method (session/load, and later) is
 // intentionally left unregistered here — Conn's own method-not-found
 // fallback rejects them (see conn.go's dispatchRequest) until a later task
 // wires them up, which is exactly the fail-closed behavior an unadvertised
@@ -162,6 +162,7 @@ func (a *Agent) Register(conn *protocol.Conn) {
 	conn.Handle(string(protocol.MethodSessionNew), a.handleSessionNew)
 	conn.Handle(string(protocol.MethodSessionPrompt), a.handlePrompt)
 	conn.HandleNotify(string(protocol.MethodSessionCancel), a.handleSessionCancel)
+	conn.Handle(string(protocol.MethodSessionClose), a.handleSessionClose)
 	if a.opts.Authenticator != nil {
 		conn.Handle(string(protocol.MethodAuthenticate), a.handleAuthenticate)
 	}

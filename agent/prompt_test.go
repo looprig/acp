@@ -81,6 +81,43 @@ type fakeLiveSession struct {
 	// RespondGate failure).
 	respondGateCalls []gate.GateResponse
 	respondGateErr   error
+
+	// Shutdown fields back the optional agent.SessionCloser capability (see
+	// host.go), exercised by close_test.go's session/close orchestration
+	// tests. shutdownBlock, when non-nil, makes Shutdown block until the
+	// test closes it — this is how close_test.go proves registry removal
+	// happens only after Shutdown returns, by observing registry state
+	// while Shutdown is deliberately held open.
+	shutdownCalls       int
+	shutdownErr         error
+	shutdownBlock       chan struct{}
+	shutdownHadDeadline bool
+}
+
+// Shutdown implements agent.SessionCloser. Every fakeLiveSession therefore
+// structurally satisfies SessionCloser; tests that must exercise the "live
+// session does NOT implement SessionCloser" branch use a different LiveSession
+// type entirely (see close_test.go's closeOnlyLiveSession).
+func (f *fakeLiveSession) Shutdown(ctx context.Context) error {
+	f.mu.Lock()
+	f.shutdownCalls++
+	_, hasDeadline := ctx.Deadline()
+	f.shutdownHadDeadline = hasDeadline
+	block := f.shutdownBlock
+	err := f.shutdownErr
+	f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+	return err
+}
+
+// shutdownState returns a snapshot of Shutdown's call count and whether the
+// most recent call observed a context deadline.
+func (f *fakeLiveSession) shutdownState() (calls int, hadDeadline bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.shutdownCalls, f.shutdownHadDeadline
 }
 
 func newFakeLiveSession(t *testing.T) *fakeLiveSession {

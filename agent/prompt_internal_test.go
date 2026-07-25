@@ -107,3 +107,135 @@ func TestDrainToTerminalAbortsWhenLiveUpdateSendFails(t *testing.T) {
 		t.Errorf("sender.SessionUpdate calls = %d, want exactly 1", sender.calls)
 	}
 }
+
+// --- promptTracker: begin/end/markClosing/forget, white-box ----------------
+
+// TestPromptTrackerBeginEndBasicSerialization pins the pre-existing
+// begin/end contract still holds under the new promptBeginOutcome return
+// type: a second begin for the same id is rejected while one is in flight,
+// and released once end runs.
+func TestPromptTrackerBeginEndBasicSerialization(t *testing.T) {
+	tr := newPromptTracker()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+
+	if got := tr.begin(id); got != promptBeginOK {
+		t.Fatalf("first begin = %v, want promptBeginOK", got)
+	}
+	if got := tr.begin(id); got != promptBeginAlreadyInFlight {
+		t.Fatalf("second begin while in flight = %v, want promptBeginAlreadyInFlight", got)
+	}
+	tr.end(id)
+	if got := tr.begin(id); got != promptBeginOK {
+		t.Fatalf("begin after end = %v, want promptBeginOK (tracker must release)", got)
+	}
+	tr.end(id)
+}
+
+// TestPromptTrackerMarkClosingTakesPrecedenceOverInFlight asserts the
+// closing check runs before the in-flight check (see begin's doc): once
+// markClosing has run, every future begin call reports promptBeginClosing —
+// never promptBeginAlreadyInFlight — even while a prompt this same
+// markClosing call observed as in-flight is still running.
+func TestPromptTrackerMarkClosingTakesPrecedenceOverInFlight(t *testing.T) {
+	tr := newPromptTracker()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+
+	if got := tr.begin(id); got != promptBeginOK {
+		t.Fatalf("begin = %v, want promptBeginOK", got)
+	}
+
+	done, wasInFlight := tr.markClosing(id)
+	if !wasInFlight {
+		t.Fatal("markClosing: wasInFlight = false, want true (a prompt is currently in flight)")
+	}
+	select {
+	case <-done:
+		t.Fatal("done channel is already closed, want open (the in-flight prompt has not ended yet)")
+	default:
+	}
+
+	if got := tr.begin(id); got != promptBeginClosing {
+		t.Fatalf("begin after markClosing (still in flight) = %v, want promptBeginClosing", got)
+	}
+
+	tr.end(id)
+	select {
+	case <-done:
+	default:
+		t.Fatal("done channel not closed after end, want closed")
+	}
+
+	// Still permanently closing, even though nothing is in flight anymore.
+	if got := tr.begin(id); got != promptBeginClosing {
+		t.Fatalf("begin after end (still closing) = %v, want promptBeginClosing", got)
+	}
+}
+
+// TestPromptTrackerMarkClosingWithoutInFlightPrompt asserts markClosing
+// correctly reports wasInFlight=false and a nil done channel when nothing is
+// running for id at all.
+func TestPromptTrackerMarkClosingWithoutInFlightPrompt(t *testing.T) {
+	tr := newPromptTracker()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+
+	done, wasInFlight := tr.markClosing(id)
+	if wasInFlight {
+		t.Fatal("markClosing: wasInFlight = true, want false (nothing was ever begun for this id)")
+	}
+	if done != nil {
+		t.Fatalf("markClosing: done = %v, want nil", done)
+	}
+	if got := tr.begin(id); got != promptBeginClosing {
+		t.Fatalf("begin after markClosing = %v, want promptBeginClosing", got)
+	}
+}
+
+// TestPromptTrackerForgetClearsClosingAndInFlight asserts forget (called by
+// close.go only after the session has already left the live registry) fully
+// clears both maps, so a stale id never grows promptTracker's memory for the
+// rest of the process's lifetime.
+func TestPromptTrackerForgetClearsClosingAndInFlight(t *testing.T) {
+	tr := newPromptTracker()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+
+	if got := tr.begin(id); got != promptBeginOK {
+		t.Fatalf("begin = %v, want promptBeginOK", got)
+	}
+	tr.markClosing(id)
+
+	if _, ok := tr.closing[id]; !ok {
+		t.Fatal("closing[id] not recorded before forget")
+	}
+	if _, ok := tr.inFlight[id]; !ok {
+		t.Fatal("inFlight[id] not recorded before forget")
+	}
+
+	tr.forget(id)
+
+	if _, ok := tr.closing[id]; ok {
+		t.Error("closing[id] still present after forget")
+	}
+	if _, ok := tr.inFlight[id]; ok {
+		t.Error("inFlight[id] still present after forget")
+	}
+
+	// forget must not have somehow left id in a stuck "closing" state that
+	// survives past its own removal: a session id is never reused, so this
+	// is mostly documenting intent, but a fresh begin should be OK were the
+	// same id ever (implausibly) reused.
+	if got := tr.begin(id); got != promptBeginOK {
+		t.Fatalf("begin after forget = %v, want promptBeginOK", got)
+	}
+}

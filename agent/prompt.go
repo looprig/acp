@@ -52,40 +52,127 @@ var ErrPromptAlreadyInFlight = errors.New("agent: a session/prompt is already in
 // content.
 var ErrSubscriptionClosed = errors.New("agent: event subscription closed before turn terminal")
 
+// ErrSessionClosing is the local cause behind the *protocol.Fault returned
+// when a session/prompt is attempted on a session that close.go's
+// handleSessionClose has already marked closing (see promptTracker.markClosing).
+// It is a distinct sentinel from ErrPromptAlreadyInFlight — both reject the
+// same way (InvalidRequest), but a caller inspecting the cause via errors.Is
+// can tell "busy" apart from "gone" — it never crosses the wire itself (only
+// Message/Code/Data do — see protocol.Fault).
+var ErrSessionClosing = errors.New("agent: session is closing")
+
 // promptTracker enforces "at most one session/prompt in flight per ACP
-// session". It is intentionally its own small type rather than a field
-// folded into sessionRegistry: which sessions exist and which sessions
-// currently have a prompt in flight are different questions with different
-// lifetimes (a session can outlive many sequential prompts), and conflating
-// them would force every registry reader to reason about prompt state too.
+// session" and, since Task 2.7, "no session/prompt may begin once
+// session/close has started for its session". It is intentionally its own
+// small type rather than a field folded into sessionRegistry: which sessions
+// exist and which sessions currently have a prompt in flight (or are
+// closing) are different questions with different lifetimes (a session can
+// outlive many sequential prompts), and conflating them would force every
+// registry reader to reason about prompt state too.
 type promptTracker struct {
-	mu       sync.Mutex
-	inFlight map[SessionID]struct{}
+	mu sync.Mutex
+	// inFlight maps a session with a prompt currently running to a channel
+	// that end closes when that prompt concludes: close.go's orchestration
+	// reads this channel (via markClosing) to wait for a real drain to
+	// finish, rather than firing the interrupt and racing ahead of it.
+	inFlight map[SessionID]chan struct{}
+	// closing records every session for which markClosing has ever been
+	// called. Entries are deliberately never removed: a session only ever
+	// closes once (handleSessionClose ends by removing it from the
+	// registry entirely — see close.go), so there is no scenario where a
+	// session should un-close and accept prompts again.
+	closing map[SessionID]struct{}
 }
 
 func newPromptTracker() *promptTracker {
-	return &promptTracker{inFlight: make(map[SessionID]struct{})}
+	return &promptTracker{
+		inFlight: make(map[SessionID]chan struct{}),
+		closing:  make(map[SessionID]struct{}),
+	}
 }
 
-// begin marks id as having a prompt in flight, reporting false — without
-// mutating anything — if one already was. This is the sole enforcement
-// point: a caller must not touch the live session (subscribe/submit) unless
-// begin reports true, and must call end exactly once afterward (typically
-// via defer) regardless of how the prompt concludes.
-func (t *promptTracker) begin(id SessionID) bool {
+// promptBeginOutcome classifies the result of promptTracker.begin.
+type promptBeginOutcome int
+
+const (
+	// promptBeginOK: no prompt was in flight and the session was not
+	// closing; the caller now owns the in-flight slot and must call end
+	// exactly once (typically via defer) regardless of how the prompt
+	// concludes.
+	promptBeginOK promptBeginOutcome = iota
+	// promptBeginAlreadyInFlight: another prompt is already running for
+	// this session; the caller must not touch the live session at all.
+	promptBeginAlreadyInFlight
+	// promptBeginClosing: session/close has marked this session closing
+	// (see markClosing); the caller must not touch the live session at
+	// all, regardless of whether a prompt happens to be in flight too.
+	promptBeginClosing
+)
+
+// begin reports whether a new session/prompt may start for id, checking
+// closing before in-flight so a session mid-close is always reported as
+// closing even if (as is normal mid-teardown) a prompt also happens to be in
+// flight for it. This is the sole enforcement point: a caller must not touch
+// the live session (subscribe/submit) unless begin reports promptBeginOK,
+// and must call end exactly once afterward (typically via defer) regardless
+// of how the prompt concludes.
+func (t *promptTracker) begin(id SessionID) promptBeginOutcome {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, ok := t.inFlight[id]; ok {
-		return false
+	if _, ok := t.closing[id]; ok {
+		return promptBeginClosing
 	}
-	t.inFlight[id] = struct{}{}
-	return true
+	if _, ok := t.inFlight[id]; ok {
+		return promptBeginAlreadyInFlight
+	}
+	t.inFlight[id] = make(chan struct{})
+	return promptBeginOK
 }
 
 // end releases id, allowing a subsequent session/prompt on the same session
-// to proceed. It is a no-op if id is not currently marked in flight.
+// to proceed (unless the session has since been marked closing), and closes
+// the channel a concurrent markClosing call may be waiting on. It is a
+// no-op if id is not currently marked in flight.
 func (t *promptTracker) end(id SessionID) {
 	t.mu.Lock()
+	ch, ok := t.inFlight[id]
+	delete(t.inFlight, id)
+	t.mu.Unlock()
+	if ok {
+		close(ch)
+	}
+}
+
+// markClosing marks id as closing: every future begin call for id reports
+// promptBeginClosing, permanently (see the closing field's doc). It returns
+// the channel end will close when the currently in-flight prompt for id (if
+// any) concludes, and whether one was in flight at the moment closing was
+// recorded. Both the "mark closing" and "read in-flight state" steps happen
+// under the same lock, so a concurrent begin can never race past this: it
+// either observes closing already set (and reports promptBeginClosing) or
+// has already recorded itself in inFlight before this runs (and is therefore
+// exactly what wasInFlight/done reports).
+func (t *promptTracker) markClosing(id SessionID) (done <-chan struct{}, wasInFlight bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closing[id] = struct{}{}
+	ch, ok := t.inFlight[id]
+	return ch, ok
+}
+
+// forget drops every trace of id from both inFlight and closing. Callers
+// must only call this once id has already been removed from the live
+// session registry (see close.go's handleSessionClose, the only caller):
+// from that point on, resolveSession fails every session-scoped call for id
+// with ResourceNotFound before it can ever reach promptTracker again, so the
+// closing bookkeeping this file relies on to reject a late in-flight prompt
+// attempt is no longer needed. Without this, closing would grow by one
+// entry for every session ever closed over a long-running process's
+// lifetime — session ids are never reused (see SessionID's doc), so nothing
+// would ever naturally shrink it otherwise.
+func (t *promptTracker) forget(id SessionID) {
+	t.mu.Lock()
+	delete(t.closing, id)
 	delete(t.inFlight, id)
 	t.mu.Unlock()
 }
@@ -116,7 +203,11 @@ func (a *Agent) handlePrompt(ctx context.Context, _ string, params json.RawMessa
 	}
 	sessionID := live.SessionID()
 
-	if !a.prompts.begin(sessionID) {
+	switch a.prompts.begin(sessionID) {
+	case promptBeginOK:
+	case promptBeginClosing:
+		return nil, protocol.InvalidRequest("session/prompt: session is closing", ErrSessionClosing)
+	default: // promptBeginAlreadyInFlight
 		return nil, protocol.InvalidRequest("session/prompt: a prompt is already in flight for this session", ErrPromptAlreadyInFlight)
 	}
 	defer a.prompts.end(sessionID)
