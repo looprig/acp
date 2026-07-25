@@ -8,8 +8,10 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/looprig/acp/protocol"
@@ -113,6 +115,20 @@ type Agent struct {
 	// open for a closing session.
 	gates *gateTracker
 
+	// cursorKey is the HMAC-SHA256 key session/list pagination cursors are
+	// authenticated under (see list.go), generated fresh via crypto/rand at
+	// New() time — see list.go's package doc for why a per-instance,
+	// per-process key is the right choice here.
+	cursorKey [cursorKeySize]byte
+
+	// sessionInfoMu guards sessionInfoObserved, the last-known (title,
+	// lastActiveAt) pair sent to the client for each session id
+	// ObserveSessionMeta has seen — the dedup state that makes
+	// session_info_update emission proportional to actual catalog change
+	// rather than to how often a product happens to call in (list.go).
+	sessionInfoMu       sync.Mutex
+	sessionInfoObserved map[SessionID]observedSessionInfo
+
 	// client is the agent-calls-client method surface bound to the same Conn
 	// Register was given. handlePrompt's drain loop (prompt.go) uses it to
 	// send session/update notifications for the live events it observes on
@@ -135,13 +151,21 @@ func New(opts Options) (*Agent, error) {
 	if opts.Authenticator != nil && len(opts.AuthMethods) == 0 {
 		return nil, ErrAuthenticatorWithoutMethods
 	}
+
+	var cursorKey [cursorKeySize]byte
+	if _, err := rand.Read(cursorKey[:]); err != nil {
+		return nil, fmt.Errorf("agent: generate session/list cursor key: %w", err)
+	}
+
 	return &Agent{
-		opts:          opts,
-		authenticated: opts.Authenticator == nil,
-		clientCaps:    protocol.DefaultClientCapabilities(),
-		sessions:      newSessionRegistry(MaxLiveSessions),
-		prompts:       newPromptTracker(),
-		gates:         newGateTracker(),
+		opts:                opts,
+		authenticated:       opts.Authenticator == nil,
+		clientCaps:          protocol.DefaultClientCapabilities(),
+		sessions:            newSessionRegistry(MaxLiveSessions),
+		prompts:             newPromptTracker(),
+		gates:               newGateTracker(),
+		cursorKey:           cursorKey,
+		sessionInfoObserved: make(map[SessionID]observedSessionInfo),
 	}, nil
 }
 
@@ -153,13 +177,14 @@ func New(opts Options) (*Agent, error) {
 // none of these have a capability gate; each of session/new, session/prompt,
 // session/close, and session/resume consults
 // AuthorizeSessionCreation/resolveSession internally), authenticate/logout
-// only when their backing Options field is supplied, and session/load only
-// when Options.Replayer is supplied — matching capabilities.go's LoadSession
-// advertisement gate: a client is never told loadSession is supported yet has
-// the method rejected, and never told it is unsupported yet has it accepted.
-// Every other ACP method (later Phase 3/4 tasks) is intentionally left
-// unregistered here — Conn's own method-not-found fallback rejects them (see
-// conn.go's dispatchRequest) until a later task wires them up, which is
+// only when their backing Options field is supplied, session/load only when
+// Options.Replayer is supplied, and session/list only when Options.Catalog is
+// supplied — matching capabilities.go's LoadSession/SessionCapabilities.List
+// advertisement gates: a client is never told a capability is supported yet
+// has the method rejected, and never told it is unsupported yet has it
+// accepted. Every other ACP method (later Phase 3/4 tasks) is intentionally
+// left unregistered here — Conn's own method-not-found fallback rejects them
+// (see conn.go's dispatchRequest) until a later task wires them up, which is
 // exactly the fail-closed behavior an unadvertised capability must have.
 func (a *Agent) Register(conn *protocol.Conn) {
 	a.client = protocol.NewClientConn(conn)
@@ -171,6 +196,9 @@ func (a *Agent) Register(conn *protocol.Conn) {
 	conn.Handle(string(protocol.MethodSessionResume), a.handleSessionResume)
 	if a.opts.Replayer != nil {
 		conn.Handle(string(protocol.MethodSessionLoad), a.handleSessionLoad)
+	}
+	if a.opts.Catalog != nil {
+		conn.Handle(string(protocol.MethodSessionList), a.handleSessionList)
 	}
 	if a.opts.Authenticator != nil {
 		conn.Handle(string(protocol.MethodAuthenticate), a.handleAuthenticate)
