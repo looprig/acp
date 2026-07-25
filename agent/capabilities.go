@@ -47,20 +47,17 @@ func (a *Agent) capabilities() protocol.AgentCapabilities {
 
 	var session protocol.SessionCapabilities
 	// Resume is unconditional (see this function's doc): SessionHost.ResumeSession
-	// is a required method, so a facade always advertises it.
+	// is a required method, so a facade always advertises it. This also means
+	// SessionCapabilities is always populated below, since Resume alone is
+	// enough to make it non-empty.
 	session.Resume = &protocol.SessionResumeCapabilities{}
-	haveSessionCapabilities := true
 	if a.opts.Catalog != nil {
 		session.List = &protocol.SessionListCapabilities{}
-		haveSessionCapabilities = true
 	}
 	if a.opts.Deleter != nil {
 		session.Delete = &protocol.SessionDeleteCapabilities{}
-		haveSessionCapabilities = true
 	}
-	if haveSessionCapabilities {
-		caps.SessionCapabilities = &session
-	}
+	caps.SessionCapabilities = &session
 
 	return caps
 }
