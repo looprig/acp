@@ -125,10 +125,26 @@ type Conn struct {
 	nextExtID  atomic.Int64
 
 	// sem is a counting semaphore (capacity MaxInFlightHandlers) that bounds
-	// how many handler callbacks run concurrently. A goroutine spawned to
-	// run a handler blocks trying to send into sem until a slot is free (or
-	// done closes), which is how "excess requests queue" is implemented.
+	// how many request handler callbacks run concurrently. A goroutine
+	// spawned to run a handler blocks trying to send into sem until a slot
+	// is free (or done closes), which is how "excess requests queue" is
+	// implemented. Notification handlers do not use sem: see notifyMu et al.
 	sem chan struct{}
+
+	// notifyMu, notifyCond, notifyQueue, and notifyClosed implement an
+	// unbounded FIFO job queue drained by a single dedicated goroutine
+	// (notifyWorker), which is how notification handler *execution* (not
+	// just invocation) is serialized in wire order. Both dispatchNotification
+	// (live notifications) and HandleNotify (buffered-notification flush)
+	// enqueue onto this same queue rather than running or spawning a handler
+	// directly, so completion order always matches arrival order — including
+	// across different notification methods, and including a buffered flush
+	// relative to a live notification for the same method that arrives
+	// concurrently with registration (see HandleNotify).
+	notifyMu     sync.Mutex
+	notifyCond   *sync.Cond
+	notifyQueue  []func()
+	notifyClosed bool
 
 	done         chan struct{}
 	readLoopDone chan struct{}
@@ -152,6 +168,7 @@ func NewConn(r io.Reader, w io.Writer, opts ConnOptions) *Conn {
 		done:           make(chan struct{}),
 		readLoopDone:   make(chan struct{}),
 	}
+	c.notifyCond = sync.NewCond(&c.notifyMu)
 
 	// Call's id space starts at 1<<32 and counts up; storing base-1 lets
 	// mintCallID uniformly use Add(1) to produce the first id.
@@ -164,6 +181,7 @@ func NewConn(r io.Reader, w io.Writer, opts ConnOptions) *Conn {
 	c.nextExtID.Store(extBase - 1)
 
 	go c.readLoop()
+	go c.notifyWorker()
 	return c
 }
 
@@ -187,19 +205,30 @@ func (c *Conn) Handle(method string, h HandlerFunc) {
 }
 
 // HandleNotify registers h as the handler for incoming notifications with
-// the given method, then synchronously flushes — in arrival order — any
-// notifications for that method that were buffered before this call (see
-// NotifyBufferDepth).
+// the given method, then enqueues — in arrival order — any notifications for
+// that method that were buffered before this call (see NotifyBufferDepth)
+// for ordered execution on the same dispatch worker that runs live
+// notifications. HandleNotify does not block waiting for that flush to run;
+// it only guarantees the flushed notifications are queued ahead of any live
+// notification for method that could possibly be dispatched after this call
+// returns.
+//
+// The registration and the flush-enqueue happen under the same handlersMu
+// critical section, which is what guarantees the ordering: dispatchNotification
+// cannot observe the new handler (and thus cannot enqueue a live notification
+// for method) until this call releases handlersMu, by which point every
+// buffered notification for method has already been pushed onto the shared
+// queue ahead of it.
 func (c *Conn) HandleNotify(method string, h NotifyFunc) {
 	c.handlersMu.Lock()
 	c.notifyHandlers[method] = h
 	buffered := c.notifyBuffers[method]
 	delete(c.notifyBuffers, method)
-	c.handlersMu.Unlock()
-
 	for _, params := range buffered {
-		h(context.Background(), method, params)
+		params := params
+		c.enqueueNotifyJob(func() { h(context.Background(), method, params) })
 	}
+	c.handlersMu.Unlock()
 }
 
 // HandleUnknownRequest registers a catch-all handler invoked for any
@@ -396,6 +425,11 @@ func (c *Conn) shutdown(cause error) {
 
 		close(c.done)
 
+		c.notifyMu.Lock()
+		c.notifyClosed = true
+		c.notifyMu.Unlock()
+		c.notifyCond.Broadcast()
+
 		for _, ch := range pending {
 			ch <- callResult{err: c.closeErr}
 		}
@@ -418,9 +452,11 @@ func (c *Conn) shutdown(cause error) {
 // readLoop is the single goroutine that reads frames off the transport,
 // classifies them, and dispatches them. It owns FrameReader exclusively (per
 // FrameReader's single-reader-loop contract) and never blocks on a handler
-// callback: request/notification dispatch always hands off to a spawned
-// goroutine gated by sem, so a slow handler cannot stall reading subsequent
-// frames (in particular, responses correlating other in-flight Calls).
+// callback: request dispatch hands off to a spawned goroutine gated by sem,
+// and notification dispatch enqueues onto the notify worker's unbounded
+// queue (see enqueueNotifyJob), so a slow handler cannot stall reading
+// subsequent frames (in particular, responses correlating other in-flight
+// Calls).
 func (c *Conn) readLoop() {
 	defer close(c.readLoopDone)
 	for {
@@ -526,22 +562,26 @@ func (c *Conn) buildResponse(id ID, result any, err error) *Response {
 }
 
 // dispatchNotification routes an incoming notification to its registered
-// handler or the unknown-notify catch-all, both run in a spawned, sem-gated
-// goroutine. If neither exists, the notification is buffered (bounded,
-// drop-oldest-on-overflow) for a HandleNotify registration that may come
-// later.
+// handler or the unknown-notify catch-all, both enqueued onto the shared
+// notify worker queue (see notifyWorker) so that handler *completion* order
+// matches wire order across all notifications on this Conn, not just
+// invocation order. If neither a handler nor the catch-all exists, the
+// notification is buffered (bounded, drop-oldest-on-overflow) for a
+// HandleNotify registration that may come later.
 func (c *Conn) dispatchNotification(n *Notification) {
 	c.handlersMu.Lock()
 
 	if h, ok := c.notifyHandlers[n.Method]; ok {
 		c.handlersMu.Unlock()
-		c.spawnHandler(func() { h(context.Background(), n.Method, n.Params) })
+		method, params := n.Method, n.Params
+		c.enqueueNotifyJob(func() { h(context.Background(), method, params) })
 		return
 	}
 
 	if h := c.unknownNotify; h != nil {
 		c.handlersMu.Unlock()
-		c.spawnHandler(func() { h(context.Background(), n.Method, n.Params) })
+		method, params := n.Method, n.Params
+		c.enqueueNotifyJob(func() { h(context.Background(), method, params) })
 		return
 	}
 
@@ -556,6 +596,60 @@ func (c *Conn) dispatchNotification(n *Notification) {
 	c.notifyBuffers[n.Method] = buf
 
 	c.handlersMu.Unlock()
+}
+
+// enqueueNotifyJob appends job to the notify worker's queue and wakes it.
+// job is abandoned (never run) if the Conn has already started shutting
+// down, matching spawnHandler's "abandon rather than run" behavior for
+// handler work that has not yet started. Never blocks: the queue is an
+// unbounded slice guarded by notifyMu, not a fixed-capacity channel, so a
+// slow (or stalled) notifyWorker can never make a caller — in particular the
+// read loop, via dispatchNotification — block here.
+func (c *Conn) enqueueNotifyJob(job func()) {
+	c.notifyMu.Lock()
+	if c.notifyClosed {
+		c.notifyMu.Unlock()
+		return
+	}
+	c.notifyQueue = append(c.notifyQueue, job)
+	c.notifyMu.Unlock()
+	c.notifyCond.Signal()
+}
+
+// notifyWorker is the single goroutine that drains the notify queue,
+// running each queued job to completion before starting the next: this
+// strict one-at-a-time draining in enqueue order is what makes notification
+// handler completion order match wire order. It exits once the Conn is
+// shutting down, abandoning (not running) whatever is still queued at that
+// point — it never waits for a job it has already started, matching Close's
+// "does not wait for any handler callback still running" contract, and it
+// never blocks Close from returning.
+func (c *Conn) notifyWorker() {
+	for {
+		job, ok := c.nextNotifyJob()
+		if !ok {
+			return
+		}
+		job()
+	}
+}
+
+// nextNotifyJob blocks until a job is available or the Conn starts shutting
+// down. Once notifyClosed is set, it returns (nil, false) immediately even
+// if jobs remain queued, abandoning them.
+func (c *Conn) nextNotifyJob() (func(), bool) {
+	c.notifyMu.Lock()
+	defer c.notifyMu.Unlock()
+	for len(c.notifyQueue) == 0 && !c.notifyClosed {
+		c.notifyCond.Wait()
+	}
+	if c.notifyClosed {
+		return nil, false
+	}
+	job := c.notifyQueue[0]
+	c.notifyQueue[0] = nil
+	c.notifyQueue = c.notifyQueue[1:]
+	return job, true
 }
 
 // spawnHandler runs fn in a new goroutine once a slot in sem is available,

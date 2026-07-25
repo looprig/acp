@@ -494,6 +494,142 @@ func TestConnUnknownRequestAndNotifyHooks(t *testing.T) {
 	}
 }
 
+// --- notification handler completion order ---
+
+// TestConnNotificationHandlersCompleteInWireOrder proves that notification
+// handler *completion* follows wire (arrival) order, not just invocation
+// order. dispatchNotification previously spawned one goroutine per
+// notification onto a shared semaphore, so a slow handler for an
+// earlier-arriving notification could finish after a fast handler for a
+// later one — this test pins a slow method before a fast one and asserts
+// the slow one's handler completes first.
+func TestConnNotificationHandlersCompleteInWireOrder(t *testing.T) {
+	assertNoGoroutineLeak(t)
+
+	client, server := pipeConns(t)
+
+	var mu sync.Mutex
+	var completionOrder []string
+
+	slowRelease := make(chan struct{})
+	server.HandleNotify("slow.method", func(ctx context.Context, method string, params json.RawMessage) {
+		<-slowRelease
+		mu.Lock()
+		completionOrder = append(completionOrder, "slow")
+		mu.Unlock()
+	})
+
+	fastDone := make(chan struct{})
+	server.HandleNotify("fast.method", func(ctx context.Context, method string, params json.RawMessage) {
+		mu.Lock()
+		completionOrder = append(completionOrder, "fast")
+		mu.Unlock()
+		close(fastDone)
+	})
+
+	if err := client.Notify(context.Background(), "slow.method", nil); err != nil {
+		t.Fatalf("Notify(slow.method) error = %v", err)
+	}
+	if err := client.Notify(context.Background(), "fast.method", nil); err != nil {
+		t.Fatalf("Notify(fast.method) error = %v", err)
+	}
+
+	// Give an unordered dispatcher every opportunity to let the fast
+	// handler race ahead and complete before the slow one is released.
+	time.Sleep(50 * time.Millisecond)
+	close(slowRelease)
+
+	select {
+	case <-fastDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("fast.method handler never completed")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(completionOrder) != 2 || completionOrder[0] != "slow" || completionOrder[1] != "fast" {
+		t.Fatalf("completionOrder = %v, want [slow fast] (wire order)", completionOrder)
+	}
+}
+
+// TestConnBufferedFlushStaysOrderedAheadOfRacingLiveNotification proves that
+// HandleNotify's buffered-early-notification flush composes correctly with
+// the ordered live-dispatch path: a live notification for the same method,
+// fired concurrently with registration, must never be observed ahead of the
+// notifications that were buffered (arrived) before registration.
+func TestConnBufferedFlushStaysOrderedAheadOfRacingLiveNotification(t *testing.T) {
+	assertNoGoroutineLeak(t)
+
+	client, server := pipeConns(t)
+
+	server.Handle("sync", func(ctx context.Context, method string, params json.RawMessage) (any, error) {
+		return "ok", nil
+	})
+
+	const n = 200
+	for i := 0; i < n; i++ {
+		if err := client.Notify(context.Background(), "race.method", echoParams{Value: strconv.Itoa(i)}); err != nil {
+			t.Fatalf("Notify(%d) error = %v", i, err)
+		}
+	}
+	var syncResult string
+	if err := client.Call(context.Background(), "sync", nil, &syncResult); err != nil {
+		t.Fatalf("Call(sync) error = %v", err)
+	}
+
+	var mu sync.Mutex
+	var got []string
+	done := make(chan struct{})
+	var once sync.Once
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Fire the "live" notification as close as possible to
+		// registration, racing HandleNotify's internal flush-enqueue.
+		_ = client.Notify(context.Background(), "race.method", echoParams{Value: "live"})
+	}()
+
+	server.HandleNotify("race.method", func(ctx context.Context, method string, params json.RawMessage) {
+		var p echoParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			t.Errorf("unmarshal notify params: %v", err)
+			return
+		}
+		mu.Lock()
+		got = append(got, p.Value)
+		count := len(got)
+		mu.Unlock()
+		if count == n+1 {
+			once.Do(func() { close(done) })
+		}
+	})
+
+	wg.Wait()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		mu.Lock()
+		t.Fatalf("did not receive all %d notifications (got %v)", n+1, got)
+		mu.Unlock()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != n+1 {
+		t.Fatalf("got %d notifications, want %d: %v", len(got), n+1, got)
+	}
+	for i := 0; i < n; i++ {
+		if got[i] != strconv.Itoa(i) {
+			t.Fatalf("got[%d] = %q, want %q (buffered flush order violated)", i, got[i], strconv.Itoa(i))
+		}
+	}
+	if got[n] != "live" {
+		t.Fatalf("got[%d] = %q, want %q (live notification raced ahead of buffered flush)", n, got[n], "live")
+	}
+}
+
 func mustMarshal(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	raw, err := json.Marshal(v)
