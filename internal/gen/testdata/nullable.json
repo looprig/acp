@@ -1,0 +1,39 @@
+{
+  "$defs": {
+    "Widget": {
+      "description": "A widget used to test nullable field normalization.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Required, non-nullable.",
+          "type": "string"
+        },
+        "nickname": {
+          "description": "Optional via a nullable type array.",
+          "type": ["string", "null"]
+        },
+        "owner": {
+          "description": "Optional via anyOf-with-null referencing another def.",
+          "anyOf": [
+            { "$ref": "#/$defs/Owner" },
+            { "type": "null" }
+          ]
+        },
+        "tags": {
+          "description": "Nullable array stays a plain slice, no pointer needed.",
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["name"]
+    },
+    "Owner": {
+      "description": "Referenced by Widget.owner.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" }
+      },
+      "required": ["id"]
+    }
+  }
+}

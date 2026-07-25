@@ -1,0 +1,50 @@
+{
+  "$defs": {
+    "FeatureCapabilities": {
+      "description": "Mirrors PromptCapabilities: every field is optional and has a boolean default, so a Default() constructor is generated.",
+      "type": "object",
+      "properties": {
+        "widgets": {
+          "description": "Widgets supported.",
+          "type": "boolean",
+          "default": false
+        },
+        "gadgets": {
+          "description": "Gadgets supported.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "RootCapabilities": {
+      "description": "Mirrors AgentCapabilities: a nested capability field defaults via the nested type's own Default() constructor.",
+      "type": "object",
+      "properties": {
+        "loadThing": {
+          "description": "Whether loadThing is supported.",
+          "type": "boolean",
+          "default": false
+        },
+        "features": {
+          "description": "Nested feature capabilities.",
+          "default": { "widgets": false, "gadgets": false },
+          "allOf": [{ "$ref": "#/$defs/FeatureCapabilities" }]
+        }
+      }
+    },
+    "ProtocolVersion": {
+      "description": "Mirrors the real schema's ProtocolVersion def, present so the generated methods_gen.go's CurrentProtocolVersion constant (typed as ProtocolVersion) compiles in the behavior-test fixture bundle.",
+      "type": "integer",
+      "format": "uint16"
+    },
+    "NotDefaultable": {
+      "description": "Has a default field but also a required field with none, so no Default() should be generated.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "flag": { "type": "boolean", "default": false }
+      },
+      "required": ["id"]
+    }
+  }
+}

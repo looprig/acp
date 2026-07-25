@@ -1,0 +1,120 @@
+{
+  "$defs": {
+    "Shape": {
+      "description": "A discriminated union of shape kinds, no fallback branch.",
+      "oneOf": [
+        {
+          "description": "A circle.",
+          "type": "object",
+          "properties": { "kind": { "type": "string", "const": "circle" } },
+          "required": ["kind"],
+          "allOf": [{ "$ref": "#/$defs/Circle" }]
+        },
+        {
+          "description": "A square.",
+          "type": "object",
+          "properties": { "kind": { "type": "string", "const": "square" } },
+          "required": ["kind"],
+          "allOf": [{ "$ref": "#/$defs/Square" }]
+        }
+      ]
+    },
+    "Circle": {
+      "description": "Circle payload.",
+      "type": "object",
+      "properties": {
+        "radius": { "type": "number", "format": "double" }
+      },
+      "required": ["radius"]
+    },
+    "Square": {
+      "description": "Square payload.",
+      "type": "object",
+      "properties": {
+        "side": { "type": "number", "format": "double" }
+      },
+      "required": ["side"]
+    },
+    "Transport": {
+      "description": "A discriminated union with a fallback branch used when the tag is absent or unrecognized.",
+      "anyOf": [
+        {
+          "description": "HTTP transport.",
+          "type": "object",
+          "properties": { "type": { "type": "string", "const": "http" } },
+          "required": ["type"],
+          "allOf": [{ "$ref": "#/$defs/HTTPTransport" }]
+        },
+        {
+          "title": "stdio",
+          "description": "Default transport when no type tag is present.",
+          "allOf": [{ "$ref": "#/$defs/StdioTransport" }]
+        }
+      ]
+    },
+    "HTTPTransport": {
+      "description": "HTTP transport payload.",
+      "type": "object",
+      "properties": {
+        "url": { "type": "string" }
+      },
+      "required": ["url"]
+    },
+    "StdioTransport": {
+      "description": "Stdio transport payload.",
+      "type": "object",
+      "properties": {
+        "command": { "type": "string" }
+      },
+      "required": ["command"]
+    },
+    "ResourcePayload": {
+      "description": "A structural union: no branch has a discriminator tag; told apart by required-field presence.",
+      "anyOf": [
+        {
+          "title": "TextPayload",
+          "allOf": [{ "$ref": "#/$defs/TextPayload" }]
+        },
+        {
+          "title": "BlobPayload",
+          "allOf": [{ "$ref": "#/$defs/BlobPayload" }]
+        }
+      ]
+    },
+    "TextPayload": {
+      "description": "Text payload.",
+      "type": "object",
+      "properties": {
+        "text": { "type": "string" },
+        "uri": { "type": "string" }
+      },
+      "required": ["text", "uri"]
+    },
+    "BlobPayload": {
+      "description": "Blob payload.",
+      "type": "object",
+      "properties": {
+        "blob": { "type": "string" },
+        "uri": { "type": "string" }
+      },
+      "required": ["blob", "uri"]
+    },
+    "SingleBranch": {
+      "description": "A degenerate single-branch union, generated as a plain alias.",
+      "anyOf": [
+        {
+          "title": "only",
+          "allOf": [{ "$ref": "#/$defs/OnlyPayload" }]
+        }
+      ]
+    },
+    "OnlyPayload": {
+      "description": "The only alternative.",
+      "type": "object",
+      "properties": {
+        "value": { "type": "string" }
+      },
+      "required": ["value"]
+    }
+  }
+}

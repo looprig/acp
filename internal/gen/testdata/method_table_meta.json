@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "agentMethods": {
+    "session_new": "session/new",
+    "initialize": "initialize"
+  },
+  "clientMethods": {
+    "session_update": "session/update"
+  },
+  "protocolMethods": {
+    "cancel_request": "$/cancel_request"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "$defs": {
+    "Status": {
+      "description": "A closed string enum: every branch carries a const, unknown values must be rejected.",
+      "oneOf": [
+        { "description": "Pending.", "type": "string", "const": "pending" },
+        { "description": "Done.", "type": "string", "const": "done" }
+      ]
+    },
+    "Category": {
+      "description": "An open string enum: one branch has no const, so unrecognized values are accepted.",
+      "anyOf": [
+        { "description": "Mode selector.", "type": "string", "const": "mode" },
+        { "description": "Model selector.", "type": "string", "const": "model" },
+        { "title": "other", "description": "Anything else.", "type": "string" }
+      ]
+    },
+    "Code": {
+      "description": "An open integer enum, named via titles (mirrors ErrorCode).",
+      "anyOf": [
+        { "title": "Parse error", "description": "Bad JSON.", "type": "integer", "format": "int32", "const": -32700 },
+        { "title": "Other", "description": "Anything else.", "type": "integer", "format": "int32" }
+      ]
+    }
+  }
+}
