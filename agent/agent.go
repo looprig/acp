@@ -179,8 +179,12 @@ func New(opts Options) (*Agent, error) {
 // AuthorizeSessionCreation/resolveSession internally), authenticate/logout
 // only when their backing Options field is supplied, session/load only when
 // Options.Replayer is supplied, session/list only when Options.Catalog is
-// supplied, and session/delete only when Options.Deleter is supplied —
-// matching capabilities.go's LoadSession/SessionCapabilities.List/
+// supplied, session/delete only when Options.Deleter is supplied, and
+// session/set_config_option/session/set_mode only when BOTH
+// Options.ConfigCatalog and Options.ConfigController are supplied (see
+// config.go: validating a change needs a live catalog, applying one needs a
+// controller, so either alone leaves both methods unregistered) — matching
+// capabilities.go's LoadSession/SessionCapabilities.List/
 // SessionCapabilities.Delete advertisement gates: a client is never told a
 // capability is supported yet has the method rejected, and never told it is
 // unsupported yet has it accepted. Every other ACP method (later Phase 4
@@ -204,6 +208,10 @@ func (a *Agent) Register(conn *protocol.Conn) {
 	}
 	if a.opts.Deleter != nil {
 		conn.Handle(string(protocol.MethodSessionDelete), a.handleSessionDelete)
+	}
+	if a.opts.ConfigCatalog != nil && a.opts.ConfigController != nil {
+		conn.Handle(string(protocol.MethodSessionSetConfigOption), a.handleSessionSetConfigOption)
+		conn.Handle(string(protocol.MethodSessionSetMode), a.handleSessionSetMode)
 	}
 	if a.opts.Authenticator != nil {
 		conn.Handle(string(protocol.MethodAuthenticate), a.handleAuthenticate)

@@ -151,31 +151,119 @@ type SessionCatalog interface {
 	ListSessions(context.Context) ([]SessionCatalogEntry, error)
 }
 
-// RuntimeConfigOption is a placeholder projection of one configurable
-// runtime option (mode, model, effort, or another product-defined category).
-// Task 4 refines its shape to match ACP's config-option discriminated union.
-type RuntimeConfigOption struct {
-	ID    string
-	Value string
+// RuntimeConfigValue is one selectable value of a RuntimeConfigOption: its
+// stable wire identity, human-readable label, and optional description. It
+// mirrors the pinned schema's SessionConfigSelectOption field-for-field so
+// config.go's translation to the wire type is a straight copy, never a
+// guess.
+type RuntimeConfigValue struct {
+	ID          protocol.SessionConfigValueID
+	Name        string
+	Description string
 }
+
+// RuntimeConfigOption is one configurable runtime option's complete current
+// state: its identity, semantic category, human-readable label, the full set
+// of values it currently offers, and which of those values is currently
+// active. This is the discriminated union Task 4.1 was asked to refine
+// RuntimeConfigOption's shape into — discriminated on Category, exactly
+// mirroring the pinned schema's SessionConfigOptionCategory constants (mode,
+// model, model_config, thought_level) plus any product-defined free-form
+// category the schema reserves for values beginning with "_" (see
+// protocol.SessionConfigOptionCategory's doc). Every RuntimeConfigOption
+// config.go builds is projected onto the wire as a "select" variant
+// (protocol.SessionConfigSelect): a dropdown over Values with CurrentValue
+// marking the active one. This module has no need for the wire's "boolean"
+// variant — every category this facade is asked to support (mode, model,
+// thought level, and any further product-defined option) is naturally an
+// enumerated choice, never a raw on/off toggle — so RuntimeConfigOption does
+// not model one; a host that needs a boolean-shaped option is out of this
+// task's scope.
+//
+// Category is protocol.SessionConfigOptionCategory directly rather than a
+// second parallel host-side enum: this package already imports
+// acp/protocol (see SessionID/Authenticator above), the wire category is
+// exactly the semantic this field carries, and duplicating it would only
+// invite the two to drift.
+//
+// Concretely, a RuntimeConfigCatalog implementation sources the mode
+// category's Values/CurrentValue from Harness's loop.ModeCatalog.Modes()
+// (translating each loop.ModeName into a RuntimeConfigValue) and every other
+// category from the product's own model/effort/access catalogs — Harness
+// deliberately has no model/effort/access catalog itself (see design doc
+// "Session configuration"). acp/agent never imports pkg/loop to do this
+// itself: LiveSession (this file) deliberately narrows session.Session down
+// to the data-plane methods a prompt/gate/interrupt handler needs and omits
+// ActiveLoop/Loop/SubmitToLoop, so a RuntimeConfigCatalog/
+// RuntimeConfigController is where a host reaches into its own
+// loop.ModeCatalog/loop.Controller instead — a consumer-owned adapter, not a
+// Harness-native type, exactly like SessionHost and the rest of this file.
+type RuntimeConfigOption struct {
+	ID           protocol.SessionConfigID
+	Category     protocol.SessionConfigOptionCategory
+	Name         string
+	Description  string
+	Values       []RuntimeConfigValue
+	CurrentValue protocol.SessionConfigValueID
+}
+
+// ModeConfigOptionID is the well-known RuntimeConfigOption.ID a
+// RuntimeConfigCatalog/RuntimeConfigController implementation MUST use for
+// the session-mode option (Category protocol.SessionConfigOptionCategoryMode,
+// Values/CurrentValue sourced from loop.ModeCatalog.Modes() — see
+// RuntimeConfigOption's doc). This is what keeps session/set_mode and
+// session/set_config_option convergent: the pinned schema's
+// SetSessionModeRequest carries only a bare SessionModeID, no configId, so
+// config.go's handleSessionSetMode always targets this constant, translating
+// the request into exactly the same call handleSessionSetConfigOption would
+// make for configId=ModeConfigOptionID — both paths run through the single
+// unexported applyConfigOption (config.go), never two independent
+// implementations that could drift.
+const ModeConfigOptionID protocol.SessionConfigID = "mode"
 
 // RuntimeConfigCatalog is the optional capability to enumerate the runtime
 // configuration options currently available for a session. Concretely this
 // is backed by Harness's loop.ModeCatalog plus a product's own model/effort
 // catalogs (Harness deliberately has no model/effort catalog itself — see
 // design doc "Session configuration").
+//
+// config.go always fetches this catalog fresh, immediately before applying a
+// requested change: this is the latest-snapshot validation the design
+// requires (an option id or value id valid a moment ago may no longer be —
+// a mode removed, a model retired — so the check must run against what is
+// true right now, never a value cached from session/new or an earlier
+// request).
 type RuntimeConfigCatalog interface {
 	RuntimeConfigOptions(context.Context, SessionID) ([]RuntimeConfigOption, error)
 }
 
+// RuntimeConfigChange is a validated request to set one RuntimeConfigOption
+// (identified by OptionID) to one of the values it currently offers
+// (ValueID). config.go constructs this only after checking both ids against
+// a RuntimeConfigCatalog snapshot fetched in the same request.
+type RuntimeConfigChange struct {
+	OptionID protocol.SessionConfigID
+	ValueID  protocol.SessionConfigValueID
+}
+
 // RuntimeConfigController is the optional capability to apply a validated
 // runtime configuration change and return the complete resulting option
-// state so dependent choices stay coherent. Config writes are idempotent:
-// setting an option to its current value must succeed without side effects.
-// Concretely this is backed by Harness's loop.Controller (SetMode, Change)
-// plus a product's own model/effort controllers.
+// state so dependent choices stay coherent. Concretely this is backed by
+// Harness's loop.Controller (SetMode, Change) plus a product's own
+// model/effort controllers — reached the same consumer-owned-adapter way
+// RuntimeConfigOption's doc describes, since LiveSession does not expose
+// Controller either.
+//
+// Config writes are idempotent: setting an option to its current value must
+// succeed without side effects. config.go itself enforces this — it compares
+// the requested ValueID against the latest catalog's CurrentValue for that
+// option BEFORE ever calling SetRuntimeConfigOption, and short-circuits to a
+// no-op success (no controller call, no config_option_update notification)
+// when they already match. An implementation of this interface is therefore
+// never asked to special-case a same-value request, and need not itself be
+// idempotent for this contract to hold.
 type RuntimeConfigController interface {
-	SetRuntimeConfigOption(context.Context, SessionID, RuntimeConfigOption) ([]RuntimeConfigOption, error)
+	SetRuntimeConfigOption(context.Context, SessionID, RuntimeConfigChange) ([]RuntimeConfigOption, error)
 }
 
 // Compactor is the optional capability to trigger the session's focused/

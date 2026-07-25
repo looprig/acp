@@ -30,10 +30,15 @@ import "github.com/looprig/acp/protocol"
 // (see handleInitialize), not a capability struct.
 //
 // RuntimeConfigCatalog, RuntimeConfigController, and Compactor have no
-// initialize-level wire representation at all in the pinned schema: config
-// options are surfaced per-session in the session/new response (Task 4.1)
-// and `/compact` is advertised as a session-level available command (Task
-// 4.2). Supplying or omitting them therefore has no effect on this response.
+// initialize-level wire representation at all in the pinned schema: as of
+// Task 4.1, ConfigCatalog/ConfigController instead gate registration of the
+// session/set_config_option and session/set_mode methods directly (see
+// agent.go's Register and config.go), and `/compact` is advertised as a
+// session-level available command (Task 4.2). Supplying or omitting them
+// therefore has no effect on this response. (Populating NewSessionResponse's
+// own ConfigOptions/Modes fields with the session's initial state is a
+// separate, still-open follow-up — Task 4.1 only wires the two mutation
+// methods.)
 func (a *Agent) capabilities() protocol.AgentCapabilities {
 	caps := protocol.AgentCapabilities{
 		LoadSession: a.opts.Replayer != nil,

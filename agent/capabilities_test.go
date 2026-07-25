@@ -51,7 +51,7 @@ func (fakeConfigCatalog) RuntimeConfigOptions(context.Context, agent.SessionID) 
 
 type fakeConfigController struct{}
 
-func (fakeConfigController) SetRuntimeConfigOption(context.Context, agent.SessionID, agent.RuntimeConfigOption) ([]agent.RuntimeConfigOption, error) {
+func (fakeConfigController) SetRuntimeConfigOption(context.Context, agent.SessionID, agent.RuntimeConfigChange) ([]agent.RuntimeConfigOption, error) {
 	return nil, nil
 }
 
@@ -211,7 +211,7 @@ func TestCapabilityAdvertisementMatrix(t *testing.T) {
 			method: "",
 		},
 		{
-			name:   "RuntimeConfigController backs session/set_config_option (deferred, currently always rejected)",
+			name:   "RuntimeConfigController alone (no ConfigCatalog) still leaves session/set_config_option unregistered",
 			with:   func(o *agent.Options) { o.ConfigController = fakeConfigController{} },
 			check:  func(t *testing.T, resp *protocol.InitializeResponse, present bool) { t.Helper() },
 			method: "session/set_config_option",
