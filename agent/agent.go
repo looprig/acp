@@ -87,6 +87,21 @@ type Agent struct {
 
 	authMu        sync.Mutex
 	authenticated bool
+
+	// capsMu guards clientCaps, the negotiated client capability set
+	// recorded at initialize (see handleInitialize) and read back by
+	// handleSessionNew when constructing each session's Setup. It defaults
+	// to the full schema-declared default set so a session created before
+	// any initialize call (which should not happen over a conforming
+	// client, but is not this facade's to assume) still gets a valid,
+	// conservative Setup rather than a zero value.
+	capsMu     sync.Mutex
+	clientCaps protocol.ClientCapabilities
+
+	// sessions is the bounded registry of live ACP sessions keyed by their
+	// Harness session UUID (see session.go's resolveSession and
+	// handleSessionNew, and registry.go's sessionRegistry).
+	sessions *sessionRegistry
 }
 
 // New validates opts and constructs the facade.
@@ -105,18 +120,23 @@ func New(opts Options) (*Agent, error) {
 	return &Agent{
 		opts:          opts,
 		authenticated: opts.Authenticator == nil,
+		clientCaps:    protocol.DefaultClientCapabilities(),
+		sessions:      newSessionRegistry(MaxLiveSessions),
 	}, nil
 }
 
 // Register binds the facade's currently implemented handlers onto conn:
-// initialize unconditionally, and authenticate/logout only when their
-// backing Options field is supplied. Every other ACP method (session/new and
-// later) is intentionally left unregistered here — Conn's own
-// method-not-found fallback rejects them (see conn.go's dispatchRequest)
-// until a later task wires them up, which is exactly the fail-closed
-// behavior an unadvertised capability must have.
+// initialize and session/new unconditionally (every product-facing agent
+// needs Options.Host, so session/new has no capability gate of its own —
+// only the AuthorizeSessionCreation gate it consults internally), and
+// authenticate/logout only when their backing Options field is supplied.
+// Every other ACP method (session/prompt and later) is intentionally left
+// unregistered here — Conn's own method-not-found fallback rejects them (see
+// conn.go's dispatchRequest) until a later task wires them up, which is
+// exactly the fail-closed behavior an unadvertised capability must have.
 func (a *Agent) Register(conn *protocol.Conn) {
 	conn.Handle(string(protocol.MethodInitialize), a.handleInitialize)
+	conn.Handle(string(protocol.MethodSessionNew), a.handleSessionNew)
 	if a.opts.Authenticator != nil {
 		conn.Handle(string(protocol.MethodAuthenticate), a.handleAuthenticate)
 	}
@@ -158,13 +178,21 @@ func (a *Agent) setAuthenticated(v bool) {
 // capabilities.go). This module speaks exactly protocol version 1, so the
 // response always names it; a client that cannot speak it is expected to
 // disconnect, per the pinned schema.
+//
+// It also records the client's negotiated capability set (with every
+// schema-declared default applied to any subfield the client did not
+// advertise) for handleSessionNew to read back into each session's Setup:
+// client capabilities are negotiated once for the connection, not re-sent
+// per session/new request (see NewSessionRequest in types_gen.go, which
+// carries no client-capability field of its own).
 func (a *Agent) handleInitialize(_ context.Context, _ string, params json.RawMessage) (any, error) {
+	var req protocol.InitializeRequest
 	if len(params) > 0 {
-		var req protocol.InitializeRequest
 		if err := json.Unmarshal(params, &req); err != nil {
 			return nil, protocol.InvalidParams("initialize: decode params", err)
 		}
 	}
+	a.setClientCapabilities(defaultedClientCapabilities(req.ClientCapabilities))
 
 	caps := a.capabilities()
 	return protocol.InitializeResponse{
@@ -172,6 +200,23 @@ func (a *Agent) handleInitialize(_ context.Context, _ string, params json.RawMes
 		AgentCapabilities: &caps,
 		AuthMethods:       a.opts.AuthMethods,
 	}, nil
+}
+
+// setClientCapabilities records c as the connection's negotiated client
+// capability set.
+func (a *Agent) setClientCapabilities(c protocol.ClientCapabilities) {
+	a.capsMu.Lock()
+	a.clientCaps = c
+	a.capsMu.Unlock()
+}
+
+// negotiatedClientCapabilities returns the client capability set recorded by
+// the most recent initialize call (or the full schema-declared defaults, if
+// initialize has not yet run).
+func (a *Agent) negotiatedClientCapabilities() protocol.ClientCapabilities {
+	a.capsMu.Lock()
+	defer a.capsMu.Unlock()
+	return a.clientCaps
 }
 
 // handleAuthenticate answers the authenticate method. It is only ever
