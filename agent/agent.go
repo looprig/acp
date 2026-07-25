@@ -45,10 +45,23 @@ type Options struct {
 	// session/set_mode (see RuntimeConfigController; wired starting Task
 	// 4.1).
 	ConfigController RuntimeConfigController
-	// Compactor, when supplied, lets the facade run the `/compact` slash
-	// command (see Compactor; wired starting Task 4.2). It has no
-	// initialize-level wire representation: it is advertised as a
-	// session-level available command.
+	// Compactor, when supplied, signals that compaction is available and
+	// gates whether the facade advertises/routes the `/compact` slash
+	// command at all (see Compactor; wired starting Task 4.2, per-session
+	// resolution added as a follow-up fix). It has no initialize-level wire
+	// representation: it is advertised as a session-level available
+	// command.
+	//
+	// This field is a presence signal ONLY — decided once, before any
+	// session exists, purely to answer "is `/compact` a thing at all on
+	// this connection?" It is NEVER invoked directly to perform a
+	// compaction: a single connection-wide field cannot tell which of
+	// several concurrent sessions a `/compact` request belongs to. The
+	// Compactor actually called for a given session is always resolved
+	// from that session's own LiveSession value instead, via a
+	// live.(Compactor) type-assertion in compact.go's handleCompactPrompt —
+	// see Compactor's doc (host.go) for the full explanation and the
+	// SessionCloser precedent this mirrors.
 	Compactor Compactor
 	// Deleter, when supplied, backs the session/delete capability (see
 	// SessionDeleter; wired starting Task 3.4).

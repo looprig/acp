@@ -62,7 +62,10 @@ type SessionHost interface {
 // interface's full method set, since session.Session also carries
 // loop-addressed and compaction methods (ActiveLoop, Loop, SubmitToLoop,
 // Compact, CompactToLoop) that ACP's data plane does not need directly;
-// Compact is exposed separately as the optional Compactor capability.
+// Compact is exposed separately as the optional Compactor capability,
+// resolved per-session via a live.(Compactor) type-assertion on this
+// specific value (see Compactor's own doc below) — never through
+// Options.Compactor directly.
 //
 // Wire-exposure trust boundary: same rule as SessionHost's doc comment above.
 // An error Submit, SubscribeEvents, or RespondGate returns is folded into a
@@ -271,6 +274,22 @@ type RuntimeConfigController interface {
 // returns the command id used to correlate the compaction outcome exactly
 // like Submit; the ACP prompt handler completes only once that outcome is
 // observed (see design doc "Slash commands and compaction").
+//
+// Resolution is per-session, never connection-wide: compact.go's
+// handleCompactPrompt type-asserts the SPECIFIC session's LiveSession value
+// against this interface (live.(Compactor)) to find the Compactor to
+// actually call — exactly the same pattern SessionCloser uses via
+// live.(SessionCloser) in close.go/replay.go. Options.Compactor (agent.go)
+// is a DIFFERENT, connection-level field of this same interface type; it is
+// set once, before any session exists, and exists solely to answer the one
+// question that has to be decided at that point — whether `/compact` should
+// be advertised (and routed) at all (ensureAvailableCommandsAdvertised,
+// compact.go). Options.Compactor is never itself invoked to perform a
+// compaction: a single connection-wide field cannot distinguish which of
+// several concurrent sessions on the same Agent a `/compact` request
+// belongs to, so only the per-session live.(Compactor) resolution above is
+// ever actually called. Do not reintroduce a direct call through
+// Options.Compactor.Compact.
 type Compactor interface {
 	Compact(context.Context) (uuid.UUID, error)
 }

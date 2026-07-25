@@ -92,6 +92,36 @@ type fakeLiveSession struct {
 	shutdownErr         error
 	shutdownBlock       chan struct{}
 	shutdownHadDeadline bool
+
+	// compactor optionally backs the agent.Compactor capability for THIS
+	// specific fakeLiveSession instance (see host.go's Compactor doc and
+	// compact.go's handleCompactPrompt, which resolves Compactor per-session
+	// via live.(Compactor) — never through a connection-wide field). Setting
+	// a different compactor on two different fakeLiveSession values lets
+	// compact_test.go's multi-session regression test prove each session's
+	// `/compact` invokes only its OWN compactor, never another session's or
+	// the connection-level Options.Compactor.
+	compactor agent.Compactor
+}
+
+// Compact implements agent.Compactor. Every fakeLiveSession therefore
+// structurally satisfies Compactor; the test that must exercise the "live
+// session does NOT implement Compactor" branch uses a different LiveSession
+// type entirely (see compact_test.go's liveSessionWithoutCompactor), mirroring
+// how Shutdown/SessionCloser already does this above. Compact forwards to
+// whichever agent.Compactor this instance was wired with; a fakeLiveSession
+// with no compactor configured fails closed with an explicit error rather
+// than silently succeeding, so a test that forgets to wire one gets a loud
+// failure instead of a false pass.
+func (f *fakeLiveSession) Compact(ctx context.Context) (coreuuid.UUID, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, "compact")
+	c := f.compactor
+	f.mu.Unlock()
+	if c == nil {
+		return coreuuid.UUID{}, errors.New("fakeLiveSession: Compact called without a per-session compactor configured")
+	}
+	return c.Compact(ctx)
 }
 
 // Shutdown implements agent.SessionCloser. Every fakeLiveSession therefore

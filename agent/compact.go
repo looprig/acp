@@ -35,6 +35,18 @@
 // resume out again or silently break that invariant. Tying it to the first
 // prompt instead reaches every session-establishment path uniformly, without
 // touching session.go/resume.go/replay.go at all.
+//
+// Options.Compactor is a connection-level field, set once before any session
+// exists, so it answers exactly one question: whether compaction is
+// available at all, for the sole purpose of deciding whether to advertise
+// and route `/compact` (above, and ensureAvailableCommandsAdvertised below).
+// It is NEVER invoked to actually perform a compaction — a single
+// connection-wide field cannot tell two different sessions' compactions
+// apart, so the actual Compactor for a given `/compact` call is always
+// resolved from that SPECIFIC session's live value instead
+// (live.(Compactor) in handleCompactPrompt), the same per-session
+// type-assertion pattern SessionCloser already uses (host.go's Compactor
+// doc; close.go's live.(SessionCloser)).
 package agent
 
 import (
@@ -71,6 +83,20 @@ var compactAvailableCommand = protocol.AvailableCommand{
 // protocol.Fault); it exists so local callers can errors.Is/As it.
 var ErrCompactSubscriptionClosed = errors.New("agent: event subscription closed before compaction outcome")
 
+// ErrCompactorNotImplemented is the local cause used when a session's
+// LiveSession value does not implement Compactor, even though
+// Options.Compactor is configured at the connection level. Options.Compactor
+// only gates whether `/compact` is advertised/routed at all (see host.go's
+// Compactor doc and Options.Compactor's own doc, agent.go) — it is never the
+// thing actually invoked, so it cannot substitute for a session whose own
+// live value does not support compaction. A correctly implemented
+// SessionHost should never produce this (every live session it hands back
+// should implement Compactor exactly when compaction is generally
+// available), but handleCompactPrompt still fails closed here rather than
+// panicking or silently no-op-succeeding if it ever does. Never crosses the
+// wire itself; exists so local callers can errors.Is/As it.
+var ErrCompactorNotImplemented = errors.New("agent: session does not implement Compactor")
+
 // isCompactSlashCommand reports whether blocks is exactly the literal
 // "/compact" command: a single text content block whose entire text equals
 // compactCommandName. Any other shape — zero or multiple blocks, a non-text
@@ -85,23 +111,33 @@ func isCompactSlashCommand(blocks []protocol.ContentBlock) bool {
 }
 
 // handleCompactPrompt runs the `/compact` slash command for one
-// session/prompt call: it subscribes to live's Enduring event stream
-// (compaction events are all Enduring and loop-scoped — see
-// harness/pkg/event/compaction.go — and the target loop is not known ahead
-// of time, so every loop is subscribed, exactly like prompt.go's own
-// subscribe-before-submit rule guards against a race between subscribing and
-// triggering the command), triggers Compactor.Compact, and drains until the
-// correlated outcome. The caller (handlePrompt) has already confirmed
-// Options.Compactor is configured and req.Prompt is exactly
-// isCompactSlashCommand.
+// session/prompt call: it resolves Compactor from the SPECIFIC session's
+// live value (live.(Compactor) — never a.opts.Compactor, which is only a
+// connection-level advertisement signal; see host.go's Compactor doc and
+// close.go's live.(SessionCloser) for the identical pattern), subscribes to
+// live's Enduring event stream (compaction events are all Enduring and
+// loop-scoped — see harness/pkg/event/compaction.go — and the target loop is
+// not known ahead of time, so every loop is subscribed, exactly like
+// prompt.go's own subscribe-before-submit rule guards against a race between
+// subscribing and triggering the command), triggers Compactor.Compact, and
+// drains until the correlated outcome. The caller (handlePrompt) has already
+// confirmed Options.Compactor is configured and req.Prompt is exactly
+// isCompactSlashCommand; neither of those facts says anything about whether
+// THIS session's live value itself supports compaction, which is why the
+// type-assertion below is still required and can still fail closed.
 func (a *Agent) handleCompactPrompt(ctx context.Context, live LiveSession) (protocol.PromptResponse, error) {
+	compactor, ok := live.(Compactor)
+	if !ok {
+		return protocol.PromptResponse{}, protocol.InternalError("session/prompt: compact: "+ErrCompactorNotImplemented.Error(), ErrCompactorNotImplemented)
+	}
+
 	sub, err := live.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
 	if err != nil {
 		return protocol.PromptResponse{}, protocol.InternalError("session/prompt: compact: subscribe: "+err.Error(), err)
 	}
 	defer sub.Close()
 
-	cmdID, err := a.opts.Compactor.Compact(ctx)
+	cmdID, err := compactor.Compact(ctx)
 	if err != nil {
 		var f *protocol.Fault
 		if errors.As(err, &f) {
