@@ -37,6 +37,19 @@ type SessionID = uuid.UUID
 // narrow substitute for touching rig.SessionOption or workspace placement
 // directly: the facade only ever calls through this boundary with a
 // validated Setup.
+//
+// Wire-exposure trust boundary: an error this interface returns is folded
+// into a *protocol.Fault's Message field essentially verbatim (see
+// session.go's handleSessionNew, which does exactly this for NewSession) and
+// therefore reaches the ACP wire. This is a deliberate, narrower case than
+// Harness's own TurnFailed causes, some of which Harness itself documents as
+// able to carry arbitrary, unsafe content (e.g. TurnPanicError.Detail) and
+// which the facade sanitizes before they ever reach a caller (see prompt.go's
+// sanitizedPromptFailure): a SessionHost is product-owned, not an internal
+// Harness turn-failure cause, so it is trusted here the same way any other
+// consumer-supplied adapter is. Implementations must still not embed
+// secrets, credentials, or other sensitive material in any error they
+// return.
 type SessionHost interface {
 	NewSession(context.Context, Setup) (LiveSession, error)
 	LoadSession(context.Context, SessionID, Setup) (LoadedSession, error)
@@ -50,6 +63,14 @@ type SessionHost interface {
 // loop-addressed and compaction methods (ActiveLoop, Loop, SubmitToLoop,
 // Compact, CompactToLoop) that ACP's data plane does not need directly;
 // Compact is exposed separately as the optional Compactor capability.
+//
+// Wire-exposure trust boundary: same rule as SessionHost's doc comment above.
+// An error Submit, SubscribeEvents, or RespondGate returns is folded into a
+// *protocol.Fault's Message field essentially verbatim (see prompt.go's
+// handlePrompt/drainToTerminal and gates.go's runPermissionGateRoundTrip/
+// resolveSelectedOption) and therefore reaches the ACP wire; implementations
+// must not embed secrets, credentials, or other sensitive material in any
+// error they return.
 type LiveSession interface {
 	SessionID() uuid.UUID
 	Submit(context.Context, []content.Block) (uuid.UUID, error)
