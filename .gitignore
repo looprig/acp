@@ -1,0 +1,33 @@
+# Binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build artifacts
+*.test
+*.out
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Git worktrees
+.worktrees/
+
+# Claude Code project settings
+.claude/
+
+# The vendored dependency tree is committed in full and built offline. Keep this
+# negation last so broader artifact and secret patterns cannot omit vendor files.
+!/vendor/**
