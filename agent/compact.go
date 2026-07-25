@@ -52,6 +52,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/looprig/acp/protocol"
 	"github.com/looprig/core/uuid"
@@ -221,11 +222,18 @@ var compactRejectMessages = map[event.CompactRejectReason]string{
 // reason is mapped through an explicit, fixed allowlist of messages
 // (compactRejectMessages), and anything outside that allowlist — including
 // the unspecified zero value, which a validated event should never carry —
-// falls back to one fixed generic message.
+// falls back to one fixed generic message. Even in that fallback branch, the
+// real reason value is still attached as the returned Fault's local
+// (unexported, never-serialized) diagnostic cause — exactly like every other
+// sanitized-error path in this phase (sanitizedPromptFailure in prompt.go,
+// and this same function's known-allowlist branch above) — so an actual
+// unmapped-reason occurrence is debuggable locally via errors.Unwrap, even
+// though the wire-visible Message never varies with it.
 func sanitizedCompactRejection(reason event.CompactRejectReason) *protocol.Fault {
 	msg, ok := compactRejectMessages[reason]
 	if !ok {
-		return protocol.InternalError("session/prompt: compact: the compaction was rejected", nil)
+		cause := fmt.Errorf("agent: unrecognized compact reject reason: %d", reason)
+		return protocol.InternalError("session/prompt: compact: the compaction was rejected", cause)
 	}
 	return protocol.InternalError("session/prompt: compact: "+msg, nil)
 }

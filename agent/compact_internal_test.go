@@ -11,6 +11,7 @@ package agent
 // covers that separately, black-box, in package agent_test).
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -182,5 +183,47 @@ func TestSanitizedCompactRejectionAllowlist(t *testing.T) {
 	}
 	if unspecified.Message != f.Message {
 		t.Errorf("sanitizedCompactRejection(CompactRejectUnspecified).Message = %q, want the same generic fallback as any other invalid reason (%q)", unspecified.Message, f.Message)
+	}
+}
+
+// TestSanitizedCompactRejectionFallbackAttachesLocalCause is Minor 1 of the
+// Phase 4 follow-up review: the fallback branch (reached for an unmapped
+// reason, including the zero CompactRejectUnspecified value) must still
+// attach the REAL reason value as a local, never-serialized diagnostic
+// cause — exactly like every other sanitized-error path in this phase
+// (sanitizedPromptFailure in prompt.go, and this same function's
+// known-allowlist branch) — so an actual occurrence is debuggable locally
+// via errors.Unwrap, even though the wire-visible Message stays the fixed
+// generic string.
+func TestSanitizedCompactRejectionFallbackAttachesLocalCause(t *testing.T) {
+	const badReason = event.CompactRejectReason(99)
+	if badReason.Valid() {
+		t.Fatalf("test setup: badReason %d must not be Valid()", badReason)
+	}
+
+	f := sanitizedCompactRejection(badReason)
+	if f == nil {
+		t.Fatal("sanitizedCompactRejection(invalid reason) = nil, want a *protocol.Fault")
+	}
+	cause := errors.Unwrap(f)
+	if cause == nil {
+		t.Fatal("sanitizedCompactRejection(invalid reason): errors.Unwrap(f) = nil, want a local diagnostic cause naming the real reason")
+	}
+	if !strings.Contains(cause.Error(), "99") {
+		t.Errorf("local cause = %q, want it to name the actual unmapped reason value (99)", cause.Error())
+	}
+	// The wire-visible message must still never leak the raw reason value —
+	// only the local cause may carry it.
+	if strings.Contains(f.Message, "99") {
+		t.Errorf("Fault.Message = %q, must never contain the raw reason value even though the local cause does", f.Message)
+	}
+
+	unspecified := sanitizedCompactRejection(event.CompactRejectUnspecified)
+	unspecifiedCause := errors.Unwrap(unspecified)
+	if unspecifiedCause == nil {
+		t.Fatal("sanitizedCompactRejection(CompactRejectUnspecified): errors.Unwrap(f) = nil, want a local diagnostic cause")
+	}
+	if unspecifiedCause.Error() == cause.Error() {
+		t.Errorf("CompactRejectUnspecified and the canary reason produced the identical local cause %q: the cause must name the specific reason value, not a shared generic string", cause.Error())
 	}
 }
