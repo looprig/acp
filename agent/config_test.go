@@ -179,6 +179,11 @@ func TestHandleSessionSetConfigOptionValidatesAgainstLatestCatalog(t *testing.T)
 	}}
 
 	agentConn, sessionID, _ := newConfigTestAgent(t, catalog, controller)
+	// session/new itself now fetches the catalog once, to populate its own
+	// response's initial ConfigOptions (config.go's initialConfigState) —
+	// baseline this call away so the assertion below counts only the two
+	// explicit session/set_config_option requests this test actually makes.
+	baseline := catalog.callCount()
 
 	valueSlow := protocol.SessionConfigValueID("slow")
 	if _, err := agentConn.SetConfigOption(context.Background(), protocol.SetSessionConfigOptionRequest{
@@ -216,8 +221,8 @@ func TestHandleSessionSetConfigOptionValidatesAgainstLatestCatalog(t *testing.T)
 	if got := controller.callCount(); got != 1 {
 		t.Errorf("controller calls after second (now-invalid) request = %d, want still 1 (must never apply an unvalidated change)", got)
 	}
-	if got := catalog.callCount(); got != 2 {
-		t.Errorf("catalog fetches = %d, want 2 (one per request — never reused across requests)", got)
+	if got := catalog.callCount() - baseline; got != 2 {
+		t.Errorf("catalog fetches since session/new = %d, want 2 (one per session/set_config_option request — never reused across requests)", got)
 	}
 }
 

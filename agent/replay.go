@@ -426,7 +426,18 @@ func (a *Agent) handleSessionLoad(ctx context.Context, _ string, params json.Raw
 		return nil, protocol.InternalError("session/load: "+err.Error(), err)
 	}
 
-	return protocol.LoadSessionResponse{}, nil
+	configOptions, modes, err := a.initialConfigState(ctx, loaded.Live.SessionID())
+	if err != nil {
+		// The live session is already registered above: this facade can no
+		// longer track it once it stops being returned, so it gets the same
+		// best-effort orphan cleanup as every other post-registration
+		// failure in this handler.
+		shutdownOrphanedSession(loaded.Live)
+		a.sessions.remove(loaded.Live.SessionID())
+		return nil, err
+	}
+
+	return protocol.LoadSessionResponse{ConfigOptions: configOptions, Modes: modes}, nil
 }
 
 // replayHistory opens the durable event replayer for sessionID and sends the

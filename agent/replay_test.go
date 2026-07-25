@@ -480,6 +480,24 @@ func (h *loadHostStub) callCount() int {
 	return h.calls
 }
 
+// internalStubConfigCatalog is a minimal RuntimeConfigCatalog test double for
+// white-box (package agent) tests that need Options.ConfigCatalog
+// configured: session/load's and session/resume's initial config-state
+// population tests share this rather than each defining their own (the
+// black-box package-agent_test equivalent is config_test.go's
+// stubConfigCatalog, unreachable from here).
+type internalStubConfigCatalog struct {
+	options []RuntimeConfigOption
+	err     error
+}
+
+func (c *internalStubConfigCatalog) RuntimeConfigOptions(context.Context, SessionID) ([]RuntimeConfigOption, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
+	return append([]RuntimeConfigOption(nil), c.options...), nil
+}
+
 // replayPipeConns wires two protocol.Conns together over a net.Pipe (a local
 // equivalent of capabilities_test.go's pipeConns, unexported there and thus
 // unreachable from this package-agent white-box test file).
@@ -640,6 +658,93 @@ func TestHandleSessionLoadHappyPath(t *testing.T) {
 	registered, ok := a.sessions.get(live.SessionID())
 	if !ok || registered != live {
 		t.Errorf("sessions.get(%v) = (%v, %v), want (live, true)", live.SessionID(), registered, ok)
+	}
+}
+
+// TestHandleSessionLoadPopulatesInitialConfigOptions is the Important fix
+// from the Phase 4 follow-up review, checked against session/load: like
+// session/new, the response must surface the loaded session's initial
+// runtime configuration options and mode state when Options.ConfigCatalog
+// is configured, via the exact same shared initialConfigState helper
+// (config.go) — proving the gap did not exist only in session/new.
+func TestHandleSessionLoadPopulatesInitialConfigOptions(t *testing.T) {
+	live := newReplayLiveStub(t)
+	host := &loadHostStub{loaded: LoadedSession{Live: live, ReplayedThrough: 0}}
+	replayer := &fakeReplayer{journal: newFakeJournalReplayer()}
+	catalog := &internalStubConfigCatalog{options: []RuntimeConfigOption{
+		{
+			ID:       ModeConfigOptionID,
+			Category: protocol.SessionConfigOptionCategoryMode,
+			Name:     "Mode",
+			Values: []RuntimeConfigValue{
+				{ID: "build", Name: "Build"},
+				{ID: "plan", Name: "Plan"},
+			},
+			CurrentValue: "plan",
+		},
+	}}
+
+	a, err := New(Options{Host: host, Replayer: replayer, ConfigCatalog: catalog})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := replayPipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	resp, err := agentConn.LoadSession(context.Background(), protocol.LoadSessionRequest{
+		SessionID: protocol.SessionID(live.SessionID().String()), Cwd: "/workspace",
+	})
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("LoadSession: resp = nil")
+	}
+	if len(resp.ConfigOptions) != 1 {
+		t.Fatalf("resp.ConfigOptions has %d entries, want 1", len(resp.ConfigOptions))
+	}
+	if resp.Modes == nil || resp.Modes.CurrentModeID != "plan" {
+		t.Fatalf("resp.Modes = %+v, want a populated SessionModeState with CurrentModeID \"plan\"", resp.Modes)
+	}
+}
+
+// TestHandleSessionLoadShutsDownOrphanWhenInitialConfigFetchFails asserts the
+// initial-config-state fetch failure path gets the same best-effort
+// SessionCloser.Shutdown cleanup session/load already applies to every other
+// post-replay failure.
+func TestHandleSessionLoadShutsDownOrphanWhenInitialConfigFetchFails(t *testing.T) {
+	live := newReplayLiveStub(t)
+	host := &loadHostStub{loaded: LoadedSession{Live: live, ReplayedThrough: 0}}
+	replayer := &fakeReplayer{journal: newFakeJournalReplayer()}
+	catalog := &internalStubConfigCatalog{err: errors.New("catalog unavailable")}
+
+	a, err := New(Options{Host: host, Replayer: replayer, ConfigCatalog: catalog})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := replayPipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	_, err = agentConn.LoadSession(context.Background(), protocol.LoadSessionRequest{
+		SessionID: protocol.SessionID(live.SessionID().String()), Cwd: "/workspace",
+	})
+	if err == nil {
+		t.Fatal("LoadSession: error = nil, want InternalError when the initial config-options fetch fails")
+	}
+	var f *protocol.Fault
+	if !errors.As(err, &f) {
+		t.Fatalf("error = %v (%T), want *protocol.Fault", err, err)
+	}
+	if f.Code != protocol.ErrorCodeInternalError {
+		t.Errorf("Fault.Code = %v, want %v", f.Code, protocol.ErrorCodeInternalError)
+	}
+	if got := live.shutdownCallCount(); got != 1 {
+		t.Errorf("SessionCloser.Shutdown calls = %d, want exactly 1 (orphaned session must not be silently abandoned)", got)
+	}
+	if _, ok := a.sessions.get(live.SessionID()); ok {
+		t.Error("session is registered after initial-config-fetch failure, want it NOT registered")
 	}
 }
 

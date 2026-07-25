@@ -324,6 +324,92 @@ func TestHandleSessionResumeRegisteredWithMinimalOptions(t *testing.T) {
 	}
 }
 
+// TestHandleSessionResumePopulatesInitialConfigOptions is the Important fix
+// from the Phase 4 follow-up review, checked against session/resume: the
+// review only flagged session/new explicitly, but session/resume shared the
+// identical omission (its response shape carries the same ConfigOptions/
+// Modes fields — types_gen.go). Like session/new and session/load, it must
+// surface the resumed session's initial runtime configuration options and
+// mode state via the same shared initialConfigState helper (config.go).
+func TestHandleSessionResumePopulatesInitialConfigOptions(t *testing.T) {
+	live := newReplayLiveStub(t)
+	host := &resumeHostStub{live: live}
+	catalog := &internalStubConfigCatalog{options: []RuntimeConfigOption{
+		{
+			ID:       ModeConfigOptionID,
+			Category: protocol.SessionConfigOptionCategoryMode,
+			Name:     "Mode",
+			Values: []RuntimeConfigValue{
+				{ID: "build", Name: "Build"},
+				{ID: "plan", Name: "Plan"},
+			},
+			CurrentValue: "build",
+		},
+	}}
+
+	a, err := New(Options{Host: host, ConfigCatalog: catalog})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := replayPipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	resp, err := agentConn.ResumeSession(context.Background(), protocol.ResumeSessionRequest{
+		SessionID: protocol.SessionID(live.SessionID().String()), Cwd: "/workspace",
+	})
+	if err != nil {
+		t.Fatalf("ResumeSession: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("ResumeSession: resp = nil")
+	}
+	if len(resp.ConfigOptions) != 1 {
+		t.Fatalf("resp.ConfigOptions has %d entries, want 1", len(resp.ConfigOptions))
+	}
+	if resp.Modes == nil || resp.Modes.CurrentModeID != "build" {
+		t.Fatalf("resp.Modes = %+v, want a populated SessionModeState with CurrentModeID \"build\"", resp.Modes)
+	}
+}
+
+// TestHandleSessionResumeShutsDownOrphanWhenInitialConfigFetchFails asserts
+// the initial-config-state fetch failure path gets the same best-effort
+// SessionCloser.Shutdown cleanup session/resume already applies to a
+// registry-capacity race loser.
+func TestHandleSessionResumeShutsDownOrphanWhenInitialConfigFetchFails(t *testing.T) {
+	live := newReplayLiveStub(t)
+	host := &resumeHostStub{live: live}
+	catalog := &internalStubConfigCatalog{err: errors.New("catalog unavailable")}
+
+	a, err := New(Options{Host: host, ConfigCatalog: catalog})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := replayPipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	_, err = agentConn.ResumeSession(context.Background(), protocol.ResumeSessionRequest{
+		SessionID: protocol.SessionID(live.SessionID().String()), Cwd: "/workspace",
+	})
+	if err == nil {
+		t.Fatal("ResumeSession: error = nil, want InternalError when the initial config-options fetch fails")
+	}
+	var f *protocol.Fault
+	if !errors.As(err, &f) {
+		t.Fatalf("error = %v (%T), want *protocol.Fault", err, err)
+	}
+	if f.Code != protocol.ErrorCodeInternalError {
+		t.Errorf("Fault.Code = %v, want %v", f.Code, protocol.ErrorCodeInternalError)
+	}
+	if got := live.shutdownCallCount(); got != 1 {
+		t.Errorf("SessionCloser.Shutdown calls = %d, want exactly 1 (orphaned session must not be silently abandoned)", got)
+	}
+	if _, ok := a.sessions.get(live.SessionID()); ok {
+		t.Error("session is registered after initial-config-fetch failure, want it NOT registered")
+	}
+}
+
 // --- orphan cleanup on registry-capacity race --------------------------
 
 // gatingResumeHost is a SessionHost whose ResumeSession hands back the next

@@ -29,6 +29,14 @@
 //     sends exactly one config_option_update session/update notification
 //     carrying the complete resulting option state, before returning that
 //     same state to the caller.
+//
+// initialConfigState is the second entry point into this file's
+// translation logic: session.go's handleSessionNew, replay.go's
+// handleSessionLoad, and resume.go's handleSessionResume all call it to
+// populate their response's ConfigOptions/Modes fields with the
+// newly-established session's current RuntimeConfigCatalog snapshot, reusing
+// translateRuntimeConfigOptions (the exact same helper applyConfigOption's
+// own response uses) rather than a second, independent translation.
 package agent
 
 import (
@@ -159,6 +167,75 @@ func (a *Agent) applyConfigOption(ctx context.Context, sessionID SessionID, opti
 	}
 
 	return translated, nil
+}
+
+// initialConfigState builds the ConfigOptions/Modes payload shared by the
+// session/new, session/load, and session/resume responses (types_gen.go's
+// NewSessionResponse/LoadSessionResponse/ResumeSessionResponse all carry the
+// identical pair of fields, documented as "Initial session configuration
+// options/mode state if supported by the Agent"). It is a no-op (nil, nil,
+// nil) when Options.ConfigCatalog is not configured: exactly like
+// session/set_config_option and session/set_mode being unregistered
+// entirely in that case, no capability means nothing to report, never an
+// error.
+//
+// When a catalog IS configured, this fetches the latest RuntimeConfigOptions
+// snapshot for sessionID — the same "always fresh, never cached" rule
+// applyConfigOption follows — and translates it through
+// translateRuntimeConfigOptions, the exact same helper applyConfigOption's
+// own response uses, so a session's config surface is represented identically
+// whether learned at establishment time or after a later
+// session/set_config_option call. If the catalog's well-known
+// ModeConfigOptionID entry (host.go) is present, its values are additionally
+// projected onto the pinned schema's separate SessionModeState shape
+// (protocol.SessionMode/protocol.SessionModeState); if it is absent, Modes is
+// left nil rather than a zero-value SessionModeState — a legitimate catalog
+// shape for a host that offers other options (model, thought level, ...) but
+// no mode support at all.
+func (a *Agent) initialConfigState(ctx context.Context, sessionID SessionID) ([]protocol.SessionConfigOption, *protocol.SessionModeState, error) {
+	if a.opts.ConfigCatalog == nil {
+		return nil, nil, nil
+	}
+
+	latest, err := a.opts.ConfigCatalog.RuntimeConfigOptions(ctx, sessionID)
+	if err != nil {
+		var f *protocol.Fault
+		if errors.As(err, &f) {
+			return nil, nil, f
+		}
+		return nil, nil, protocol.InternalError("config option: fetch initial catalog: "+err.Error(), err)
+	}
+
+	options := translateRuntimeConfigOptions(latest)
+
+	var modes *protocol.SessionModeState
+	if modeOption, ok := findRuntimeConfigOption(latest, ModeConfigOptionID); ok {
+		modes = buildSessionModeState(modeOption)
+	}
+
+	return options, modes, nil
+}
+
+// buildSessionModeState projects one RuntimeConfigOption (assumed to be the
+// well-known ModeConfigOptionID entry — see initialConfigState's doc) onto
+// the pinned schema's SessionModeState: each RuntimeConfigValue becomes a
+// protocol.SessionMode (ID/Name/optional Description, field-for-field —
+// RuntimeConfigValue's own doc, host.go, says this mirroring is exactly why
+// it exists), and CurrentValue becomes CurrentModeID.
+func buildSessionModeState(modeOption RuntimeConfigOption) *protocol.SessionModeState {
+	modes := make([]protocol.SessionMode, 0, len(modeOption.Values))
+	for _, v := range modeOption.Values {
+		m := protocol.SessionMode{ID: protocol.SessionModeID(v.ID), Name: v.Name}
+		if v.Description != "" {
+			d := v.Description
+			m.Description = &d
+		}
+		modes = append(modes, m)
+	}
+	return &protocol.SessionModeState{
+		AvailableModes: modes,
+		CurrentModeID:  protocol.SessionModeID(modeOption.CurrentValue),
+	}
 }
 
 // findRuntimeConfigOption looks up id in options by its ID field.

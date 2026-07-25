@@ -87,7 +87,18 @@ func (a *Agent) handleSessionResume(ctx context.Context, _ string, params json.R
 		return nil, protocol.InternalError("session/resume: "+err.Error(), err)
 	}
 
+	configOptions, modes, err := a.initialConfigState(ctx, live.SessionID())
+	if err != nil {
+		// The live session is already registered above: this facade can no
+		// longer track it once it stops being returned, so it gets the same
+		// best-effort orphan cleanup as every other post-registration
+		// failure in this handler.
+		shutdownOrphanedSession(live)
+		a.sessions.remove(live.SessionID())
+		return nil, err
+	}
+
 	// No replay: this response is sent having emitted zero session/update
 	// notifications, unlike handleSessionLoad's replayHistory step.
-	return protocol.ResumeSessionResponse{}, nil
+	return protocol.ResumeSessionResponse{ConfigOptions: configOptions, Modes: modes}, nil
 }

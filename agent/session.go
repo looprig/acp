@@ -164,7 +164,20 @@ func (a *Agent) handleSessionNew(ctx context.Context, _ string, params json.RawM
 		return nil, protocol.InternalError("session/new: "+err.Error(), err)
 	}
 
+	configOptions, modes, err := a.initialConfigState(ctx, live.SessionID())
+	if err != nil {
+		// The live session is already registered above: this facade can no
+		// longer track it once it stops being returned, so it gets the same
+		// best-effort orphan cleanup as every other post-registration
+		// failure in this handler (see shutdownOrphanedSession's doc).
+		shutdownOrphanedSession(live)
+		a.sessions.remove(live.SessionID())
+		return nil, err
+	}
+
 	return protocol.NewSessionResponse{
-		SessionID: protocol.SessionID(live.SessionID().String()),
+		SessionID:     protocol.SessionID(live.SessionID().String()),
+		ConfigOptions: configOptions,
+		Modes:         modes,
 	}, nil
 }

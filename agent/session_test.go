@@ -315,6 +315,172 @@ func TestHandleSessionNewRegistryBounded(t *testing.T) {
 	}
 }
 
+// TestHandleSessionNewPopulatesInitialConfigOptions is the Important fix from
+// the Phase 4 follow-up review: session/new must surface the newly-created
+// session's initial runtime configuration options and mode state when
+// Options.ConfigCatalog is configured — without this, a real ACP client has
+// no way to discover that config options or modes exist at all. The
+// translation must be the exact same one applyConfigOption's own response
+// uses (config.go's translateRuntimeConfigOptions), reused here via
+// initialConfigState rather than duplicated.
+func TestHandleSessionNewPopulatesInitialConfigOptions(t *testing.T) {
+	host := &sessionHostStub{}
+	catalog := &stubConfigCatalog{options: []agent.RuntimeConfigOption{
+		modelOption("fast",
+			agent.RuntimeConfigValue{ID: "fast", Name: "Fast"},
+			agent.RuntimeConfigValue{ID: "slow", Name: "Slow"},
+		),
+		{
+			ID:       agent.ModeConfigOptionID,
+			Category: protocol.SessionConfigOptionCategoryMode,
+			Name:     "Mode",
+			Values: []agent.RuntimeConfigValue{
+				{ID: "build", Name: "Build"},
+				{ID: "plan", Name: "Plan"},
+			},
+			CurrentValue: "build",
+		},
+	}}
+	a, err := agent.New(agent.Options{Host: host, ConfigCatalog: catalog})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	resp, err := agentConn.NewSession(context.Background(), protocol.NewSessionRequest{Cwd: "/workspace"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	if len(resp.ConfigOptions) != 2 {
+		t.Fatalf("resp.ConfigOptions has %d entries, want 2", len(resp.ConfigOptions))
+	}
+	if resp.Modes == nil {
+		t.Fatal("resp.Modes = nil, want a populated SessionModeState (catalog offers the well-known mode option)")
+	}
+	if resp.Modes.CurrentModeID != "build" {
+		t.Errorf("resp.Modes.CurrentModeID = %q, want %q", resp.Modes.CurrentModeID, "build")
+	}
+	if len(resp.Modes.AvailableModes) != 2 {
+		t.Fatalf("resp.Modes.AvailableModes has %d entries, want 2", len(resp.Modes.AvailableModes))
+	}
+}
+
+// TestHandleSessionNewOmitsModesWhenCatalogHasNoModeOption asserts Modes
+// stays nil (never a zero-value SessionModeState) when the configured
+// catalog offers no ModeConfigOptionID entry: a legitimate host shape (only
+// model/effort-style options, no mode support at all).
+func TestHandleSessionNewOmitsModesWhenCatalogHasNoModeOption(t *testing.T) {
+	host := &sessionHostStub{}
+	catalog := &stubConfigCatalog{options: []agent.RuntimeConfigOption{
+		modelOption("fast", agent.RuntimeConfigValue{ID: "fast", Name: "Fast"}),
+	}}
+	a, err := agent.New(agent.Options{Host: host, ConfigCatalog: catalog})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	resp, err := agentConn.NewSession(context.Background(), protocol.NewSessionRequest{Cwd: "/workspace"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if resp.Modes != nil {
+		t.Errorf("resp.Modes = %+v, want nil (no mode option in the catalog)", resp.Modes)
+	}
+	if len(resp.ConfigOptions) != 1 {
+		t.Fatalf("resp.ConfigOptions has %d entries, want 1", len(resp.ConfigOptions))
+	}
+}
+
+// TestHandleSessionNewNoConfigOptionsWithoutCatalog asserts nothing changes
+// when Options.ConfigCatalog is not configured at all: ConfigOptions/Modes
+// stay absent from the response exactly like before this fix.
+func TestHandleSessionNewNoConfigOptionsWithoutCatalog(t *testing.T) {
+	host := &sessionHostStub{}
+	a, err := agent.New(agent.Options{Host: host})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	resp, err := agentConn.NewSession(context.Background(), protocol.NewSessionRequest{Cwd: "/workspace"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if resp.ConfigOptions != nil {
+		t.Errorf("resp.ConfigOptions = %+v, want nil", resp.ConfigOptions)
+	}
+	if resp.Modes != nil {
+		t.Errorf("resp.Modes = %+v, want nil", resp.Modes)
+	}
+}
+
+// shutdownCheckHostStub is a SessionHost whose NewSession always hands back
+// the same *raceLiveSession (SessionCloser-capable), used by
+// TestHandleSessionNewShutsDownOrphanWhenInitialConfigFetchFails to prove the
+// initial-config-state fetch failure path gets the exact same best-effort
+// orphan cleanup as every other post-creation failure in handleSessionNew.
+type shutdownCheckHostStub struct{ live *raceLiveSession }
+
+func (h *shutdownCheckHostStub) NewSession(context.Context, agent.Setup) (agent.LiveSession, error) {
+	return h.live, nil
+}
+
+func (h *shutdownCheckHostStub) LoadSession(context.Context, agent.SessionID, agent.Setup) (agent.LoadedSession, error) {
+	return agent.LoadedSession{}, errors.New("shutdownCheckHostStub: LoadSession not implemented")
+}
+
+func (h *shutdownCheckHostStub) ResumeSession(context.Context, agent.SessionID, agent.Setup) (agent.LiveSession, error) {
+	return nil, errors.New("shutdownCheckHostStub: ResumeSession not implemented")
+}
+
+// TestHandleSessionNewShutsDownOrphanWhenInitialConfigFetchFails asserts that
+// when the initial config-options fetch (RuntimeConfigCatalog.RuntimeConfigOptions)
+// fails AFTER the live session has already been created and registered,
+// handleSessionNew reports InternalError and gives the now-orphaned session
+// the same best-effort SessionCloser.Shutdown cleanup as every other
+// post-registration failure (see shutdownOrphanedSession, replay.go).
+func TestHandleSessionNewShutsDownOrphanWhenInitialConfigFetchFails(t *testing.T) {
+	id, err := coreuuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	live := &raceLiveSession{id: id}
+	host := &shutdownCheckHostStub{live: live}
+	catalog := &stubConfigCatalog{err: errors.New("catalog unavailable")}
+	a, err := agent.New(agent.Options{Host: host, ConfigCatalog: catalog})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	_, err = agentConn.NewSession(context.Background(), protocol.NewSessionRequest{Cwd: "/workspace"})
+	if err == nil {
+		t.Fatal("NewSession: error = nil, want InternalError when the initial config-options fetch fails")
+	}
+	var f *protocol.Fault
+	if !errors.As(err, &f) {
+		t.Fatalf("error = %v (%T), want *protocol.Fault", err, err)
+	}
+	if f.Code != protocol.ErrorCodeInternalError {
+		t.Errorf("Fault.Code = %v, want %v", f.Code, protocol.ErrorCodeInternalError)
+	}
+	if calls, hadDeadline := live.shutdownState(); calls != 1 {
+		t.Errorf("SessionCloser.Shutdown calls = %d, want exactly 1 (orphaned session must not be silently abandoned)", calls)
+	} else if !hadDeadline {
+		t.Error("SessionCloser.Shutdown: ctx had no deadline, want a bounded context")
+	}
+}
+
 // raceLiveSession is a minimal LiveSession that also implements
 // agent.SessionCloser with a call counter, used by
 // TestHandleSessionNewOrphanedSessionShutdownOnRegistryRace to prove the

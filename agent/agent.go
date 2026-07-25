@@ -38,8 +38,9 @@ type Options struct {
 	// ConfigCatalog, when supplied, lets the facade enumerate a session's
 	// available runtime configuration options (see RuntimeConfigCatalog;
 	// wired starting Task 4.1). It has no initialize-level wire
-	// representation: config options are surfaced per-session in the
-	// session/new response.
+	// representation: config options are surfaced per-session, in the
+	// session/new, session/load, and session/resume responses' ConfigOptions
+	// and Modes fields (see config.go's initialConfigState).
 	ConfigCatalog RuntimeConfigCatalog
 	// ConfigController, when supplied, backs session/set_config_option and
 	// session/set_mode (see RuntimeConfigController; wired starting Task
