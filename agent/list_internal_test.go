@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 
 	coreuuid "github.com/looprig/core/uuid"
@@ -41,17 +42,39 @@ func newTestCursorAgent(t *testing.T) *Agent {
 	return a
 }
 
-// flipLastRune flips a token's final rune to a different valid base64url
-// character, mutating its bytes while keeping the string the same length.
-func flipLastRune(s string) string {
-	runes := []rune(s)
-	last := len(runes) - 1
-	if runes[last] == 'A' {
-		runes[last] = 'B'
-	} else {
-		runes[last] = 'A'
+// flipTagByte decodes a cursor token's base64url-encoded HMAC tag segment,
+// flips a bit in the tag's first byte, and re-encodes it — provably a
+// real-bit mutation, never a padding-only one.
+//
+// The tag is 32 bytes, which base64url-encodes to 43 characters (32 mod 3
+// == 2, so the trailing group is 2 leftover bytes encoded as 3 characters:
+// 16 real bits packed into 18 bits of base64, leaving the final character's
+// low 2 bits structurally always-zero padding). That boundary effect is
+// confined entirely to the LAST character of the tag segment: every other
+// character, including the whole first byte, sits inside a complete
+// 3-byte/4-character group with no padding involved at all. Flipping a bit
+// in byte[0] therefore can never land on a padding bit — byte[0] is 100%
+// real HMAC tag content — which sidesteps the padding-bit collision this
+// test used to have: an earlier version mutated only the token's final
+// character, which, 1 time in 16 (whenever that character already happened
+// to be 'A'), only toggled the trailing group's always-zero padding bits,
+// leaving the decoded tag bytes unchanged and the test flaky.
+func flipTagByte(t *testing.T, token string) string {
+	t.Helper()
+	dot := strings.LastIndex(token, ".")
+	if dot < 0 {
+		t.Fatalf("flipTagByte: no '.' found in %q", token)
 	}
-	return string(runes)
+	payloadSeg, tagSeg := token[:dot], token[dot+1:]
+	tag, err := base64.RawURLEncoding.DecodeString(tagSeg)
+	if err != nil {
+		t.Fatalf("flipTagByte: decode tag %q: %v", tagSeg, err)
+	}
+	if len(tag) == 0 {
+		t.Fatalf("flipTagByte: empty tag in %q", token)
+	}
+	tag[0] ^= 0x01
+	return payloadSeg + "." + base64.RawURLEncoding.EncodeToString(tag)
 }
 
 // flipRuneJustBeforeDot flips the character immediately preceding token's
@@ -97,9 +120,9 @@ func TestListCursorRoundTrip(t *testing.T) {
 	}
 }
 
-// TestListCursorTamperedTagRejected flips the tag segment's last byte (the
-// HMAC authentication tag), leaving the payload untouched, and asserts
-// decodeListCursor rejects it as *InvalidCursorError{Reason:
+// TestListCursorTamperedTagRejected flips a bit in the tag segment's first
+// byte (the HMAC authentication tag), leaving the payload untouched, and
+// asserts decodeListCursor rejects it as *InvalidCursorError{Reason:
 // CursorReasonTampered}.
 func TestListCursorTamperedTagRejected(t *testing.T) {
 	a := newTestCursorAgent(t)
@@ -109,9 +132,9 @@ func TestListCursorTamperedTagRejected(t *testing.T) {
 		t.Fatalf("encodeListCursor: %v", err)
 	}
 
-	tampered := flipLastRune(token)
+	tampered := flipTagByte(t, token)
 	if tampered == token {
-		t.Fatal("flipLastRune produced no change")
+		t.Fatal("flipTagByte produced no change")
 	}
 
 	_, err = a.decodeListCursor(tampered)

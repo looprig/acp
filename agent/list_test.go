@@ -12,9 +12,11 @@ package agent_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -287,9 +289,9 @@ func TestHandleSessionListTamperedCursorRejected(t *testing.T) {
 		t.Fatal("cursor is empty, cannot tamper")
 	}
 
-	tampered := tamperLastByte(t, original)
+	tampered := tamperTagByte(t, original)
 	if tampered == original {
-		t.Fatal("tamperLastByte produced no change")
+		t.Fatal("tamperTagByte produced no change")
 	}
 
 	_, err = agentConn.ListSessions(context.Background(), protocol.ListSessionsRequest{Cursor: &tampered})
@@ -305,20 +307,38 @@ func TestHandleSessionListTamperedCursorRejected(t *testing.T) {
 	}
 }
 
-// tamperLastByte flips the cursor's final character to a different valid
-// base64url character, mutating the token's bytes while keeping it
+// tamperTagByte decodes the cursor's base64url-encoded HMAC tag segment,
+// flips a bit in the tag's first byte, and re-encodes it, keeping the token
 // structurally decodable (so the test exercises the HMAC/content check, not
 // merely a decode failure).
-func tamperLastByte(t *testing.T, s string) string {
+//
+// This deliberately does not mutate the tag's LAST character: the tag is 32
+// bytes, which base64url-encodes to 43 characters (32 mod 3 == 2, so the
+// trailing group is 2 leftover bytes packed into 3 base64 characters — 16
+// real bits in 18 bits of encoding, leaving the final character's low 2
+// bits structurally always-zero base64 padding, never real tag content). A
+// mutation confined to that last character can — 1 time in 16, whenever the
+// real last character already happens to be 'A' (index 0) — land purely on
+// those always-zero padding bits and round-trip back to byte-identical tag
+// bytes, making "tampered" cursor legitimately indistinguishable from the
+// original. byte[0] of the tag sits inside a complete, padding-free
+// 3-byte/4-character group, so flipping it is always a real-bit mutation.
+func tamperTagByte(t *testing.T, token string) string {
 	t.Helper()
-	runes := []rune(s)
-	last := len(runes) - 1
-	replacement := 'A'
-	if runes[last] == 'A' {
-		replacement = 'B'
+	dot := strings.LastIndex(token, ".")
+	if dot < 0 {
+		t.Fatalf("tamperTagByte: no '.' found in %q", token)
 	}
-	runes[last] = replacement
-	return string(runes)
+	payloadSeg, tagSeg := token[:dot], token[dot+1:]
+	tag, err := base64.RawURLEncoding.DecodeString(tagSeg)
+	if err != nil {
+		t.Fatalf("tamperTagByte: decode tag %q: %v", tagSeg, err)
+	}
+	if len(tag) == 0 {
+		t.Fatalf("tamperTagByte: empty tag in %q", token)
+	}
+	tag[0] ^= 0x01
+	return payloadSeg + "." + base64.RawURLEncoding.EncodeToString(tag)
 }
 
 // TestHandleSessionListMalformedCursorRejected asserts a structurally
