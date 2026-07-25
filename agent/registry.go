@@ -31,15 +31,27 @@ func (e *TooManyLiveSessionsError) Error() string {
 // Harness session UUID (SessionID). It is the facade's single source of
 // truth for which session ids currently name a live session; resolveSession
 // is its only reader outside this file.
+//
+// It also records each live session's already-validated Setup.Cwd (cwds),
+// keyed by the same SessionID and maintained in lockstep with sessions: it
+// is the authoritative overlay session/list's handleSessionList (list.go)
+// consults for any session id that is currently live, regardless of what (if
+// anything) the product's own SessionCatalog reports for that same id — see
+// list.go's package doc for why a live session's Setup.Cwd always wins.
 type sessionRegistry struct {
 	mu       sync.Mutex
 	sessions map[SessionID]LiveSession
+	cwds     map[SessionID]string
 	max      int
 }
 
 // newSessionRegistry constructs an empty registry bounded at max entries.
 func newSessionRegistry(max int) *sessionRegistry {
-	return &sessionRegistry{sessions: make(map[SessionID]LiveSession), max: max}
+	return &sessionRegistry{
+		sessions: make(map[SessionID]LiveSession),
+		cwds:     make(map[SessionID]string),
+		max:      max,
+	}
 }
 
 // atCapacity reports whether the registry already holds max entries. It is
@@ -54,12 +66,17 @@ func (r *sessionRegistry) atCapacity() bool {
 	return len(r.sessions) >= r.max
 }
 
-// add registers s under its own SessionID(), failing closed with a
-// *TooManyLiveSessionsError if the registry is already at capacity. This
-// holds the lock for the full read-check-write, so it is correct even when
-// multiple sessions race to register at once (unlike atCapacity followed by
-// a separate, unsynchronized add call).
-func (r *sessionRegistry) add(s LiveSession) error {
+// add registers s under its own SessionID(), recording cwd as its
+// authoritative live working directory (see this type's cwds doc), and
+// failing closed with a *TooManyLiveSessionsError if the registry is already
+// at capacity. This holds the lock for the full read-check-write, so it is
+// correct even when multiple sessions race to register at once (unlike
+// atCapacity followed by a separate, unsynchronized add call).
+//
+// cwd is expected to be a Setup.Cwd already validated by NewSetup (every
+// caller — handleSessionNew, handleSessionResume, handleSessionLoad —
+// constructs it that way); add itself does not re-validate it.
+func (r *sessionRegistry) add(s LiveSession, cwd string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	id := s.SessionID()
@@ -67,6 +84,7 @@ func (r *sessionRegistry) add(s LiveSession) error {
 		return &TooManyLiveSessionsError{Max: r.max}
 	}
 	r.sessions[id] = s
+	r.cwds[id] = cwd
 	return nil
 }
 
@@ -82,12 +100,26 @@ func (r *sessionRegistry) get(id SessionID) (LiveSession, bool) {
 	return s, ok
 }
 
-// remove drops id from the registry. It is a no-op for an id that is not
-// (or is no longer) registered.
+// remove drops id (and its recorded cwd) from the registry. It is a no-op
+// for an id that is not (or is no longer) registered.
 func (r *sessionRegistry) remove(id SessionID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.sessions, id)
+	delete(r.cwds, id)
+}
+
+// cwd returns the Setup.Cwd recorded when id was added (see add), and
+// whether id currently names a live, registered session at all. A caller
+// must treat ok == false as "this registry has no opinion about id's cwd" —
+// never as "id's cwd is empty" — since add never stores an empty cwd (every
+// caller's Setup.Cwd is validated non-empty by NewSetup before add is ever
+// called).
+func (r *sessionRegistry) cwd(id SessionID) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.cwds[id]
+	return c, ok
 }
 
 // len reports the current number of registered sessions.

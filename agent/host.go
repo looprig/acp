@@ -109,12 +109,46 @@ type EventReplayer interface {
 	OpenEventReplayer(SessionID) (journal.EventReplayer, error)
 }
 
+// SessionCatalogEntry is one entry a SessionCatalog reports for
+// session/list: a Harness catalog record plus this host's own knowledge (if
+// any) of that session's actual working directory.
+//
+// Harness's sessionstore.SessionMeta carries no field for a session's live
+// working-directory path at all — SessionMeta.CurrentWorkspace is a
+// WorkspacePointer naming a content-addressed workspace-SNAPSHOT digest, not
+// a filesystem path (see list.go's package doc for the full discrepancy).
+// Cwd is this module's own consumer-owned overlay for that gap: it must be
+// an absolute path when the host knows this session's actual working
+// directory, and left empty when it does not — never a relative path, a
+// placeholder, or a best-effort guess. handleSessionList (list.go) omits a
+// session from the session/list response entirely rather than emit the
+// pinned ACP schema's required-absolute-path SessionInfo.Cwd as an empty
+// string, UNLESS the session is currently live in this facade's own bounded
+// session registry, in which case its already-validated Setup.Cwd is used
+// instead of Cwd here and this field is not consulted at all for that
+// session id (see handleSessionList's overlay step).
+//
+// A durable fix — persisting a real per-session cwd inside Harness's own
+// sessionstore.SessionMeta, so a host would not need to track this mapping
+// itself — is a legitimate future Harness-side follow-up. It is out of
+// scope here (Harness is read-only in this plan); this field is the
+// narrower, consumer-side workaround until that lands, if it ever does.
+type SessionCatalogEntry struct {
+	// Meta is the underlying Harness catalog record for this session.
+	Meta sessionstore.SessionMeta
+	// Cwd is this session's absolute working directory, if this host knows
+	// it; empty if unknown. See this type's doc for the full contract.
+	Cwd string
+}
+
 // SessionCatalog is the optional capability to list known sessions for ACP
-// session/list, matching Harness's sessionstore.Catalog.ListSessions. The
-// facade owns bounded page construction and opaque cursor validation over the
-// returned metadata; callers cannot depend on the catalog's key layout.
+// session/list, matching Harness's sessionstore.Catalog.ListSessions plus
+// this module's own cwd overlay (SessionCatalogEntry.Cwd — see its doc for
+// the exact contract an implementation must uphold). The facade owns bounded
+// page construction and opaque cursor validation over the returned metadata;
+// callers cannot depend on the catalog's key layout.
 type SessionCatalog interface {
-	ListSessions(context.Context) ([]sessionstore.SessionMeta, error)
+	ListSessions(context.Context) ([]SessionCatalogEntry, error)
 }
 
 // RuntimeConfigOption is a placeholder projection of one configurable

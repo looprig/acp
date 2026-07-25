@@ -243,7 +243,7 @@ func TestHandleSessionResumeCapacityRejected(t *testing.T) {
 		if err != nil {
 			t.Fatalf("uuid.New: %v", err)
 		}
-		if err := a.sessions.add(&replayLiveStub{id: id}); err != nil {
+		if err := a.sessions.add(&replayLiveStub{id: id}, "/test/cwd"); err != nil {
 			t.Fatalf("sessions.add: %v", err)
 		}
 	}
@@ -397,7 +397,7 @@ func TestHandleSessionResumeShutsDownOrphanOnRegistryCapacityRace(t *testing.T) 
 		if err != nil {
 			t.Fatalf("uuid.New: %v", err)
 		}
-		if err := a.sessions.add(&replayLiveStub{id: id}); err != nil {
+		if err := a.sessions.add(&replayLiveStub{id: id}, "/test/cwd"); err != nil {
 			t.Fatalf("sessions.add: %v", err)
 		}
 	}

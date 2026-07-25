@@ -10,7 +10,6 @@ import (
 	"github.com/looprig/acp/protocol"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/harness/pkg/sessionstore"
 )
 
 // --- fakes: a minimal SessionHost plus one fake per optional capability
@@ -40,7 +39,7 @@ func (fakeReplayer) OpenEventReplayer(agent.SessionID) (journal.EventReplayer, e
 
 type fakeCatalog struct{}
 
-func (fakeCatalog) ListSessions(context.Context) ([]sessionstore.SessionMeta, error) {
+func (fakeCatalog) ListSessions(context.Context) ([]agent.SessionCatalogEntry, error) {
 	return nil, nil
 }
 

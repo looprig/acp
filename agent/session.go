@@ -151,7 +151,7 @@ func (a *Agent) handleSessionNew(ctx context.Context, _ string, params json.RawM
 		return nil, protocol.InternalError("session/new: "+err.Error(), err)
 	}
 
-	if err := a.sessions.add(live); err != nil {
+	if err := a.sessions.add(live, setup.Cwd); err != nil {
 		// The host has already created a live resource this facade can no
 		// longer track: another concurrent session/new call won the
 		// registry's last slot first (this branch is only reachable via the

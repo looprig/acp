@@ -29,15 +29,15 @@ import (
 // --- listCatalogStub: a fixed, scriptable agent.SessionCatalog fake --------
 
 type listCatalogStub struct {
-	metas []sessionstore.SessionMeta
-	err   error
+	entries []agent.SessionCatalogEntry
+	err     error
 }
 
-func (s *listCatalogStub) ListSessions(context.Context) ([]sessionstore.SessionMeta, error) {
+func (s *listCatalogStub) ListSessions(context.Context) ([]agent.SessionCatalogEntry, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	return s.metas, nil
+	return s.entries, nil
 }
 
 // listSessionID builds a deterministic, sortable UUID string for test
@@ -84,19 +84,16 @@ func collectSessionUpdates(t *testing.T, client *protocol.Conn) <-chan protocol.
 	return ch
 }
 
-// --- mapping: SessionMeta -> SessionInfo -----------------------------------
+// --- mapping: SessionCatalogEntry -> SessionInfo ----------------------------
 
 // TestHandleSessionListMapsCatalogEntry asserts the {sessionId, cwd, title,
-// updatedAt} mapping this task's adapter contract calls for, including the
-// deliberate cwd="" (see this task's report: sessionstore.SessionMeta carries
-// no field representing a session's live working-directory path;
-// CurrentWorkspace is a content-addressed workspace-SNAPSHOT pointer, not a
-// directory string).
+// updatedAt} mapping this task's adapter contract calls for, when the
+// catalog entry itself carries a known, absolute cwd.
 func TestHandleSessionListMapsCatalogEntry(t *testing.T) {
 	id := listSessionID(t, 1)
 	lastActive := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
-	catalog := &listCatalogStub{metas: []sessionstore.SessionMeta{
-		{SessionID: id, Title: "Fix the flaky test", LastActiveAt: lastActive},
+	catalog := &listCatalogStub{entries: []agent.SessionCatalogEntry{
+		{Meta: sessionstore.SessionMeta{SessionID: id, Title: "Fix the flaky test", LastActiveAt: lastActive}, Cwd: "/repo/checkout"},
 	}}
 	_, client := listAgentSetup(t, catalog)
 	agentConn := protocol.NewAgentConn(client)
@@ -112,8 +109,8 @@ func TestHandleSessionListMapsCatalogEntry(t *testing.T) {
 	if got.SessionID != protocol.SessionID(id.String()) {
 		t.Errorf("SessionID = %q, want %q", got.SessionID, id.String())
 	}
-	if got.Cwd != "" {
-		t.Errorf("Cwd = %q, want \"\" (no field on SessionMeta represents a working directory)", got.Cwd)
+	if got.Cwd != "/repo/checkout" {
+		t.Errorf("Cwd = %q, want %q", got.Cwd, "/repo/checkout")
 	}
 	if got.Title == nil || *got.Title != "Fix the flaky test" {
 		t.Errorf("Title = %v, want \"Fix the flaky test\"", got.Title)
@@ -129,10 +126,12 @@ func TestHandleSessionListMapsCatalogEntry(t *testing.T) {
 
 // TestHandleSessionListOmitsEmptyOptionalFields asserts a session with no
 // title yet and a zero LastActiveAt reports both Title and UpdatedAt as nil,
-// not empty-string pointers.
+// not empty-string pointers, while still reporting its known cwd.
 func TestHandleSessionListOmitsEmptyOptionalFields(t *testing.T) {
 	id := listSessionID(t, 1)
-	catalog := &listCatalogStub{metas: []sessionstore.SessionMeta{{SessionID: id}}}
+	catalog := &listCatalogStub{entries: []agent.SessionCatalogEntry{
+		{Meta: sessionstore.SessionMeta{SessionID: id}, Cwd: "/repo/checkout"},
+	}}
 	_, client := listAgentSetup(t, catalog)
 	agentConn := protocol.NewAgentConn(client)
 
@@ -143,6 +142,9 @@ func TestHandleSessionListOmitsEmptyOptionalFields(t *testing.T) {
 	if len(resp.Sessions) != 1 {
 		t.Fatalf("len(Sessions) = %d, want 1", len(resp.Sessions))
 	}
+	if resp.Sessions[0].Cwd != "/repo/checkout" {
+		t.Errorf("Cwd = %q, want %q", resp.Sessions[0].Cwd, "/repo/checkout")
+	}
 	if resp.Sessions[0].Title != nil {
 		t.Errorf("Title = %v, want nil", resp.Sessions[0].Title)
 	}
@@ -151,18 +153,165 @@ func TestHandleSessionListOmitsEmptyOptionalFields(t *testing.T) {
 	}
 }
 
+// --- cwd resolution: omission and the live-session overlay ------------------
+
+// TestHandleSessionListOmitsUnknownCwdEntry asserts a catalog entry whose Cwd
+// is empty (unknown, and not a currently-live session) is omitted from the
+// session/list response entirely, rather than emitted with an empty or
+// otherwise schema-non-conformant Cwd — the pinned ACP schema requires
+// SessionInfo.cwd to be a non-empty absolute path.
+func TestHandleSessionListOmitsUnknownCwdEntry(t *testing.T) {
+	id := listSessionID(t, 1)
+	catalog := &listCatalogStub{entries: []agent.SessionCatalogEntry{
+		{Meta: sessionstore.SessionMeta{SessionID: id, Title: "cold session, unknown cwd"}, Cwd: ""},
+	}}
+	_, client := listAgentSetup(t, catalog)
+	agentConn := protocol.NewAgentConn(client)
+
+	resp, err := agentConn.ListSessions(context.Background(), protocol.ListSessionsRequest{})
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(resp.Sessions) != 0 {
+		t.Fatalf("len(Sessions) = %d, want 0 (unknown-cwd entry must be omitted)", len(resp.Sessions))
+	}
+	if resp.NextCursor != nil {
+		t.Errorf("NextCursor = %v, want nil (single-entry catalog fits in one page)", resp.NextCursor)
+	}
+}
+
+// TestHandleSessionListMixedKnownAndUnknownCwd asserts a page with a mix of
+// known- and unknown-cwd entries reports only the known ones, each with its
+// correct cwd, and drops the unknown ones silently (no error, no placeholder
+// row).
+func TestHandleSessionListMixedKnownAndUnknownCwd(t *testing.T) {
+	known := listSessionID(t, 1)
+	unknown := listSessionID(t, 2)
+	catalog := &listCatalogStub{entries: []agent.SessionCatalogEntry{
+		{Meta: sessionstore.SessionMeta{SessionID: known, Title: "known"}, Cwd: "/repo/known"},
+		{Meta: sessionstore.SessionMeta{SessionID: unknown, Title: "unknown"}, Cwd: ""},
+	}}
+	_, client := listAgentSetup(t, catalog)
+	agentConn := protocol.NewAgentConn(client)
+
+	resp, err := agentConn.ListSessions(context.Background(), protocol.ListSessionsRequest{})
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(resp.Sessions) != 1 {
+		t.Fatalf("len(Sessions) = %d, want 1", len(resp.Sessions))
+	}
+	if resp.Sessions[0].SessionID != protocol.SessionID(known.String()) {
+		t.Errorf("SessionID = %q, want %q", resp.Sessions[0].SessionID, known.String())
+	}
+	if resp.Sessions[0].Cwd != "/repo/known" {
+		t.Errorf("Cwd = %q, want %q", resp.Sessions[0].Cwd, "/repo/known")
+	}
+}
+
+// TestHandleSessionListLiveOverlayFillsUnknownCatalogCwd asserts a session
+// that is currently live/registered in this facade's own session registry
+// is listed using its already-validated Setup.Cwd, even though the catalog
+// itself reports an unknown (empty) cwd for that same session id — the
+// overlay this fix adds so a live session in session/list is always
+// conformant regardless of what a cold-session catalog can answer.
+func TestHandleSessionListLiveOverlayFillsUnknownCatalogCwd(t *testing.T) {
+	host := &sessionHostStub{}
+	catalog := &listCatalogStub{}
+	opts := agent.Options{Host: host, Catalog: catalog}
+	a, err := agent.New(opts)
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	newResp, err := agentConn.NewSession(context.Background(), protocol.NewSessionRequest{Cwd: "/live/workspace"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	liveID, err := coreuuid.Parse(string(newResp.SessionID))
+	if err != nil {
+		t.Fatalf("parse live session id: %v", err)
+	}
+
+	// The catalog reports this exact session id, but does not (yet) know its
+	// cwd — simulating a product catalog that has not caught up with a
+	// just-created live session.
+	catalog.entries = []agent.SessionCatalogEntry{
+		{Meta: sessionstore.SessionMeta{SessionID: liveID, Title: "live session"}, Cwd: ""},
+	}
+
+	resp, err := agentConn.ListSessions(context.Background(), protocol.ListSessionsRequest{})
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(resp.Sessions) != 1 {
+		t.Fatalf("len(Sessions) = %d, want 1 (live overlay must supply the missing cwd)", len(resp.Sessions))
+	}
+	if resp.Sessions[0].Cwd != "/live/workspace" {
+		t.Errorf("Cwd = %q, want %q (from the live session's Setup.Cwd)", resp.Sessions[0].Cwd, "/live/workspace")
+	}
+}
+
+// TestHandleSessionListLiveOverlayOverridesStaleCatalogCwd asserts the live
+// overlay wins even when the catalog reports a DIFFERENT, non-empty cwd for
+// the same session id: Setup.Cwd is authoritative for a live session,
+// unconditionally, not merely a fallback for when the catalog has nothing.
+func TestHandleSessionListLiveOverlayOverridesStaleCatalogCwd(t *testing.T) {
+	host := &sessionHostStub{}
+	catalog := &listCatalogStub{}
+	opts := agent.Options{Host: host, Catalog: catalog}
+	a, err := agent.New(opts)
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	a.Register(server)
+	agentConn := protocol.NewAgentConn(client)
+
+	newResp, err := agentConn.NewSession(context.Background(), protocol.NewSessionRequest{Cwd: "/live/workspace"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	liveID, err := coreuuid.Parse(string(newResp.SessionID))
+	if err != nil {
+		t.Fatalf("parse live session id: %v", err)
+	}
+
+	catalog.entries = []agent.SessionCatalogEntry{
+		{Meta: sessionstore.SessionMeta{SessionID: liveID, Title: "live session"}, Cwd: "/stale/catalog/path"},
+	}
+
+	resp, err := agentConn.ListSessions(context.Background(), protocol.ListSessionsRequest{})
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(resp.Sessions) != 1 {
+		t.Fatalf("len(Sessions) = %d, want 1", len(resp.Sessions))
+	}
+	if resp.Sessions[0].Cwd != "/live/workspace" {
+		t.Errorf("Cwd = %q, want %q (live Setup.Cwd overrides the catalog's stale value)", resp.Sessions[0].Cwd, "/live/workspace")
+	}
+}
+
 // --- pagination -------------------------------------------------------------
 
-// buildFixedCatalog returns n deterministic SessionMeta entries with
+// buildFixedCatalog returns n deterministic SessionCatalogEntry entries with
 // ascending-sorted SessionIDs (listSessionID), each carrying a distinct title
-// so a test can identify exactly which entries landed on which page.
-func buildFixedCatalog(t *testing.T, n int) []sessionstore.SessionMeta {
+// and a known, distinct absolute cwd so a test can identify exactly which
+// entries landed on which page and none are omitted for lacking a cwd.
+func buildFixedCatalog(t *testing.T, n int) []agent.SessionCatalogEntry {
 	t.Helper()
-	metas := make([]sessionstore.SessionMeta, n)
+	entries := make([]agent.SessionCatalogEntry, n)
 	for i := 0; i < n; i++ {
-		metas[i] = sessionstore.SessionMeta{SessionID: listSessionID(t, i), Title: fmt.Sprintf("session-%d", i)}
+		entries[i] = agent.SessionCatalogEntry{
+			Meta: sessionstore.SessionMeta{SessionID: listSessionID(t, i), Title: fmt.Sprintf("session-%d", i)},
+			Cwd:  fmt.Sprintf("/sessions/%d", i),
+		}
 	}
-	return metas
+	return entries
 }
 
 // TestHandleSessionListPaginationStableNoDuplicatesNoGaps walks a fixed
@@ -172,7 +321,7 @@ func buildFixedCatalog(t *testing.T, n int) []sessionstore.SessionMeta {
 // final page's nextCursor is nil.
 func TestHandleSessionListPaginationStableNoDuplicatesNoGaps(t *testing.T) {
 	const total = 250
-	catalog := &listCatalogStub{metas: buildFixedCatalog(t, total)}
+	catalog := &listCatalogStub{entries: buildFixedCatalog(t, total)}
 	_, client := listAgentSetup(t, catalog)
 	agentConn := protocol.NewAgentConn(client)
 
@@ -225,7 +374,7 @@ func TestHandleSessionListPaginationStableNoDuplicatesNoGaps(t *testing.T) {
 // page of a catalog larger than MaxPageSize is exactly MaxPageSize entries,
 // never more.
 func TestHandleSessionListPageSizeBoundedAtMaxPageSize(t *testing.T) {
-	catalog := &listCatalogStub{metas: buildFixedCatalog(t, agent.MaxPageSize+37)}
+	catalog := &listCatalogStub{entries: buildFixedCatalog(t, agent.MaxPageSize+37)}
 	_, client := listAgentSetup(t, catalog)
 	agentConn := protocol.NewAgentConn(client)
 
@@ -244,7 +393,7 @@ func TestHandleSessionListPageSizeBoundedAtMaxPageSize(t *testing.T) {
 // TestHandleSessionListSmallCatalogHasNoNextCursor asserts a catalog smaller
 // than MaxPageSize reports every entry on one page with no nextCursor.
 func TestHandleSessionListSmallCatalogHasNoNextCursor(t *testing.T) {
-	catalog := &listCatalogStub{metas: buildFixedCatalog(t, 5)}
+	catalog := &listCatalogStub{entries: buildFixedCatalog(t, 5)}
 	_, client := listAgentSetup(t, catalog)
 	agentConn := protocol.NewAgentConn(client)
 
@@ -257,6 +406,58 @@ func TestHandleSessionListSmallCatalogHasNoNextCursor(t *testing.T) {
 	}
 	if resp.NextCursor != nil {
 		t.Errorf("NextCursor = %v, want nil", resp.NextCursor)
+	}
+}
+
+// TestHandleSessionListOmissionConsumesPaginationSlot proves this file's
+// documented pagination-under-omission decision (list.go's package doc,
+// "Pagination under cwd omission"): the page boundary and cursor are
+// computed over the full sorted catalog BEFORE cwd resolution, so an
+// unknown-cwd entry within a page still "consumes" its slot — the returned
+// page can be shorter than MaxPageSize (here, MaxPageSize minus the number
+// of unknown-cwd entries in that slice) while NextCursor still advances past
+// exactly MaxPageSize catalog entries, not past MaxPageSize *returned* ones.
+func TestHandleSessionListOmissionConsumesPaginationSlot(t *testing.T) {
+	total := agent.MaxPageSize + 10
+	entries := buildFixedCatalog(t, total)
+	unknownIdx := []int{2, 17, 42, 99} // all within [0, MaxPageSize), the first page.
+	for _, i := range unknownIdx {
+		entries[i].Cwd = ""
+	}
+	catalog := &listCatalogStub{entries: entries}
+	_, client := listAgentSetup(t, catalog)
+	agentConn := protocol.NewAgentConn(client)
+
+	resp, err := agentConn.ListSessions(context.Background(), protocol.ListSessionsRequest{})
+	if err != nil {
+		t.Fatalf("ListSessions (first page): %v", err)
+	}
+	wantFirstPageCount := agent.MaxPageSize - len(unknownIdx)
+	if len(resp.Sessions) != wantFirstPageCount {
+		t.Fatalf("first page len(Sessions) = %d, want %d (MaxPageSize minus %d omitted unknown-cwd entries)",
+			len(resp.Sessions), wantFirstPageCount, len(unknownIdx))
+	}
+	if resp.NextCursor == nil {
+		t.Fatal("first page NextCursor = nil, want non-nil (10 more entries remain beyond the MaxPageSize-1 boundary)")
+	}
+
+	// The second page must start exactly at catalog index MaxPageSize — the
+	// same boundary as if no entries had been omitted — proving omission
+	// never shifts where the page boundary/cursor sits.
+	resp2, err := agentConn.ListSessions(context.Background(), protocol.ListSessionsRequest{Cursor: resp.NextCursor})
+	if err != nil {
+		t.Fatalf("ListSessions (second page): %v", err)
+	}
+	if len(resp2.Sessions) != 10 {
+		t.Fatalf("second page len(Sessions) = %d, want 10 (the remaining entries beyond MaxPageSize, all with known cwd)", len(resp2.Sessions))
+	}
+	wantBoundaryID := listSessionID(t, agent.MaxPageSize).String()
+	if resp2.Sessions[0].SessionID != protocol.SessionID(wantBoundaryID) {
+		t.Errorf("second page first SessionID = %q, want %q (immediately after the index-MaxPageSize-1 boundary)",
+			resp2.Sessions[0].SessionID, wantBoundaryID)
+	}
+	if resp2.NextCursor != nil {
+		t.Errorf("second page NextCursor = %v, want nil (catalog exhausted)", resp2.NextCursor)
 	}
 }
 
@@ -273,7 +474,7 @@ func TestHandleSessionListSmallCatalogHasNoNextCursor(t *testing.T) {
 // errors.As to it here would be asserting on something the design
 // deliberately never sends.
 func TestHandleSessionListTamperedCursorRejected(t *testing.T) {
-	catalog := &listCatalogStub{metas: buildFixedCatalog(t, agent.MaxPageSize+10)}
+	catalog := &listCatalogStub{entries: buildFixedCatalog(t, agent.MaxPageSize+10)}
 	_, client := listAgentSetup(t, catalog)
 	agentConn := protocol.NewAgentConn(client)
 
@@ -348,7 +549,7 @@ func tamperTagByte(t *testing.T, token string) string {
 // TestHandleSessionListTamperedCursorRejected's doc for why that check
 // cannot be made through a wire round trip.
 func TestHandleSessionListMalformedCursorRejected(t *testing.T) {
-	catalog := &listCatalogStub{metas: buildFixedCatalog(t, 5)}
+	catalog := &listCatalogStub{entries: buildFixedCatalog(t, 5)}
 	_, client := listAgentSetup(t, catalog)
 	agentConn := protocol.NewAgentConn(client)
 
@@ -371,7 +572,7 @@ func TestHandleSessionListMalformedCursorRejected(t *testing.T) {
 // treated as "no cursor" — a client that sends "" is not the same as a
 // client that omits the field.
 func TestHandleSessionListEmptyCursorStringRejected(t *testing.T) {
-	catalog := &listCatalogStub{metas: buildFixedCatalog(t, 5)}
+	catalog := &listCatalogStub{entries: buildFixedCatalog(t, 5)}
 	_, client := listAgentSetup(t, catalog)
 	agentConn := protocol.NewAgentConn(client)
 

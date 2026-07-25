@@ -57,7 +57,7 @@ func TestAgentResolveSessionValidatesBeforeLookup(t *testing.T) {
 
 	t.Run("registered id resolves to its live session", func(t *testing.T) {
 		s := newRegistryFakeSession(t)
-		if err := a.sessions.add(s); err != nil {
+		if err := a.sessions.add(s, "/test/cwd"); err != nil {
 			t.Fatalf("sessions.add: %v", err)
 		}
 		got, err := a.resolveSession(protocol.SessionID(s.SessionID().String()))

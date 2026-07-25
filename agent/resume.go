@@ -78,7 +78,7 @@ func (a *Agent) handleSessionResume(ctx context.Context, _ string, params json.R
 		return nil, protocol.InternalError("session/resume: "+err.Error(), err)
 	}
 
-	if err := a.sessions.add(live); err != nil {
+	if err := a.sessions.add(live, setup.Cwd); err != nil {
 		// The host has already created/restored a live resource this facade
 		// can no longer track: another concurrent session-establishment call
 		// won the registry's last slot first. Same best-effort cleanup as

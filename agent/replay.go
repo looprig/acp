@@ -421,7 +421,7 @@ func (a *Agent) handleSessionLoad(ctx context.Context, _ string, params json.Raw
 		return nil, protocol.InternalError("session/load: "+err.Error(), err)
 	}
 
-	if err := a.sessions.add(loaded.Live); err != nil {
+	if err := a.sessions.add(loaded.Live, setup.Cwd); err != nil {
 		shutdownOrphanedSession(loaded.Live)
 		return nil, protocol.InternalError("session/load: "+err.Error(), err)
 	}

@@ -57,7 +57,7 @@ func TestSessionRegistryBoundedAtMax(t *testing.T) {
 	r := newSessionRegistry(max)
 
 	for i := 0; i < max; i++ {
-		if err := r.add(newRegistryFakeSession(t)); err != nil {
+		if err := r.add(newRegistryFakeSession(t), "/test/cwd"); err != nil {
 			t.Fatalf("add #%d (within capacity): unexpected error: %v", i+1, err)
 		}
 	}
@@ -65,7 +65,7 @@ func TestSessionRegistryBoundedAtMax(t *testing.T) {
 		t.Fatalf("len after filling to capacity = %d, want %d", got, max)
 	}
 
-	err := r.add(newRegistryFakeSession(t))
+	err := r.add(newRegistryFakeSession(t), "/test/cwd")
 	if err == nil {
 		t.Fatal("add beyond capacity: error = nil, want *TooManyLiveSessionsError")
 	}
@@ -89,13 +89,13 @@ func TestSessionRegistryAtCapacity(t *testing.T) {
 	if r.atCapacity() {
 		t.Fatal("atCapacity() on empty registry = true, want false")
 	}
-	if err := r.add(newRegistryFakeSession(t)); err != nil {
+	if err := r.add(newRegistryFakeSession(t), "/test/cwd"); err != nil {
 		t.Fatalf("add: unexpected error: %v", err)
 	}
 	if r.atCapacity() {
 		t.Fatal("atCapacity() at 1/2 = true, want false")
 	}
-	if err := r.add(newRegistryFakeSession(t)); err != nil {
+	if err := r.add(newRegistryFakeSession(t), "/test/cwd"); err != nil {
 		t.Fatalf("add: unexpected error: %v", err)
 	}
 	if !r.atCapacity() {
@@ -115,7 +115,7 @@ func TestSessionRegistryGetAndRemove(t *testing.T) {
 		t.Fatal("get before add: ok = true, want false")
 	}
 
-	if err := r.add(s); err != nil {
+	if err := r.add(s, "/test/cwd"); err != nil {
 		t.Fatalf("add: unexpected error: %v", err)
 	}
 	got, ok := r.get(s.SessionID())
@@ -136,6 +136,54 @@ func TestSessionRegistryGetAndRemove(t *testing.T) {
 	r.remove(s.SessionID())
 }
 
+// TestSessionRegistryCwdRoundTrip asserts cwd returns the exact string
+// recorded by add for a currently-registered session id, with ok == true.
+func TestSessionRegistryCwdRoundTrip(t *testing.T) {
+	r := newSessionRegistry(8)
+	s := newRegistryFakeSession(t)
+
+	if err := r.add(s, "/workspace/example"); err != nil {
+		t.Fatalf("add: unexpected error: %v", err)
+	}
+	got, ok := r.cwd(s.SessionID())
+	if !ok {
+		t.Fatal("cwd after add: ok = false, want true")
+	}
+	if got != "/workspace/example" {
+		t.Errorf("cwd after add: got %q, want %q", got, "/workspace/example")
+	}
+}
+
+// TestSessionRegistryCwdUnknownForUnregistered asserts cwd reports ok ==
+// false for a session id that was never registered — never a fabricated
+// empty string masquerading as "known but empty".
+func TestSessionRegistryCwdUnknownForUnregistered(t *testing.T) {
+	r := newSessionRegistry(8)
+	s := newRegistryFakeSession(t)
+
+	if _, ok := r.cwd(s.SessionID()); ok {
+		t.Fatal("cwd before add: ok = true, want false")
+	}
+}
+
+// TestSessionRegistryCwdClearedOnRemove asserts remove drops a session's
+// recorded cwd along with the session itself, so a later re-add under the
+// same id is not silently seeded with stale state, and a plain lookup
+// correctly reports "unknown" once removed.
+func TestSessionRegistryCwdClearedOnRemove(t *testing.T) {
+	r := newSessionRegistry(8)
+	s := newRegistryFakeSession(t)
+
+	if err := r.add(s, "/workspace/example"); err != nil {
+		t.Fatalf("add: unexpected error: %v", err)
+	}
+	r.remove(s.SessionID())
+
+	if _, ok := r.cwd(s.SessionID()); ok {
+		t.Fatal("cwd after remove: ok = true, want false")
+	}
+}
+
 // TestSessionRegistryConcurrentAddGetRemove exercises add/get/remove from
 // many goroutines at once (run with -race, per every task's ground rules)
 // to confirm the registry's single mutex actually serializes access rather
@@ -154,7 +202,7 @@ func TestSessionRegistryConcurrentAddGetRemove(t *testing.T) {
 		wg.Add(1)
 		go func(s registryFakeSession) {
 			defer wg.Done()
-			if err := r.add(s); err != nil {
+			if err := r.add(s, "/test/cwd/"+s.SessionID().String()); err != nil {
 				atomic.AddInt32(&addErrs, 1)
 			}
 		}(s)
@@ -167,7 +215,7 @@ func TestSessionRegistryConcurrentAddGetRemove(t *testing.T) {
 		t.Fatalf("len after concurrent add = %d, want %d", got, n)
 	}
 
-	var missing int32
+	var missing, cwdMismatch int32
 	for _, s := range sessions {
 		wg.Add(1)
 		go func(id uuid.UUID) {
@@ -175,12 +223,18 @@ func TestSessionRegistryConcurrentAddGetRemove(t *testing.T) {
 			if _, ok := r.get(id); !ok {
 				atomic.AddInt32(&missing, 1)
 			}
+			if cwd, ok := r.cwd(id); !ok || cwd != "/test/cwd/"+id.String() {
+				atomic.AddInt32(&cwdMismatch, 1)
+			}
 			r.remove(id)
 		}(s.SessionID())
 	}
 	wg.Wait()
 	if missing != 0 {
 		t.Errorf("concurrent get misses = %d, want 0", missing)
+	}
+	if cwdMismatch != 0 {
+		t.Errorf("concurrent cwd mismatches = %d, want 0", cwdMismatch)
 	}
 	if got := r.len(); got != 0 {
 		t.Errorf("len after concurrent remove = %d, want 0", got)
