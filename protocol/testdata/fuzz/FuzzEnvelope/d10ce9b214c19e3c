@@ -1,0 +1,2 @@
+go test fuzz v1
+string("{\"jso\xb6\xb6ac\":\"2.0\",\"id\":1,\"result\":1,\"error\":{\"codesage\":\"m\"}}")

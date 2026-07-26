@@ -28,9 +28,15 @@ type UpdateMeta struct {
 	IsReplay bool
 }
 
-// decodeUpdateMeta parses raw (a SessionNotification's Meta field) into an
+// DecodeUpdateMeta parses raw (a SessionNotification's Meta field) into an
 // UpdateMeta, defaulting to the zero value on absence or malformed input.
-func decodeUpdateMeta(raw json.RawMessage) UpdateMeta {
+// Exported (not just used internally by dispatch.go) so wire-compatibility
+// tests outside this package — see acp/agent/meta_roundtrip_test.go, which
+// cannot import this package's unexported symbols across the acp/agent /
+// acp/client boundary any other way — can feed it real producer-side bytes
+// and assert the fields land correctly, without this package ever needing
+// to import acp/agent back.
+func DecodeUpdateMeta(raw json.RawMessage) UpdateMeta {
 	if len(raw) == 0 {
 		return UpdateMeta{}
 	}

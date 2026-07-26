@@ -468,34 +468,37 @@ func TestEventDedupEvictedIDNoLongerCaught(t *testing.T) {
 
 // --- decodeUpdateMeta wire-shape fidelity ---
 
-// TestDecodeUpdateMetaMatchesProducerWireShape decodes the exact _meta JSON
-// acp/agent/translate.go's marshalUpdateMeta produces (hardcoded here, not
-// imported — acp/client cannot import acp/agent, see acp/CLAUDE.md), proving
-// this package's independently-owned UpdateMeta stays wire-compatible with
-// the producer side's {eventId, promptId, isReplay} shape.
+// TestDecodeUpdateMetaMatchesProducerWireShape decodes a hand-written _meta
+// JSON literal shaped like acp/agent/translate.go's marshalUpdateMeta output,
+// as a fast, dependency-free regression pin on this package's own decode
+// logic. It does NOT call the real producer function, so it cannot by
+// itself catch the two sides silently drifting — for that, see
+// acp/agent/meta_roundtrip_test.go's TestMetaWireRoundTripAgentToClient,
+// which calls the actual production marshalUpdateMeta (package agent) and
+// feeds its raw output straight into this package's real DecodeUpdateMeta.
 func TestDecodeUpdateMetaMatchesProducerWireShape(t *testing.T) {
 	raw := []byte(`{"eventId":"55555555-5555-4555-8555-555555555555","promptId":"44444444-4444-4444-8444-444444444444"}`)
-	got := decodeUpdateMeta(raw)
+	got := DecodeUpdateMeta(raw)
 	want := UpdateMeta{EventID: "55555555-5555-4555-8555-555555555555", PromptID: "44444444-4444-4444-8444-444444444444"}
 	if got != want {
-		t.Errorf("decodeUpdateMeta() = %+v, want %+v", got, want)
+		t.Errorf("DecodeUpdateMeta() = %+v, want %+v", got, want)
 	}
 }
 
 func TestDecodeUpdateMetaReplayShape(t *testing.T) {
 	raw := []byte(`{"eventId":"11111111-1111-4111-8111-111111111111","isReplay":true}`)
-	got := decodeUpdateMeta(raw)
+	got := DecodeUpdateMeta(raw)
 	if got.EventID != "11111111-1111-4111-8111-111111111111" || !got.IsReplay || got.PromptID != "" {
-		t.Errorf("decodeUpdateMeta() = %+v, want eventId set, isReplay true, promptId empty", got)
+		t.Errorf("DecodeUpdateMeta() = %+v, want eventId set, isReplay true, promptId empty", got)
 	}
 }
 
 func TestDecodeUpdateMetaDegradesOnAbsentOrMalformed(t *testing.T) {
-	if got := decodeUpdateMeta(nil); got != (UpdateMeta{}) {
-		t.Errorf("decodeUpdateMeta(nil) = %+v, want zero value", got)
+	if got := DecodeUpdateMeta(nil); got != (UpdateMeta{}) {
+		t.Errorf("DecodeUpdateMeta(nil) = %+v, want zero value", got)
 	}
-	if got := decodeUpdateMeta([]byte(`not json`)); got != (UpdateMeta{}) {
-		t.Errorf("decodeUpdateMeta(malformed) = %+v, want zero value", got)
+	if got := DecodeUpdateMeta([]byte(`not json`)); got != (UpdateMeta{}) {
+		t.Errorf("DecodeUpdateMeta(malformed) = %+v, want zero value", got)
 	}
 }
 

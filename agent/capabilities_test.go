@@ -465,3 +465,45 @@ func TestLogoutInvokesHandlerAndRequiresReAuth(t *testing.T) {
 		t.Errorf("AuthorizeSessionCreation() after logout Fault.Code = %v, want %v", f.Code, protocol.ErrorCodeAuthenticationRequired)
 	}
 }
+
+// TestInitializeNeverAdvertisesDraftAdditionalDirectories pins the design
+// doc's ("2026-07-17-acp-bridge-design.md", Non-goals) explicit exclusion of
+// "draft remote transport or additional-directory proposals" from this
+// release: capabilities.go (see its doc comment) has no code path that ever
+// sets SessionCapabilities.AdditionalDirectories, so every initialize
+// response must report it nil regardless of which optional Options are
+// supplied. Before this test, nothing pinned that absence — a future change
+// wiring AdditionalDirectories up (the generated type already exists, since
+// it is part of the pinned v1 schema) could start advertising a draft
+// capability as stable ACP with no test catching the regression. Exercises
+// every optional capability at once (not just the zero-Options case) so an
+// implementation that only omits AdditionalDirectories when nothing else is
+// configured would still fail here.
+func TestInitializeNeverAdvertisesDraftAdditionalDirectories(t *testing.T) {
+	opts := agent.Options{
+		Host:             fakeHost{},
+		Replayer:         fakeReplayer{},
+		Catalog:          fakeCatalog{},
+		Deleter:          fakeDeleter{},
+		ConfigCatalog:    fakeConfigCatalog{},
+		ConfigController: fakeConfigController{},
+		Compactor:        fakeCompactor{},
+		Authenticator:    &fakeAuthenticator{},
+		AuthMethods:      []protocol.AuthMethod{{ID: "test-method", Name: "Test Method"}},
+		Logout:           &fakeLogoutHandler{},
+	}
+
+	a, err := agent.New(opts)
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+	client, server := pipeConns(t)
+	resp := mustInitialize(t, a, client, server)
+
+	if resp.AgentCapabilities != nil &&
+		resp.AgentCapabilities.SessionCapabilities != nil &&
+		resp.AgentCapabilities.SessionCapabilities.AdditionalDirectories != nil {
+		t.Errorf("SessionCapabilities.AdditionalDirectories = %+v, want nil (draft, not stable in this release)",
+			resp.AgentCapabilities.SessionCapabilities.AdditionalDirectories)
+	}
+}

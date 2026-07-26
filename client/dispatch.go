@@ -124,7 +124,7 @@ func (c *Client) handleSessionUpdateNotify(_ context.Context, _ string, params j
 		return
 	}
 
-	sess.deliver(Update{SessionUpdate: n.Update, Meta: decodeUpdateMeta(n.Meta)})
+	sess.deliver(Update{SessionUpdate: n.Update, Meta: DecodeUpdateMeta(n.Meta)})
 }
 
 func (c *Client) countDroppedUpdate() {
