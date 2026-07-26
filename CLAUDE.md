@@ -20,9 +20,17 @@ strictly:
   packages must never import `github.com/looprig/harness` or
   `github.com/looprig/core`, directly or transitively. They exist independently
   of Harness and must stay usable against any ACP peer.
-- `acp/agent` is the only package that may import Harness's public packages
-  (and Core). It adapts the wire layer onto a Harness session; it is the
-  seam where the protocol meets the agent runtime.
+- `acp/agent` is the only PRODUCT-FACING package that may import Harness's
+  public packages (and Core). It adapts the wire layer onto a Harness
+  session; it is the seam where the protocol meets the agent runtime.
+  `acp/internal/exampleagent` (Task 6.1's thin, test-only composition — the
+  module still ships no product binary) is the one deliberate exception: it
+  wires a minimal in-memory SessionHost/LiveSession implementation onto the
+  real `acp/agent` facade for interop testing, so it necessarily depends on
+  the same Harness/Core public packages a real product would (content, uuid,
+  event, gate, journal, sessionstore) — never their internal/ packages,
+  exactly like `acp/agent` itself. No other package may import Harness or
+  Core.
 
 A dependency-guard test enforces this layering (see Task 1.9 of the ACP bridge
 implementation plan); until it lands, treat the rule above as binding anyway.
@@ -31,10 +39,10 @@ Prefer the standard library. External packages require explicit user approval
 before they are added — do not `go get` anything not already listed below
 without stopping to ask first. The only approved external packages are:
 
-- `github.com/looprig/core` — shared content and UUID values, consumed only
-  by `acp/agent`
+- `github.com/looprig/core` — shared content and UUID values, consumed by
+  `acp/agent` and `acp/internal/exampleagent`
 - `github.com/looprig/harness` — public foreign, loop, command, event, and
-  identity contracts, consumed only by `acp/agent`
+  identity contracts, consumed by `acp/agent` and `acp/internal/exampleagent`
 - `github.com/securego/gosec/v2` — security static analysis (development tool only)
 - `golang.org/x/vuln/cmd/govulncheck` — Go vulnerability scanner (development tool only)
 - `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (development tool only)

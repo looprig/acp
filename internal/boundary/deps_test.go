@@ -14,12 +14,19 @@ import (
 )
 
 // Layering rule for this module (see acp/CLAUDE.md): acp/agent is the only
-// package that may import Harness's or Core's *public* packages, and even it
-// must not reach into their internal/ packages. Every other package in this
-// module (protocol, transport/stdio, client, and all internal/* tooling) must
-// not import Harness or Core at all, directly or transitively through another
-// local acp package. No package anywhere in the module may import
-// github.com/looprig/foreignloops.
+// PRODUCT-FACING package that may import Harness's or Core's *public*
+// packages, and even it must not reach into their internal/ packages.
+// internal/exampleagent (Task 6.1's thin, test-only composition — see its own
+// package doc) is the one deliberate exception: it exists specifically to
+// wire a minimal in-memory SessionHost/LiveSession implementation onto the
+// real acp/agent facade, which unavoidably means depending on the same
+// Harness/Core public packages a real product would (content, uuid, event,
+// gate, journal, sessionstore) — never on their internal/ packages, exactly
+// like acp/agent itself. Every OTHER package in this module (protocol,
+// transport/stdio, client, mockpeer, and every other internal/* tooling
+// package) must not import Harness or Core at all, directly or transitively
+// through another local acp package. No package anywhere in the module may
+// import github.com/looprig/foreignloops.
 //
 // scanModuleBoundaries enforces this by building the local import graph from
 // source (go/parser, not go/packages or `go list`: see acp/CLAUDE.md on
@@ -127,6 +134,55 @@ import (
 	}
 	if len(violations) != 0 {
 		t.Errorf("violations = %#v, want none: acp/agent may import Harness/Core public packages", violations)
+	}
+}
+
+// TestScanModuleBoundariesAllowsExampleAgentHarnessAndCorePublicImports
+// proves internal/exampleagent gets the same allowance as acp/agent itself
+// (see mayImportHarnessOrCorePublic's doc): Task 6.1's composition needs
+// Harness/Core public packages to implement SessionHost/LiveSession, exactly
+// like a real product would.
+func TestScanModuleBoundariesAllowsExampleAgentHarnessAndCorePublicImports(t *testing.T) {
+	root := t.TempDir()
+	writeBoundaryFixture(t, filepath.Join(root, "internal", "exampleagent", "ok.go"), `package main
+
+import (
+	_ "github.com/looprig/harness/pkg/foreign"
+	_ "github.com/looprig/core/content"
+)
+`)
+
+	violations, err := scanModuleBoundaries(root)
+	if err != nil {
+		t.Fatalf("scan synthetic module: %v", err)
+	}
+	if len(violations) != 0 {
+		t.Errorf("violations = %#v, want none: internal/exampleagent may import Harness/Core public packages", violations)
+	}
+}
+
+// TestScanModuleBoundariesRejectsExampleAgentHarnessInternalImport proves
+// internal/exampleagent is held to the same "public only, never internal/"
+// discipline as acp/agent — the allowance in
+// TestScanModuleBoundariesAllowsExampleAgentHarnessAndCorePublicImports is
+// not a blanket exemption.
+func TestScanModuleBoundariesRejectsExampleAgentHarnessInternalImport(t *testing.T) {
+	root := t.TempDir()
+	writeBoundaryFixture(t, filepath.Join(root, "internal", "exampleagent", "bad.go"), `package main
+
+import _ "github.com/looprig/harness/internal/sessionruntime"
+`)
+
+	violations, err := scanModuleBoundaries(root)
+	if err != nil {
+		t.Fatalf("scan synthetic module: %v", err)
+	}
+	wantFile := filepath.Join("internal", "exampleagent", "bad.go")
+	if !hasBoundaryViolation(violations, boundaryAgentInternalImport, wantFile, "github.com/looprig/harness/internal/sessionruntime") {
+		t.Errorf("violations = %#v, want exampleagent Harness-internal import rejection", violations)
+	}
+	if len(violations) != 1 {
+		t.Errorf("len(violations) = %d, want 1: %#v", len(violations), violations)
 	}
 }
 
@@ -355,7 +411,7 @@ func classifyBoundaryViolation(dir, importPath string) (boundaryViolationKind, b
 	if hasImportPrefix(importPath, foreignloopsImportRoot) {
 		return boundaryForeignloopsImport, true
 	}
-	if isAgentGroupDir(dir) {
+	if mayImportHarnessOrCorePublic(dir) {
 		if hasImportPrefix(importPath, harnessInternalImportRoot) || hasImportPrefix(importPath, coreInternalImportRoot) {
 			return boundaryAgentInternalImport, true
 		}
@@ -407,8 +463,17 @@ func firstLocalEdgeFile(pkg *packageImports) string {
 	return best
 }
 
-func isAgentGroupDir(dir string) bool {
-	return dir == "agent" || strings.HasPrefix(dir, "agent/")
+// mayImportHarnessOrCorePublic reports whether dir is one of the two
+// package groups permitted to import Harness's or Core's public packages
+// (never their internal/ packages — see classifyBoundaryViolation): the
+// product-facing acp/agent facade itself, or internal/exampleagent, Task
+// 6.1's test-only composition that wires a minimal in-memory host onto that
+// same facade (see this file's package doc).
+func mayImportHarnessOrCorePublic(dir string) bool {
+	if dir == "agent" || strings.HasPrefix(dir, "agent/") {
+		return true
+	}
+	return dir == "internal/exampleagent" || strings.HasPrefix(dir, "internal/exampleagent/")
 }
 
 func hasImportPrefix(importPath, root string) bool {
