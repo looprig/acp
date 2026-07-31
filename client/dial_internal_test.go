@@ -20,6 +20,7 @@ import (
 func newTestClient(attempt func(ctx context.Context) error) *Client {
 	c := &Client{
 		sessions: make(map[protocol.SessionID]*Session),
+		done:     make(chan struct{}),
 	}
 	c.attemptConnect = attempt
 	return c

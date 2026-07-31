@@ -14,7 +14,9 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"sync"
 	"time"
@@ -85,6 +87,17 @@ type Client struct {
 	sessions   map[protocol.SessionID]*Session
 
 	droppedUpdates uint64
+
+	// done and doneOnce back Done(): done is created once in New (so Done()
+	// itself never needs a nil check or lock) and closed exactly once, by
+	// whichever terminal path (watchDeath's connection-death observation, or
+	// an explicit Close) reaches its close(c.done) first. sync.Once is what
+	// makes "exactly once" true under concurrent close/death rather than
+	// merely "usually once": both paths may run concurrently (Close racing a
+	// death watchDeath just observed), and closing an already-closed channel
+	// panics, so the guard is load-bearing, not defensive boilerplate.
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 // New constructs a Client that will spawn cmd and negotiate opts's
@@ -96,6 +109,7 @@ func New(cmd stdio.Command, opts Options) *Client {
 		cmd:      cmd,
 		opts:     opts.withDefaults(),
 		sessions: make(map[protocol.SessionID]*Session),
+		done:     make(chan struct{}),
 	}
 	c.attemptConnect = c.spawnAndConnect
 	return c
@@ -223,12 +237,33 @@ func (c *Client) watchDeath(conn *protocol.Conn, proc *stdio.Proc) {
 	c.mu.Lock()
 	c.state = dialClosed
 	c.mu.Unlock()
+	c.closeDone()
 
 	c.closeAllSessions()
 
 	if proc != nil {
 		_ = proc.Kill()
 	}
+}
+
+// Done returns a channel that is closed once this Client reaches a terminal
+// closed state: an explicit Close call, or watchDeath observing the
+// connection end on its own (peer disconnect or transport failure). It is
+// safe to read from immediately after New, before any Dial — it simply
+// never closes until the Client is actually terminated, including the case
+// where Close is called before Dial ever succeeded (see Close's own doc: it
+// transitions to closed and tears down whatever partial state exists,
+// unconditionally, once called). A merely FAILED Dial attempt that leaves
+// the Client retryable (see Dial's start-once state machine) does not close
+// this channel: only a genuine terminal transition does. This lets a caller
+// (in particular the ACP launch layer's owned-proxy lifecycle) react to
+// unexpected child death without polling Client state.
+func (c *Client) Done() <-chan struct{} { return c.done }
+
+// closeDone closes c.done exactly once, however many terminal paths
+// (watchDeath, Close, or both concurrently) reach it.
+func (c *Client) closeDone() {
+	c.doneOnce.Do(func() { close(c.done) })
 }
 
 // currentAgent returns the connected AgentConn, or a typed error if the
@@ -271,6 +306,7 @@ func (c *Client) Close(ctx context.Context) error {
 	conn, proc := c.conn, c.proc
 	c.state = dialClosed
 	c.mu.Unlock()
+	c.closeDone()
 
 	c.closeAllSessions()
 
@@ -302,4 +338,55 @@ func (c *Client) DroppedUpdates() uint64 {
 	c.sessionsMu.Lock()
 	defer c.sessionsMu.Unlock()
 	return c.droppedUpdates
+}
+
+// SetModelCapability is unforgeable proof that this Client's negotiated
+// "initialize" response advertised — under a caller-checked _meta key — the
+// non-standard "session/set_model" extension some ACP adapters implement
+// (see Session.SetModel). The zero value is not proof of anything and
+// SetModel refuses it; the only way to obtain a granted SetModelCapability
+// is ProveSetModelCapability, which checks the real bytes this Client
+// received during the handshake rather than trusting any caller assertion.
+type SetModelCapability struct {
+	granted bool
+}
+
+// ProveSetModelCapability reports whether this Client's stored "initialize"
+// response `_meta` contains key as a present, non-null top-level field, and
+// returns a SetModelCapability recording the answer (ok is the same
+// boolean, returned separately so a caller can branch without inspecting
+// the capability value's private state).
+//
+// Different ACP adapters that implement the unstable session/set_model
+// extension are expected to advertise it under different, adapter-specific
+// _meta keys — there is no pinned schema for this extension in
+// protocol/types_gen.go to standardize one — so the caller (a connector in
+// acp/launch, which knows its specific adapter's documented key) supplies
+// the exact key to check. This method's only job is making that check
+// unforgeable and centralized: it is always evaluated against the real
+// initialize response, never a value a caller could fabricate directly, and
+// it deliberately never calls session/set_model itself to "check" for
+// support — some ACP adapters answer an unrecognized method with a bare
+// `{}` success rather than a JSON-RPC error, which would make a speculative
+// probe silently misread as support.
+//
+// ok is false both when the key is genuinely absent (or _meta is empty or
+// not a JSON object) and when this Client has never dialed successfully;
+// SetModel refuses either way.
+func (c *Client) ProveSetModelCapability(key string) (proof SetModelCapability, ok bool) {
+	c.mu.Lock()
+	resp := c.initRes
+	c.mu.Unlock()
+	if resp == nil || len(resp.Meta) == 0 {
+		return SetModelCapability{}, false
+	}
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(resp.Meta, &meta); err != nil {
+		return SetModelCapability{}, false
+	}
+	raw, present := meta[key]
+	if !present || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return SetModelCapability{}, false
+	}
+	return SetModelCapability{granted: true}, true
 }

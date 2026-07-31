@@ -47,6 +47,17 @@ func (e *LoadTimeoutError) Error() string {
 	return fmt.Sprintf("acp/client: session/load: sessionId %q did not resolve within %s", e.SessionID, e.Timeout)
 }
 
+// SetModelUnsupportedError reports that Session.SetModel was called without
+// a granted SetModelCapability: the connected agent's initialize response
+// _meta never proved (see Client.ProveSetModelCapability) that it
+// advertises the non-standard session/set_model extension, so the call was
+// refused before ever reaching the wire.
+type SetModelUnsupportedError struct{}
+
+func (e *SetModelUnsupportedError) Error() string {
+	return "acp/client: session/set_model: no proven _meta capability for this extension"
+}
+
 // wrapConnError normalizes an error returned by a protocol.Conn-backed call
 // (AgentConn.*, Conn.Notify) into this package's typed vocabulary: a
 // *protocol.ConnClosedError becomes a *ClosedError so callers of acp/client

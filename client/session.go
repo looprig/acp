@@ -123,10 +123,71 @@ type Session struct {
 	seenOrder []string
 
 	promptSem chan struct{}
+
+	// configMu guards configOptions and modes: this Session's locally cached
+	// view of its session/new response's initial configOptions/modes, kept
+	// current by SetConfigOption/SetMode's own responses (see their docs)
+	// rather than by parsing the session/update notification stream, since a
+	// connector needs a synchronous "what does the session look like right
+	// now" read (ConfigOptions/Modes) that does not require it to also track
+	// the update stream just to answer that question.
+	configMu      sync.Mutex
+	configOptions []protocol.SessionConfigOption
+	modes         *protocol.SessionModeState
 }
 
 // ID returns the ACP session id this Session was created or loaded with.
 func (s *Session) ID() protocol.SessionID { return s.id }
+
+// copyConfigOptions returns a defensive copy of in: a fresh backing array so
+// a caller mutating the returned slice (or Session mutating its own stored
+// copy later) can never alias the other's memory. Nil in yields nil out
+// (never an empty-but-non-nil slice), matching this package's existing
+// append([]T(nil), src...) idiom elsewhere (see e.g.
+// internal/exampleagent/host.go, agent/list.go).
+func copyConfigOptions(in []protocol.SessionConfigOption) []protocol.SessionConfigOption {
+	if in == nil {
+		return nil
+	}
+	return append([]protocol.SessionConfigOption(nil), in...)
+}
+
+// copyModeState returns a defensive copy of in: a new *SessionModeState with
+// its own AvailableModes backing array. Nil in yields nil out.
+func copyModeState(in *protocol.SessionModeState) *protocol.SessionModeState {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.AvailableModes = append([]protocol.SessionMode(nil), in.AvailableModes...)
+	return &out
+}
+
+// ConfigOptions returns a defensive copy of this Session's most recently
+// known set of session configuration options: session/new's response
+// initially (see NewSession), replaced wholesale by SetConfigOption's own
+// response on every successful call (see SetConfigOption's doc — never a
+// partial merge). Nil if the agent never advertised any, or if this Session
+// was created via LoadSession/ResumeSession, whose config surface this
+// package does not populate from their own responses. The returned slice is
+// this Session's own copy: mutating it never affects the Session's internal
+// state, and a later SetConfigOption response never mutates a slice a
+// caller is still holding from an earlier call.
+func (s *Session) ConfigOptions() []protocol.SessionConfigOption {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	return copyConfigOptions(s.configOptions)
+}
+
+// Modes returns a defensive copy of this Session's most recently known mode
+// state: session/new's response initially (see NewSession), updated by
+// SetMode on every successful call (see SetMode's doc). Nil under the same
+// conditions as ConfigOptions.
+func (s *Session) Modes() *protocol.SessionModeState {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	return copyModeState(s.modes)
+}
 
 // newSession constructs a Session and starts its update-delivery pump.
 func newSession(client *Client, id protocol.SessionID) *Session {
@@ -358,7 +419,12 @@ func (c *Client) NewSession(ctx context.Context, p NewSessionParams) (*Session, 
 	if err != nil {
 		return nil, wrapConnError(err)
 	}
-	return c.registerSession(resp.SessionID), nil
+	sess := c.registerSession(resp.SessionID)
+	sess.configMu.Lock()
+	sess.configOptions = copyConfigOptions(resp.ConfigOptions)
+	sess.modes = copyModeState(resp.Modes)
+	sess.configMu.Unlock()
+	return sess, nil
 }
 
 // errEmptySessionID reports that a caller-supplied SessionID was empty,
@@ -439,4 +505,128 @@ func (c *Client) ResumeSession(ctx context.Context, p ResumeSessionParams) (*Ses
 		return nil, wrapConnError(err)
 	}
 	return sess, nil
+}
+
+// SetConfigOption calls the agent's session/set_config_option method,
+// selecting valueID for configID (the single-value-selector variant of
+// protocol.SetSessionConfigOptionRequest — the boolean variant is not
+// reachable through this method, matching this method's own signature: a
+// caller with a boolean option to flip has no valueID to pass in the first
+// place). On success, this Session's cached ConfigOptions is replaced
+// wholesale with the response's own full set (never a partial merge: the
+// agent's response is authoritative, and the local cache before the call
+// might already be stale by the time it resolves).
+func (s *Session) SetConfigOption(ctx context.Context, configID protocol.SessionConfigID, valueID protocol.SessionConfigValueID) error {
+	agent, err := s.client.currentAgent()
+	if err != nil {
+		return err
+	}
+
+	resp, err := agent.SetConfigOption(ctx, protocol.SetSessionConfigOptionRequest{
+		SessionID: s.id,
+		ConfigID:  configID,
+		ValueID:   &valueID,
+	})
+	if err != nil {
+		return wrapConnError(err)
+	}
+
+	s.configMu.Lock()
+	s.configOptions = copyConfigOptions(resp.ConfigOptions)
+	s.configMu.Unlock()
+	return nil
+}
+
+// SetMode calls the agent's session/set_mode method. Unlike
+// SetConfigOption, session/set_mode's own response carries no state at all
+// (see protocol.SetSessionModeResponse: only _meta), so on success this
+// Session's cached mode state is updated locally instead: CurrentModeID is
+// replaced with the id the caller just requested — the call succeeding is
+// the only confirmation the wire gives — leaving AvailableModes as most
+// recently known. If this Session has no cached mode state yet (a
+// LoadSession/ResumeSession-created Session, whose initial Modes this
+// package does not populate — see Modes' doc), a minimal SessionModeState
+// carrying only the new CurrentModeID is recorded rather than silently
+// discarding the confirmed change.
+func (s *Session) SetMode(ctx context.Context, modeID protocol.SessionModeID) error {
+	agent, err := s.client.currentAgent()
+	if err != nil {
+		return err
+	}
+
+	if _, err := agent.SetMode(ctx, protocol.SetSessionModeRequest{
+		SessionID: s.id,
+		ModeID:    modeID,
+	}); err != nil {
+		return wrapConnError(err)
+	}
+
+	s.configMu.Lock()
+	if s.modes == nil {
+		s.modes = &protocol.SessionModeState{CurrentModeID: modeID}
+	} else {
+		updated := *s.modes
+		updated.CurrentModeID = modeID
+		s.modes = &updated
+	}
+	s.configMu.Unlock()
+	return nil
+}
+
+// methodSessionSetModel is the wire method name for the non-standard,
+// unstable "session/set_model" extension some ACP adapters implement (for
+// example claude-agent-acp). It has no entry in protocol/methods_gen.go —
+// the pinned v1 ACP schema this module generates from does not define it —
+// so SetModel calls it through AgentConn.Conn().Call, the same generic path
+// AgentConn.Conn's own doc names for "extension traffic," rather than
+// inventing a typed protocol.AgentConn method for a method the pinned
+// schema does not recognize. This is the only method name SetModel will
+// ever call: nothing in this package accepts a caller-supplied method
+// string, so this is not a generic arbitrary-JSON-RPC-call escape hatch.
+const methodSessionSetModel = "session/set_model"
+
+// setModelRequest is session/set_model's request shape. Field names/casing
+// mirror the sibling generated SetSessionModeRequest (sessionId plus one
+// target-value field) — this codebase's existing convention for "set X for
+// a session" ACP methods — since no published schema exists for this
+// extension to conform to instead. Unexported: callers only ever reach it
+// through SetModel's (context, capability, modelID) signature.
+type setModelRequest struct {
+	SessionID protocol.SessionID `json:"sessionId"`
+	ModelID   string             `json:"modelId"`
+}
+
+// setModelResponse is session/set_model's response shape. Deliberately
+// empty: this is an unstable, non-standard extension with no pinned
+// response schema, and SetModel promises callers nothing about
+// adapter-specific response data.
+type setModelResponse struct{}
+
+// SetModel calls the non-standard "session/set_model" extension some ACP
+// adapters implement, gated behind proof (a SetModelCapability) that this
+// Session's Client actually observed the extension advertised in its
+// "initialize" response (see Client.ProveSetModelCapability). Without a
+// granted proof, SetModel fails closed with *SetModelUnsupportedError
+// before ever reaching the wire: this package never speculatively probes an
+// ACP peer for an undeclared method, because some adapters answer an
+// unrecognized method with a bare `{}` success rather than a JSON-RPC
+// error, which would make such a probe silently misread as support.
+func (s *Session) SetModel(ctx context.Context, proof SetModelCapability, modelID string) error {
+	if !proof.granted {
+		return &SetModelUnsupportedError{}
+	}
+
+	agent, err := s.client.currentAgent()
+	if err != nil {
+		return err
+	}
+
+	var resp setModelResponse
+	if err := agent.Conn().Call(ctx, methodSessionSetModel, setModelRequest{
+		SessionID: s.id,
+		ModelID:   modelID,
+	}, &resp); err != nil {
+		return wrapConnError(err)
+	}
+	return nil
 }

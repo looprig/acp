@@ -26,14 +26,17 @@ type fakeAgent struct {
 	conn   *protocol.Conn
 	client *protocol.ClientConn
 
-	mu             sync.Mutex
-	lastInitReq    protocol.InitializeRequest
-	onInitialize   func(req protocol.InitializeRequest) (protocol.InitializeResponse, error)
-	onNewSession   func(req protocol.NewSessionRequest) (protocol.NewSessionResponse, error)
-	onLoadSession  func(ctx context.Context, fa *fakeAgent, req protocol.LoadSessionRequest) (protocol.LoadSessionResponse, error)
-	onResume       func(req protocol.ResumeSessionRequest) (protocol.ResumeSessionResponse, error)
-	onPrompt       func(ctx context.Context, fa *fakeAgent, req protocol.PromptRequest) (protocol.PromptResponse, error)
-	cancelReceived chan protocol.CancelNotification
+	mu                sync.Mutex
+	lastInitReq       protocol.InitializeRequest
+	onInitialize      func(req protocol.InitializeRequest) (protocol.InitializeResponse, error)
+	onNewSession      func(req protocol.NewSessionRequest) (protocol.NewSessionResponse, error)
+	onLoadSession     func(ctx context.Context, fa *fakeAgent, req protocol.LoadSessionRequest) (protocol.LoadSessionResponse, error)
+	onResume          func(req protocol.ResumeSessionRequest) (protocol.ResumeSessionResponse, error)
+	onPrompt          func(ctx context.Context, fa *fakeAgent, req protocol.PromptRequest) (protocol.PromptResponse, error)
+	onSetConfigOption func(req protocol.SetSessionConfigOptionRequest) (protocol.SetSessionConfigOptionResponse, error)
+	onSetMode         func(req protocol.SetSessionModeRequest) (protocol.SetSessionModeResponse, error)
+	onSetModel        func(req setModelRequest) (setModelResponse, error)
+	cancelReceived    chan protocol.CancelNotification
 }
 
 // newFakeAgent wires default (successful, minimal) handlers for every
@@ -60,6 +63,15 @@ func newFakeAgent(conn *protocol.Conn) *fakeAgent {
 	}
 	fa.onPrompt = func(ctx context.Context, fa *fakeAgent, req protocol.PromptRequest) (protocol.PromptResponse, error) {
 		return protocol.PromptResponse{StopReason: protocol.StopReasonEndTurn}, nil
+	}
+	fa.onSetConfigOption = func(req protocol.SetSessionConfigOptionRequest) (protocol.SetSessionConfigOptionResponse, error) {
+		return protocol.SetSessionConfigOptionResponse{}, nil
+	}
+	fa.onSetMode = func(req protocol.SetSessionModeRequest) (protocol.SetSessionModeResponse, error) {
+		return protocol.SetSessionModeResponse{}, nil
+	}
+	fa.onSetModel = func(req setModelRequest) (setModelResponse, error) {
+		return setModelResponse{}, nil
 	}
 
 	conn.Handle(string(protocol.MethodInitialize), func(_ context.Context, _ string, params json.RawMessage) (any, error) {
@@ -110,6 +122,27 @@ func newFakeAgent(conn *protocol.Conn) *fakeAgent {
 		}
 		fa.cancelReceived <- n
 	})
+	conn.Handle(string(protocol.MethodSessionSetConfigOption), func(_ context.Context, _ string, params json.RawMessage) (any, error) {
+		var req protocol.SetSessionConfigOptionRequest
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, protocol.InvalidParams("session/set_config_option: decode", err)
+		}
+		return fa.onSetConfigOption(req)
+	})
+	conn.Handle(string(protocol.MethodSessionSetMode), func(_ context.Context, _ string, params json.RawMessage) (any, error) {
+		var req protocol.SetSessionModeRequest
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, protocol.InvalidParams("session/set_mode: decode", err)
+		}
+		return fa.onSetMode(req)
+	})
+	conn.Handle(methodSessionSetModel, func(_ context.Context, _ string, params json.RawMessage) (any, error) {
+		var req setModelRequest
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, protocol.InvalidParams("session/set_model: decode", err)
+		}
+		return fa.onSetModel(req)
+	})
 
 	return fa
 }
@@ -131,11 +164,22 @@ func (fa *fakeAgent) waitCancel(t *testing.T, d time.Duration) protocol.CancelNo
 // over a net.Pipe (no real subprocess) with the given Options, dials it, and
 // registers cleanup. It returns both so a test can script fa's handlers
 // before triggering Client calls that reach them.
-func dialTestClient(t *testing.T, opts Options) (*Client, *fakeAgent) {
+//
+// configure, if given, is applied to fa before dialing — the only way to
+// script fa's onInitialize response (unlike every other handler, which a
+// test can still safely reassign after dialing, onInitialize must already
+// be in place before Dial's handshake happens). Tests that need a
+// non-default initialize response (for example, one advertising a
+// session/set_model _meta capability) pass a configure func; every existing
+// caller passes none, so this is purely additive.
+func dialTestClient(t *testing.T, opts Options, configure ...func(*fakeAgent)) (*Client, *fakeAgent) {
 	t.Helper()
 	agentSide, clientSide := net.Pipe()
 
 	fa := newFakeAgent(protocol.NewConn(agentSide, agentSide, protocol.ConnOptions{}))
+	for _, fn := range configure {
+		fn(fa)
+	}
 
 	c := New(stdio.Command{}, opts)
 	c.attemptConnect = func(ctx context.Context) error {

@@ -3,10 +3,12 @@ package client
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/looprig/acp/protocol"
+	"github.com/looprig/acp/transport/stdio"
 )
 
 // TestConnectionDeathFailsPendingPromptAndClosesUpdates proves that when the
@@ -98,4 +100,124 @@ func TestOperationsAfterConnectionDeathFailTyped(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("NewSession() after connection death error = %v, want *ClosedError", err)
+}
+
+// assertDoneClosed fails the test unless c.Done() is already closed
+// (non-blocking receive), and assertDoneOpen fails it unless c.Done() is
+// still open. Both poll briefly rather than assuming a single immediate
+// check is deterministic against watchDeath's own goroutine scheduling.
+func assertDoneClosed(t *testing.T, c *Client, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		select {
+		case <-c.Done():
+			return
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Done() not closed within %s", d)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func assertDoneOpen(t *testing.T, c *Client) {
+	t.Helper()
+	select {
+	case <-c.Done():
+		t.Fatal("Done() closed, want still open")
+	default:
+	}
+}
+
+// TestDoneClosesOnExplicitClose proves Done() closes when Close is called
+// on an otherwise healthy, successfully-dialed Client.
+func TestDoneClosesOnExplicitClose(t *testing.T) {
+	c, _ := dialTestClient(t, Options{})
+	assertDoneOpen(t, c)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	assertDoneClosed(t, c, 2*time.Second)
+}
+
+// TestDoneClosesOnConnectionDeath proves Done() closes when the connection
+// dies on its own (watchDeath observing conn.Done(), never Close called by
+// this test at all) — the "child/connection death" trigger distinct from
+// an explicit Close.
+func TestDoneClosesOnConnectionDeath(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	assertDoneOpen(t, c)
+
+	if err := fa.conn.Close(); err != nil {
+		t.Fatalf("fa.conn.Close() error = %v", err)
+	}
+	assertDoneClosed(t, c, 2*time.Second)
+}
+
+// TestDoneClosesOnCloseAfterNeverSuccessfullyDialing proves two things about
+// the "failed terminal transition" trigger: first, that a Dial attempt which
+// merely fails (and, per the start-once state machine, resets to idle so a
+// later Dial can retry) does NOT by itself close Done — a retryable Client
+// is not yet terminally done. Second, that Close called from that same
+// never-successfully-connected state (proc and conn both nil: attemptConnect
+// never got far enough to set them) still performs a genuine terminal
+// transition and closes Done, exactly as it would from a live connection.
+func TestDoneClosesOnCloseAfterNeverSuccessfullyDialing(t *testing.T) {
+	c := New(stdio.Command{}, Options{})
+	c.attemptConnect = func(ctx context.Context) error {
+		return errors.New("boom: attemptConnect always fails in this test")
+	}
+
+	if err := c.Dial(context.Background()); err == nil {
+		t.Fatal("Dial() error = nil, want the injected failure")
+	}
+	assertDoneOpen(t, c)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	assertDoneClosed(t, c, 2*time.Second)
+}
+
+// TestDoneClosesExactlyOnceUnderConcurrentCloseAndDeath proves Done()
+// survives a genuine race between an explicit Close and watchDeath's own
+// connection-death observation without panicking (closing an
+// already-closed channel panics, so this is the sync.Once guard's real
+// job) and settles closed either way. Run with -race.
+func TestDoneClosesExactlyOnceUnderConcurrentCloseAndDeath(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	c, fa := dialTestClient(t, Options{})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = c.Close(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		_ = fa.conn.Close()
+	}()
+	wg.Wait()
+
+	assertDoneClosed(t, c, 2*time.Second)
+
+	// A second, independent read must also observe it closed (reading a
+	// closed channel is always safe/non-blocking); this is really just
+	// belt-and-suspenders on top of the -race run itself catching any
+	// double-close panic.
+	select {
+	case <-c.Done():
+	default:
+		t.Fatal("Done() not closed on a second read after concurrent Close/death")
+	}
 }
