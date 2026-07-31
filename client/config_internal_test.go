@@ -106,7 +106,7 @@ func TestNewSessionRetainsDefensiveCopyOfConfigOptionsAndModes(t *testing.T) {
 	// Mutating the slice/pointer returned by the accessors must never affect
 	// the Session's own state (defensive copy on read).
 	gotOptions[0].Name = "mutated"
-	gotOptions = append(gotOptions, protocol.SessionConfigOption{ID: "extra"})
+	_ = append(gotOptions, protocol.SessionConfigOption{ID: "extra"})
 	gotModes.CurrentModeID = "mutated"
 	gotModes.AvailableModes = append(gotModes.AvailableModes, protocol.SessionMode{ID: "extra"})
 
