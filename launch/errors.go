@@ -49,3 +49,19 @@ type ModelAliasError struct{ Alias string }
 func (e *ModelAliasError) Error() string {
 	return fmt.Sprintf("acp/launch: model alias %q not advertised by the connected adapter", e.Alias)
 }
+
+// CodexVersionError reports that a codex-acp version probe (see
+// ProbeCodexVersion in version.go) did not clear MinCodexVersion, for any
+// reason: below the floor, a legacy binary with no recognizable version
+// output, unparseable output, a nonzero exit, or a timeout. Every one of
+// those classifications fails closed identically from a caller's
+// perspective -- reject the adapter -- with Result carrying the specific
+// CodexVersionClass a caller can inspect or log.
+type CodexVersionError struct {
+	Path   string
+	Result CodexVersionResult
+}
+
+func (e *CodexVersionError) Error() string {
+	return fmt.Sprintf("acp/launch: codex-acp at %q failed the version probe (%s)", e.Path, e.Result.Class)
+}
