@@ -190,6 +190,11 @@ func dial(ctx context.Context, cfg Config, connect connectFunc) (*ManagedClient,
 
 	mc := &ManagedClient{conn: conn, owned: owned}
 	if owned != nil {
+		// #nosec G118 -- watchOwnedDeath deliberately outlives any single
+		// request: it must keep watching for connection/child death for the
+		// ManagedClient's entire remaining lifetime, not be tied to (and
+		// cancelled with) whichever request context happened to be in scope
+		// when Dial returned. context.Background() is correct here.
 		go mc.watchOwnedDeath()
 	}
 	return mc, nil

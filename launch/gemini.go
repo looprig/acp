@@ -22,7 +22,10 @@ const (
 	// only nothing to add beyond these three variables (see the design
 	// doc).
 	envGoogleGeminiBaseURL = "GOOGLE_GEMINI_BASE_URL"
-	envGeminiAPIKey        = "GEMINI_API_KEY"
+	// #nosec G101 -- this is the NAME of an environment variable, not a
+	// credential value; the real secret is a runtime ProxyBinding token,
+	// never a source-code literal.
+	envGeminiAPIKey = "GEMINI_API_KEY"
 	// envGeminiModel selects the harness-facing model alias.
 	envGeminiModel = "GEMINI_MODEL"
 )

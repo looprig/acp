@@ -24,6 +24,10 @@ const (
 	// model_providers.looprig.env_key override below (see
 	// codexConfigArgs): codex-acp reads the token from this environment
 	// variable, never from an argv value or a config file.
+	//
+	// #nosec G101 -- this is the NAME of an environment variable, not a
+	// credential value; the real secret is the runtime bearer token read
+	// from a ProxyBinding, never a source-code literal.
 	envLoopRigProxyToken = "LOOPRIG_PROXY_TOKEN"
 	// envCodexHome must never be present in codex-acp's environment: its
 	// presence would point codex-acp at a real, persistent configuration

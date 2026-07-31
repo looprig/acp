@@ -15,7 +15,10 @@ const (
 	// envAnthropicBaseURL and envAnthropicAuthToken point claude-agent-acp's
 	// underlying Anthropic client at the model proxy binding instead of a
 	// real provider endpoint.
-	envAnthropicBaseURL   = "ANTHROPIC_BASE_URL"
+	envAnthropicBaseURL = "ANTHROPIC_BASE_URL"
+	// #nosec G101 -- this is the NAME of an environment variable, not a
+	// credential value; the real secret is a runtime ProxyBinding token,
+	// never a source-code literal.
 	envAnthropicAuthToken = "ANTHROPIC_AUTH_TOKEN"
 	// envClaudeCodeExecutable optionally pins the underlying `claude` CLI
 	// claude-agent-acp drives to a specific absolute path.
