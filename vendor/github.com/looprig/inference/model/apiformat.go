@@ -12,4 +12,9 @@ const (
 	APIFormatOpenAI    APIFormat = "openai"
 	APIFormatAnthropic APIFormat = "anthropic"
 	APIFormatGemini    APIFormat = "gemini"
+
+	// APIFormatOpenAIResponses names the OpenAI Responses API dialect
+	// (POST /v1/responses), distinct from APIFormatOpenAI which names OpenAI
+	// Chat Completions.
+	APIFormatOpenAIResponses APIFormat = "openai-responses"
 )

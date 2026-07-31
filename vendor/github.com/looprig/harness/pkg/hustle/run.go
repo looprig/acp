@@ -61,6 +61,48 @@ func (s TerminalStatus) Valid() bool {
 	return s == TerminalStatusCompleted || s == TerminalStatusFailed
 }
 
+// RetryPolicy selects the immutable, bounded retry behavior of one definition.
+// The zero value preserves the historical single-attempt behavior.
+type RetryPolicy uint8
+
+const (
+	RetryPolicyNone RetryPolicy = iota
+	// RetryPolicyClassifiedOnce permits one clean restart after a closed set of
+	// transient inference or recoverable terminal-parse failures.
+	RetryPolicyClassifiedOnce
+)
+
+// Valid reports whether the policy is a recognized immutable behavior.
+func (p RetryPolicy) Valid() bool {
+	return p == RetryPolicyNone || p == RetryPolicyClassifiedOnce
+}
+
+const recoverableTerminalValidationMessage = "hustle: recoverable malformed terminal output"
+
+// recoverableTerminalValidationError is intentionally private so consumers
+// cannot attach arbitrary causes or provider output to the retry marker.
+type recoverableTerminalValidationError struct{}
+
+func (*recoverableTerminalValidationError) Error() string {
+	return recoverableTerminalValidationMessage
+}
+
+// NewRecoverableTerminalValidationError returns the sealed marker a strict
+// classifier adapter may return when terminal decoding or wire-shape
+// validation is malformed but safe to retry. It must not be used for domain
+// decisions, basis mismatches, unsafe results, or operational failures.
+func NewRecoverableTerminalValidationError() error {
+	return &recoverableTerminalValidationError{}
+}
+
+// IsRecoverableTerminalValidationError reports whether err contains the
+// package-owned malformed-terminal marker. Matching is typed and never
+// inspects error text.
+func IsRecoverableTerminalValidationError(err error) bool {
+	_, ok := err.(*recoverableTerminalValidationError)
+	return ok
+}
+
 // ReasonAllowed reports whether reason is a valid durable classification for
 // stage. The closed matrix prevents impossible stage/reason audit records.
 func ReasonAllowed(stage Stage, reason ReasonCode) bool {
@@ -87,6 +129,18 @@ type Request struct {
 	Name  Name
 	Cause identity.Cause
 	Input json.RawMessage
+	// SecurityCeiling is the per-invocation evidence-tool containment ceiling
+	// THIS SPECIFIC run's evidence catalog must be bound against (design
+	// §13.1, §21). Empty means no per-request override: a Hustle without an
+	// evidence-tool concept (e.g. compaction) never sets it, and never reaches
+	// the evidence-binding path that would consume it. A permission-review
+	// Hustle always sets it from that review's own frozen basis
+	// (gate.ReviewBasis.SecurityCeiling, captured once at StartPermissionReview
+	// — see internal/sessionruntime/gates.go's respondFromClassifier doc
+	// comment), never a session-wide constant, so a long session's later
+	// review is bound against ITS OWN current ceiling rather than one frozen
+	// at controller construction.
+	SecurityCeiling string
 }
 
 // Result is the validated serialized output and normalized usage.

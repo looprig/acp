@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -181,6 +182,7 @@ func encodePayload(ev Event) ([]byte, error) {
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
 		ActiveLoopChanged,
 		HustleStarted, HustleCompleted, HustleFailed,
+		PermissionReviewStarted, PermissionReviewCompleted,
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
 		LoopExternalToolsetChanged, ContextMeasured,
 		CompactionCommitted, CompactionRejected, CompactWaiterResolved, CompactWaiterRejected,
@@ -359,6 +361,9 @@ func mergeEnvelope(name string, payload []byte) ([]byte, error) {
 func UnmarshalEvent(data []byte) (Event, error) {
 	if len(data) > maxEventBytes {
 		return nil, &EventLimitError{Got: len(data), Max: maxEventBytes}
+	}
+	if !utf8.Valid(data) {
+		return nil, &EventDecodeError{Cause: errors.New("invalid UTF-8 event envelope")}
 	}
 	if err := rejectDuplicateJSONKeys(data); err != nil {
 		return nil, &EventDecodeError{Cause: err}
@@ -603,6 +608,10 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[HustleCompleted](tag, data)
 	case "HustleFailed":
 		return decodePlain[HustleFailed](tag, data)
+	case "PermissionReviewStarted":
+		return decodePlain[PermissionReviewStarted](tag, data)
+	case "PermissionReviewCompleted":
+		return decodePlain[PermissionReviewCompleted](tag, data)
 	case "LoopIdle":
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":

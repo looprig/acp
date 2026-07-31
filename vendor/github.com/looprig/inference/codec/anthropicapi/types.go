@@ -32,6 +32,7 @@ const (
 	// SSE event `type` values.
 	eventContentBlockStart = "content_block_start"
 	eventContentBlockDelta = "content_block_delta"
+	eventContentBlockStop  = "content_block_stop"
 	eventMessageStart      = "message_start"
 	eventMessageDelta      = "message_delta"
 	eventMessageStop       = "message_stop"
@@ -120,8 +121,14 @@ type outputFormat struct {
 	Schema json.RawMessage `json:"schema"`
 }
 
+// toolChoice is the `tool_choice` request field. Name is populated only on
+// decode, for the "tool" variant (force one named tool) — a real Anthropic
+// wire shape the encode side never emits and the neutral vocabulary cannot
+// represent, so the server decoder uses Name only to produce a precise
+// unsupported-feature error.
 type toolChoice struct {
 	Type string `json:"type"`
+	Name string `json:"name,omitempty"`
 }
 
 // anthropicTool is one entry of the `tools` array.

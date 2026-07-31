@@ -135,38 +135,42 @@ github.com/gorilla/websocket
 # github.com/invopop/jsonschema v0.14.0
 ## explicit; go 1.24
 github.com/invopop/jsonschema
-# github.com/looprig/core v0.3.0 => ../core
+# github.com/looprig/core v0.4.0
 ## explicit; go 1.25.8
 github.com/looprig/core/content
 github.com/looprig/core/uuid
-# github.com/looprig/harness v0.15.0 => ../harness
+# github.com/looprig/harness v0.18.0
 ## explicit; go 1.26.4
 github.com/looprig/harness/internal/pathutil
 github.com/looprig/harness/pkg/command
 github.com/looprig/harness/pkg/event
 github.com/looprig/harness/pkg/gate
+github.com/looprig/harness/pkg/hook
 github.com/looprig/harness/pkg/hustle
 github.com/looprig/harness/pkg/identity
 github.com/looprig/harness/pkg/journal
+github.com/looprig/harness/pkg/loop
 github.com/looprig/harness/pkg/sessionstore
 github.com/looprig/harness/pkg/tool
 github.com/looprig/harness/pkg/workspacestore
-# github.com/looprig/inference v0.3.1-0.20260718005749-13e4d7f173b3 => ../inference
+# github.com/looprig/inference v0.6.0
 ## explicit; go 1.26.4
 github.com/looprig/inference
 github.com/looprig/inference/codec
 github.com/looprig/inference/codec/anthropicapi
 github.com/looprig/inference/codec/geminiapi
 github.com/looprig/inference/codec/openaiapi
+github.com/looprig/inference/codec/openairesponses
 github.com/looprig/inference/contextcount
 github.com/looprig/inference/failure
+github.com/looprig/inference/internal/jsonstrict
 github.com/looprig/inference/internal/usagenorm
 github.com/looprig/inference/model
 github.com/looprig/inference/stream
 github.com/looprig/inference/usage
 github.com/looprig/inference/wire/jsonbody
 github.com/looprig/inference/wire/sse
-# github.com/looprig/storage v0.2.0 => ../storage
+# github.com/looprig/storage v0.3.0
 ## explicit; go 1.25.0
 github.com/looprig/storage
 # github.com/openai/openai-go/v3 v3.42.0
@@ -705,7 +709,3 @@ honnef.co/go/tools/stylecheck/st1021
 honnef.co/go/tools/stylecheck/st1022
 honnef.co/go/tools/stylecheck/st1023
 honnef.co/go/tools/unused
-# github.com/looprig/harness => ../harness
-# github.com/looprig/core => ../core
-# github.com/looprig/inference => ../inference
-# github.com/looprig/storage => ../storage

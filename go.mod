@@ -9,8 +9,8 @@ tool (
 )
 
 require (
-	github.com/looprig/core v0.3.0
-	github.com/looprig/harness v0.15.0
+	github.com/looprig/core v0.4.0
+	github.com/looprig/harness v0.18.0
 )
 
 require (
@@ -34,8 +34,8 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
-	github.com/looprig/inference v0.3.1-0.20260718005749-13e4d7f173b3 // indirect
-	github.com/looprig/storage v0.2.0 // indirect
+	github.com/looprig/inference v0.6.0 // indirect
+	github.com/looprig/storage v0.3.0 // indirect
 	github.com/openai/openai-go/v3 v3.42.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/securego/gosec/v2 v2.28.0 // indirect
@@ -69,19 +69,3 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	honnef.co/go/tools v0.7.0 // indirect
 )
-
-// Development-only mappings for the untagged public Harness and Core seams
-// consumed by this module. Remove local replaces and require tagged module
-// versions before release.
-replace github.com/looprig/harness => ../harness
-
-replace github.com/looprig/core => ../core
-
-// Transitive development-only mappings: Harness's own go.mod locally replaces
-// these with its sibling checkouts, and that replace is not transitive, so
-// this module needs the same local mapping to resolve the packages Harness's
-// pkg/event, pkg/sessionstore, and pkg/hustle import. Remove alongside the
-// Harness/Core mappings above before release.
-replace github.com/looprig/inference => ../inference
-
-replace github.com/looprig/storage => ../storage
