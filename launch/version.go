@@ -181,6 +181,14 @@ func ProbeCodexVersion(ctx context.Context, path string, timeout time.Duration, 
 // failure (runErr != nil) is always CodexVersionNonzeroExit; only once both
 // of those are ruled out does raw's own content decide between
 // legacy-no-version, unparseable, below-minimum, and modern.
+//
+// "Timed-out" here means probeCtx's own internal timeout specifically: if
+// the caller instead cancels the *outer* ctx passed to ProbeCodexVersion
+// while the runner is still blocked, probeCtx.Err() reports
+// context.Canceled, not context.DeadlineExceeded, so this falls through to
+// the runErr != nil case and classifies as CodexVersionNonzeroExit instead
+// of CodexVersionTimeout. Still a fail-closed rejection either way -- just
+// not the label a caller might expect from an outer-canceled probe.
 func classifyCodexVersion(ctx context.Context, raw string, runErr error) CodexVersionResult {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return CodexVersionResult{Class: CodexVersionTimeout, Raw: raw}
