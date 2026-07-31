@@ -26,7 +26,11 @@ import (
 // transport/stdio, client, mockpeer, and every other internal/* tooling
 // package) must not import Harness or Core at all, directly or transitively
 // through another local acp package. No package anywhere in the module may
-// import github.com/looprig/foreignloops.
+// import github.com/looprig/foreignloops or github.com/looprig/inference:
+// unlike Harness/Core, neither has a product-facing seam package in this
+// module at all (see acp/launch's own package doc), so this ban applies
+// even to acp/agent -- there is no carve-out for it the way
+// mayImportHarnessOrCorePublic grants one for Harness/Core.
 //
 // scanModuleBoundaries enforces this by building the local import graph from
 // source (go/parser, not go/packages or `go list`: see acp/CLAUDE.md on
@@ -42,6 +46,7 @@ const (
 	boundaryAgentInternalImport boundaryViolationKind = "agent package importing Harness/Core internal package"
 	boundaryWireLayerImport     boundaryViolationKind = "non-agent package importing Harness or Core"
 	boundaryForeignloopsImport  boundaryViolationKind = "package importing foreignloops"
+	boundaryInferenceImport     boundaryViolationKind = "package importing inference"
 
 	moduleImportRoot          = "github.com/looprig/acp"
 	harnessImportRoot         = "github.com/looprig/harness"
@@ -49,6 +54,7 @@ const (
 	coreImportRoot            = "github.com/looprig/core"
 	coreInternalImportRoot    = "github.com/looprig/core/internal"
 	foreignloopsImportRoot    = "github.com/looprig/foreignloops"
+	inferenceImportRoot       = "github.com/looprig/inference"
 )
 
 type boundaryViolation struct {
@@ -237,6 +243,38 @@ import _ "github.com/looprig/foreignloops"
 	}
 }
 
+// TestScanModuleBoundariesRejectsInferenceImportEverywhere proves
+// github.com/looprig/inference is banned from every package in this module,
+// including acp/agent: unlike Harness/Core, inference has no product-facing
+// seam package here at all (see acp/launch's own package doc on why it
+// deliberately never imports inference), so mayImportHarnessOrCorePublic's
+// carve-out must not extend to it.
+func TestScanModuleBoundariesRejectsInferenceImportEverywhere(t *testing.T) {
+	root := t.TempDir()
+	writeBoundaryFixture(t, filepath.Join(root, "launch", "bad.go"), `package launch
+
+import _ "github.com/looprig/inference/gateway"
+`)
+	writeBoundaryFixture(t, filepath.Join(root, "agent", "bad.go"), `package agent
+
+import _ "github.com/looprig/inference"
+`)
+
+	violations, err := scanModuleBoundaries(root)
+	if err != nil {
+		t.Fatalf("scan synthetic module: %v", err)
+	}
+	if !hasBoundaryViolation(violations, boundaryInferenceImport, filepath.Join("launch", "bad.go"), "github.com/looprig/inference/gateway") {
+		t.Errorf("violations = %#v, want launch inference rejection", violations)
+	}
+	if !hasBoundaryViolation(violations, boundaryInferenceImport, filepath.Join("agent", "bad.go"), "github.com/looprig/inference") {
+		t.Errorf("violations = %#v, want agent inference rejection (inference is banned everywhere, not just outside agent)", violations)
+	}
+	if len(violations) != 2 {
+		t.Errorf("len(violations) = %d, want 2: %#v", len(violations), violations)
+	}
+}
+
 // TestScanModuleBoundariesRejectsTransitiveHarnessThroughLocalPackage proves
 // the guard walks the local import graph rather than only inspecting direct
 // imports: "client" never mentions Harness itself, but it imports "agent",
@@ -356,7 +394,8 @@ func scanModuleBoundaries(root string) ([]boundaryViolation, error) {
 			switch {
 			case hasImportPrefix(importPath, harnessImportRoot),
 				hasImportPrefix(importPath, coreImportRoot),
-				hasImportPrefix(importPath, foreignloopsImportRoot):
+				hasImportPrefix(importPath, foreignloopsImportRoot),
+				hasImportPrefix(importPath, inferenceImportRoot):
 				pkg := packages[dirSlash]
 				if pkg == nil {
 					pkg = &packageImports{directExternal: map[string]string{}, localEdges: map[string]string{}}
@@ -410,6 +449,9 @@ func scanModuleBoundaries(root string) ([]boundaryViolation, error) {
 func classifyBoundaryViolation(dir, importPath string) (boundaryViolationKind, bool) {
 	if hasImportPrefix(importPath, foreignloopsImportRoot) {
 		return boundaryForeignloopsImport, true
+	}
+	if hasImportPrefix(importPath, inferenceImportRoot) {
+		return boundaryInferenceImport, true
 	}
 	if mayImportHarnessOrCorePublic(dir) {
 		if hasImportPrefix(importPath, harnessInternalImportRoot) || hasImportPrefix(importPath, coreInternalImportRoot) {
