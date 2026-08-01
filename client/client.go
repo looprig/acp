@@ -85,6 +85,10 @@ type Client struct {
 
 	sessionsMu sync.Mutex
 	sessions   map[protocol.SessionID]*Session
+	// sessionsClosed is guarded by sessionsMu. Once terminal teardown has
+	// snapshotted the registry, no later operation may add a Session to the
+	// replacement map; otherwise its update pump could outlive Client.Close.
+	sessionsClosed bool
 
 	droppedUpdates uint64
 

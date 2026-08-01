@@ -3,12 +3,32 @@ package client
 import (
 	"context"
 	"errors"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/looprig/acp/protocol"
 	"github.com/looprig/acp/transport/stdio"
 )
+
+type delayedCloseConn struct {
+	net.Conn
+	closeStarted chan struct{}
+	release      chan struct{}
+	closeOnce    sync.Once
+	releaseOnce  sync.Once
+}
+
+func (c *delayedCloseConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closeStarted) })
+	<-c.release
+	return c.Conn.Close()
+}
+
+func (c *delayedCloseConn) releaseClose() {
+	c.releaseOnce.Do(func() { close(c.release) })
+}
 
 func TestNewSessionReturnsRegisteredSession(t *testing.T) {
 	c, fa := dialTestClient(t, Options{})
@@ -50,6 +70,118 @@ func TestNewSessionPropagatesAgentError(t *testing.T) {
 	defer cancel()
 	if _, err := c.NewSession(ctx, NewSessionParams{}); err == nil {
 		t.Fatal("NewSession() error = nil, want the agent's InvalidParams fault")
+	}
+}
+
+func TestNewSessionRejectsRegistrationAfterCloseSnapshot(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	agentSide, clientSide := net.Pipe()
+	clientConn := &delayedCloseConn{
+		Conn:         clientSide,
+		closeStarted: make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	fa := newFakeAgent(protocol.NewConn(agentSide, agentSide, protocol.ConnOptions{}))
+	c := New(stdio.Command{}, Options{})
+	c.attemptConnect = func(ctx context.Context) error {
+		return c.finishConnect(ctx, nil, clientConn, clientConn)
+	}
+	t.Cleanup(func() {
+		clientConn.releaseClose()
+		_ = agentSide.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = c.Close(ctx)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.Dial(ctx); err != nil {
+		t.Fatalf("Dial() over delayed-close transport: %v", err)
+	}
+
+	rpcStarted := make(chan struct{})
+	releaseRPC := make(chan struct{})
+	var releaseRPCOnce sync.Once
+	release := func() {
+		releaseRPCOnce.Do(func() { close(releaseRPC) })
+	}
+	t.Cleanup(release)
+	fa.onNewSession = func(req protocol.NewSessionRequest) (protocol.NewSessionResponse, error) {
+		close(rpcStarted)
+		<-releaseRPC
+		return protocol.NewSessionResponse{SessionID: "sess-late-register"}, nil
+	}
+
+	newDone := make(chan struct{})
+	var sess *Session
+	var newErr error
+	go func() {
+		sess, newErr = c.NewSession(context.Background(), NewSessionParams{Cwd: "/work"})
+		close(newDone)
+	}()
+	select {
+	case <-rpcStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for session/new RPC")
+	}
+
+	closeDone := make(chan struct{})
+	var closeErr error
+	go func() {
+		closeErr = c.Close(context.Background())
+		close(closeDone)
+	}()
+	select {
+	case <-clientConn.closeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Client.Close to snapshot sessions")
+	}
+
+	// Client.Close has snapshotted the registry and is blocked in transport
+	// teardown. The response can now complete while registration races with
+	// the already-closed registry.
+	release()
+	select {
+	case <-newDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for NewSession after close snapshot")
+	}
+
+	var updatesClosed bool
+	if sess != nil {
+		select {
+		case _, open := <-sess.Updates():
+			updatesClosed = !open
+		case <-time.After(2 * time.Second):
+		}
+	}
+	clientConn.releaseClose()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Client.Close")
+	}
+	if closeErr != nil {
+		t.Fatalf("Client.Close() error = %v", closeErr)
+	}
+
+	var closedErr *ClosedError
+	if !errors.As(newErr, &closedErr) {
+		if sess != nil && !updatesClosed {
+			t.Fatalf("late NewSession registration left Updates() open after Client.Close")
+		}
+		t.Fatalf("NewSession() error = %v (%T), want *ClosedError after close snapshot", newErr, newErr)
+	}
+	if sess != nil {
+		t.Fatal("NewSession() returned a Session with *ClosedError")
+	}
+
+	c.sessionsMu.Lock()
+	_, tracked := c.sessions["sess-late-register"]
+	c.sessionsMu.Unlock()
+	if tracked {
+		t.Fatal("late NewSession session remained in the registry after Client.Close")
 	}
 }
 

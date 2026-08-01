@@ -395,13 +395,31 @@ func (s *Session) abortUpdates() {
 // registerSession constructs and tracks a new Session under id, so inbound
 // session/update notifications for it (which may arrive concurrently with,
 // or even before, the caller observes the *Session this returns — see
-// LoadSession) are never dropped.
-func (c *Client) registerSession(id protocol.SessionID) *Session {
+// LoadSession) are never dropped. Once terminal teardown has snapshotted the
+// registry, it rejects and aborts the new Session instead of adding it to the
+// replacement map. The closed check and insertion share sessionsMu; the
+// terminal-state check is completed before taking it, and the abort happens
+// after unlocking, so no session lifecycle path is nested under the registry
+// lock.
+func (c *Client) registerSession(id protocol.SessionID) (*Session, error) {
 	s := newSession(c, id)
+	c.mu.Lock()
+	closed := c.state == dialClosed
+	c.mu.Unlock()
+	if closed {
+		s.abortUpdates()
+		return nil, &ClosedError{}
+	}
+
 	c.sessionsMu.Lock()
+	if c.sessionsClosed {
+		c.sessionsMu.Unlock()
+		s.abortUpdates()
+		return nil, &ClosedError{}
+	}
 	c.sessions[id] = s
 	c.sessionsMu.Unlock()
-	return s
+	return s, nil
 }
 
 func (c *Client) unregisterSession(id protocol.SessionID) {
@@ -410,15 +428,16 @@ func (c *Client) unregisterSession(id protocol.SessionID) {
 	c.sessionsMu.Unlock()
 }
 
-// closeAllSessions closes every currently-tracked Session's update stream
-// and clears the registry. Called on Client.Close and on connection death
-// (watchDeath): once the connection is gone, no more updates will ever
-// arrive for any session, so every Updates() channel must close rather than
-// hang forever.
+// closeAllSessions closes every currently-tracked Session's update stream,
+// clears the registry, and marks it closed to reject late registrations.
+// Called on Client.Close and on connection death (watchDeath): once the
+// connection is gone, no more updates will ever arrive for any session, so
+// every Updates() channel must close rather than hang forever.
 func (c *Client) closeAllSessions() {
 	c.sessionsMu.Lock()
 	sessions := c.sessions
 	c.sessions = make(map[protocol.SessionID]*Session)
+	c.sessionsClosed = true
 	c.sessionsMu.Unlock()
 
 	for _, s := range sessions {
@@ -454,7 +473,10 @@ func (c *Client) NewSession(ctx context.Context, p NewSessionParams) (*Session, 
 	if err != nil {
 		return nil, wrapConnError(err)
 	}
-	sess := c.registerSession(resp.SessionID)
+	sess, err := c.registerSession(resp.SessionID)
+	if err != nil {
+		return nil, err
+	}
 	sess.configMu.Lock()
 	sess.configOptions = copyConfigOptions(resp.ConfigOptions)
 	sess.modes = copyModeState(resp.Modes)
@@ -488,7 +510,10 @@ func (c *Client) LoadSession(ctx context.Context, p LoadSessionParams) (*Session
 		return nil, err
 	}
 
-	sess := c.registerSession(p.SessionID)
+	sess, err := c.registerSession(p.SessionID)
+	if err != nil {
+		return nil, err
+	}
 
 	loadCtx, cancel := context.WithTimeout(ctx, c.loadTimeout())
 	defer cancel()
@@ -526,7 +551,10 @@ func (c *Client) ResumeSession(ctx context.Context, p ResumeSessionParams) (*Ses
 		return nil, err
 	}
 
-	sess := c.registerSession(p.SessionID)
+	sess, err := c.registerSession(p.SessionID)
+	if err != nil {
+		return nil, err
+	}
 
 	_, err = agent.ResumeSession(ctx, protocol.ResumeSessionRequest{
 		SessionID:             p.SessionID,
