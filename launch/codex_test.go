@@ -65,6 +65,57 @@ func TestCodexConnectorConfigureSetsExactContract(t *testing.T) {
 	}
 }
 
+func TestCodexConnectorConfigureWithoutProxyOmitsGatewayOverrides(t *testing.T) {
+	c := Codex("gpt-5-codex")
+
+	out, err := c.configureWithoutProxy(stdio.Command{
+		Path: "/opt/codex-acp",
+		Env:  []string{"PATH=/usr/bin", "LANG=C"},
+	})
+	if err != nil {
+		t.Fatalf("ConfigureWithoutProxy() error = %v", err)
+	}
+	want := []string{
+		"-c", "model=gpt-5-codex",
+		"-c", "approval_policy=on-request",
+		"-c", "sandbox_mode=workspace-write",
+		"-c", "sandbox_workspace_write.network_access=false",
+	}
+	if !equalStrings(out.Args, want) {
+		t.Fatalf("native args = %#v, want %#v", out.Args, want)
+	}
+	env := envMap(out.Env)
+	if len(env) != 2 || env["PATH"] != "/usr/bin" || env["LANG"] != "C" {
+		t.Fatalf("native env = %#v, want only caller environment", env)
+	}
+}
+
+func TestCodexConnectorConfigureWithoutProxyRetainsValidationAndDenylist(t *testing.T) {
+	c := Codex("gpt-5-codex")
+
+	_, err := c.configureWithoutProxy(stdio.Command{Path: "codex-acp"})
+	var pathErr *PathError
+	if !errors.As(err, &pathErr) {
+		t.Fatalf("ConfigureWithoutProxy() error = %v (%T), want *PathError", err, err)
+	}
+
+	for _, key := range []string{"CODEX_HOME", "LOOPRIG_PROXY_TOKEN"} {
+		t.Run(key, func(t *testing.T) {
+			_, err := c.configureWithoutProxy(stdio.Command{
+				Path: "/opt/codex-acp",
+				Env:  []string{key + "=caller-value"},
+			})
+			var conflict *ConflictingEnvError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("ConfigureWithoutProxy() error = %v (%T), want *ConflictingEnvError", err, err)
+			}
+			if conflict.Key != key {
+				t.Fatalf("ConflictingEnvError.Key = %q, want %q", conflict.Key, key)
+			}
+		})
+	}
+}
+
 func TestCodexConnectorConfigureAppliesCustomPosture(t *testing.T) {
 	c := Codex("gpt-5-codex")
 	c.Posture = CodexPosture{

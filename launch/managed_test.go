@@ -9,6 +9,7 @@ package launch
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -228,6 +229,103 @@ func TestDialRequiresExactlyOneProxy(t *testing.T) {
 		}
 	})
 }
+
+func TestDialNoProxyRequiresExplicitRequestAndSkipsProxy(t *testing.T) {
+	harness := &fakeHarness{}
+	noProxyHarness := &noProxyFakeHarness{HarnessAdapter: harness}
+	conn := newFakeConn()
+
+	mc, err := dial(context.Background(), Config{
+		NoProxy: true,
+		Harness: noProxyHarness,
+		Command: stdio.Command{Path: "/bin/claude-agent-acp"},
+	}, fakeConnect(conn, nil))
+	if err != nil {
+		t.Fatalf("dial() error = %v", err)
+	}
+	if mc.owned != nil {
+		t.Fatal("ManagedClient.owned != nil, want nil for no-proxy dial")
+	}
+	if got := harness.callCount(); got != 0 {
+		t.Fatalf("gateway Configure calls = %d, want 0", got)
+	}
+	if got := noProxyHarness.noProxyCalls(); got != 1 {
+		t.Fatalf("no-proxy Configure calls = %d, want 1", got)
+	}
+}
+
+func TestDialNoProxyUsesConnectorConfiguration(t *testing.T) {
+	tests := []struct {
+		name    string
+		harness HarnessAdapter
+	}{
+		{name: "claude", harness: ClaudeCode(ClaudeModels{Default: "primary", Small: "small"})},
+		{name: "codex", harness: Codex("primary")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var configured stdio.Command
+			conn := newFakeConn()
+			mc, err := dial(context.Background(), Config{
+				NoProxy: true,
+				Harness: tt.harness,
+				Command: stdio.Command{
+					Path: "/opt/acp-adapter",
+					Env:  []string{"PATH=/usr/bin", "LANG=C"},
+				},
+			}, func(_ context.Context, cmd stdio.Command, _ client.Options) (connCloser, error) {
+				configured = cmd
+				return conn, nil
+			})
+			if err != nil {
+				t.Fatalf("dial() error = %v", err)
+			}
+			defer func() { _ = mc.Close(context.Background()) }()
+
+			for _, entry := range configured.Env {
+				if strings.HasPrefix(entry, "ANTHROPIC_BASE_URL=") ||
+					strings.HasPrefix(entry, "ANTHROPIC_AUTH_TOKEN=") ||
+					strings.HasPrefix(entry, "LOOPRIG_PROXY_TOKEN=") {
+					t.Errorf("configured env contains gateway entry %q", entry)
+				}
+			}
+			for _, arg := range configured.Args {
+				if strings.Contains(arg, "base_url") || strings.Contains(arg, "env_key") || strings.Contains(arg, "LOOPRIG_PROXY_TOKEN") {
+					t.Errorf("configured args contain gateway override %q", arg)
+				}
+			}
+		})
+	}
+}
+
+func TestDialNoProxyRejectsProxyConfiguration(t *testing.T) {
+	proxy := readyProxy()
+	_, err := dial(context.Background(), Config{
+		NoProxy:    true,
+		OwnedProxy: proxy,
+		Harness:    &noProxyFakeHarness{HarnessAdapter: &fakeHarness{}},
+	}, failIfCalledConnect(t))
+	var cfgErr *ConfigError
+	if !errors.As(err, &cfgErr) {
+		t.Fatalf("dial() error = %v (%T), want *ConfigError", err, err)
+	}
+	if starts, closes := proxy.counts(); starts != 0 || closes != 0 {
+		t.Fatalf("proxy starts/closes = %d/%d, want 0/0", starts, closes)
+	}
+}
+
+type noProxyFakeHarness struct {
+	HarnessAdapter
+	noProxyCallsValue int
+}
+
+func (h *noProxyFakeHarness) configureWithoutProxy(cmd stdio.Command) (stdio.Command, error) {
+	h.noProxyCallsValue++
+	return cmd, nil
+}
+
+func (h *noProxyFakeHarness) noProxyCalls() int { return h.noProxyCallsValue }
 
 // --- owned startup precedes command configuration and ACP dial ---
 

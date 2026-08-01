@@ -41,13 +41,30 @@ const (
 // if c.CLIPath is set. cmd is never mutated; the returned Command is always
 // a fresh copy (see buildChildCommand).
 func (c *ClaudeConnector) Configure(cmd stdio.Command, binding ProxyBinding) (stdio.Command, error) {
+	return c.configure(cmd, binding, true)
+}
+
+// configureWithoutProxy keeps the caller's environment and Claude executable
+// validation, but never installs gateway URL or token overrides so the child
+// can use its own login state.
+func (c *ClaudeConnector) configureWithoutProxy(cmd stdio.Command) (stdio.Command, error) {
+	return c.configure(cmd, ProxyBinding{}, false)
+}
+
+func (c *ClaudeConnector) configure(cmd stdio.Command, binding ProxyBinding, gateway bool) (stdio.Command, error) {
 	if !cleanAbsolutePath(cmd.Path) {
 		return stdio.Command{}, &PathError{Field: "Path", Reason: "must be a clean absolute path to claude-agent-acp"}
 	}
 
-	overrides := []envOverride{
-		{Key: envAnthropicBaseURL, Value: binding.BaseURL},
-		{Key: envAnthropicAuthToken, Value: binding.Token},
+	overrides := make([]envOverride, 0, 3)
+	forbidden := []string{envClaudeCodeNestedSession}
+	if gateway {
+		overrides = append(overrides,
+			envOverride{Key: envAnthropicBaseURL, Value: binding.BaseURL},
+			envOverride{Key: envAnthropicAuthToken, Value: binding.Token},
+		)
+	} else {
+		forbidden = append(forbidden, envAnthropicBaseURL, envAnthropicAuthToken)
 	}
 	if c.CLIPath != "" {
 		if !cleanAbsolutePath(c.CLIPath) {
@@ -56,7 +73,7 @@ func (c *ClaudeConnector) Configure(cmd stdio.Command, binding ProxyBinding) (st
 		overrides = append(overrides, envOverride{Key: envClaudeCodeExecutable, Value: c.CLIPath})
 	}
 
-	out, err := buildChildCommand(cmd, overrides, []string{envClaudeCodeNestedSession})
+	out, err := buildChildCommand(cmd, overrides, forbidden)
 	if err != nil {
 		return stdio.Command{}, err
 	}

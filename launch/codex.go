@@ -58,6 +58,17 @@ const (
 // LOOPRIG_PROXY_TOKEN and never CODEX_HOME. cmd is never mutated; the
 // returned Command is always a fresh copy (see buildChildCommand).
 func (c *CodexConnector) Configure(cmd stdio.Command, binding ProxyBinding) (stdio.Command, error) {
+	return c.configure(cmd, binding, true)
+}
+
+// configureWithoutProxy keeps the caller's environment and Codex executable
+// validation, but omits the gateway token and provider/base URL settings so
+// Codex uses its own login.
+func (c *CodexConnector) configureWithoutProxy(cmd stdio.Command) (stdio.Command, error) {
+	return c.configure(cmd, ProxyBinding{}, false)
+}
+
+func (c *CodexConnector) configure(cmd stdio.Command, binding ProxyBinding, gateway bool) (stdio.Command, error) {
 	if !cleanAbsolutePath(cmd.Path) {
 		return stdio.Command{}, &PathError{Field: "Path", Reason: "must be a clean absolute path to codex-acp"}
 	}
@@ -65,15 +76,40 @@ func (c *CodexConnector) Configure(cmd stdio.Command, binding ProxyBinding) (std
 		return stdio.Command{}, &ConfigError{Reason: "CodexConnector.Model is required"}
 	}
 
-	out, err := buildChildCommand(cmd, []envOverride{
-		{Key: envLoopRigProxyToken, Value: binding.Token},
-	}, []string{envCodexHome})
+	overrides := make([]envOverride, 0, 1)
+	forbidden := []string{envCodexHome}
+	if gateway {
+		overrides = append(overrides, envOverride{Key: envLoopRigProxyToken, Value: binding.Token})
+	} else {
+		forbidden = append(forbidden, envLoopRigProxyToken)
+	}
+
+	out, err := buildChildCommand(cmd, overrides, forbidden)
 	if err != nil {
 		return stdio.Command{}, err
 	}
 
-	out.Args = codexConfigArgs(c.Model, binding.BaseURL, c.Posture.resolve())
+	posture := c.Posture.resolve()
+	if gateway {
+		out.Args = codexConfigArgs(c.Model, binding.BaseURL, posture)
+	} else {
+		out.Args = codexNativeConfigArgs(c.Model, posture)
+	}
 	return out, nil
+}
+
+func codexNativeConfigArgs(model string, posture CodexPosture) []string {
+	pairs := [...][2]string{
+		{"model", model},
+		{"approval_policy", posture.ApprovalPolicy},
+		{"sandbox_mode", posture.SandboxMode},
+		{"sandbox_workspace_write.network_access", strconv.FormatBool(posture.SandboxNetworkAccess)},
+	}
+	args := make([]string, 0, len(pairs)*2)
+	for _, p := range pairs {
+		args = append(args, "-c", p[0]+"="+p[1])
+	}
+	return args
 }
 
 // codexConfigArgs builds codex-acp's fixed, ordered `-c key=value` override

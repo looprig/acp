@@ -121,24 +121,36 @@ func (m *ManagedClient) watchOwnedDeath() {
 	_ = m.closeOwnedProxy(context.Background())
 }
 
-// validateConfig rejects a Config before Dial starts anything: neither or
-// both of OwnedProxy/SharedProxy set, or no Harness supplied.
+// validateConfig rejects a Config before Dial starts anything: an ordinary
+// dial must have exactly one proxy, while a no-proxy dial must have neither
+// proxy and must use a HarnessAdapter with an explicit no-proxy method.
 func validateConfig(cfg Config) error {
+	if cfg.Harness == nil {
+		return &ConfigError{Reason: "Harness is required"}
+	}
+	if cfg.NoProxy {
+		if cfg.OwnedProxy != nil || cfg.SharedProxy != nil {
+			return &ConfigError{Reason: "NoProxy is mutually exclusive with OwnedProxy and SharedProxy"}
+		}
+		if _, ok := cfg.Harness.(noProxyHarnessAdapter); !ok {
+			return &ConfigError{Reason: "NoProxy requires a no-proxy harness adapter"}
+		}
+		return nil
+	}
+
 	switch {
 	case cfg.OwnedProxy == nil && cfg.SharedProxy == nil:
 		return &ConfigError{Reason: "exactly one of OwnedProxy or SharedProxy is required, neither was set"}
 	case cfg.OwnedProxy != nil && cfg.SharedProxy != nil:
 		return &ConfigError{Reason: "OwnedProxy and SharedProxy are mutually exclusive, both were set"}
-	case cfg.Harness == nil:
-		return &ConfigError{Reason: "Harness is required"}
 	}
 	return nil
 }
 
 // Dial validates cfg, starts an owned proxy (if configured), configures
-// Command for the resulting ProxyBinding via cfg.Harness, spawns and
-// initializes the ACP child through acp/client, and returns a
-// ManagedClient.
+// Command for the resulting ProxyBinding via cfg.Harness or through its
+// explicit internal no-proxy connector path, spawns and initializes the ACP
+// child through acp/client, and returns a ManagedClient.
 //
 // Lifecycle order: validate -> start proxy -> configure a copied
 // stdio.Command -> spawn ACP child -> initialize ACP -> return
@@ -157,22 +169,32 @@ func dial(ctx context.Context, cfg Config, connect connectFunc) (*ManagedClient,
 
 	var owned ModelProxy
 	var binding ProxyBinding
-	if cfg.OwnedProxy != nil {
-		owned = cfg.OwnedProxy
-		if err := owned.Start(ctx); err != nil {
-			return nil, fmt.Errorf("acp/launch: start owned proxy: %w", err)
+	if !cfg.NoProxy {
+		if cfg.OwnedProxy != nil {
+			owned = cfg.OwnedProxy
+			if err := owned.Start(ctx); err != nil {
+				return nil, fmt.Errorf("acp/launch: start owned proxy: %w", err)
+			}
+			baseURL, token, ready := owned.Binding()
+			if !ready {
+				_ = owned.Close(ctx)
+				return nil, &ProxyNotReadyError{}
+			}
+			binding = ProxyBinding{BaseURL: baseURL, Token: token}
+		} else {
+			binding = *cfg.SharedProxy
 		}
-		baseURL, token, ready := owned.Binding()
-		if !ready {
-			_ = owned.Close(ctx)
-			return nil, &ProxyNotReadyError{}
-		}
-		binding = ProxyBinding{BaseURL: baseURL, Token: token}
-	} else {
-		binding = *cfg.SharedProxy
 	}
 
-	cmd, err := cfg.Harness.Configure(cfg.Command, binding)
+	var (
+		cmd stdio.Command
+		err error
+	)
+	if cfg.NoProxy {
+		cmd, err = cfg.Harness.(noProxyHarnessAdapter).configureWithoutProxy(cfg.Command)
+	} else {
+		cmd, err = cfg.Harness.Configure(cfg.Command, binding)
+	}
 	if err != nil {
 		if owned != nil {
 			_ = owned.Close(ctx)

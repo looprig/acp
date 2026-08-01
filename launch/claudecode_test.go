@@ -75,6 +75,50 @@ func TestClaudeConnectorConfigureSetsOptionalCLIPath(t *testing.T) {
 	}
 }
 
+func TestClaudeConnectorConfigureWithoutProxyOmitsGatewayOverrides(t *testing.T) {
+	c := ClaudeCode(ClaudeModels{Default: "primary", Small: "small"})
+
+	out, err := c.configureWithoutProxy(stdio.Command{
+		Path: "/opt/claude-agent-acp",
+		Env:  []string{"PATH=/usr/bin", "LANG=C"},
+	})
+	if err != nil {
+		t.Fatalf("ConfigureWithoutProxy() error = %v", err)
+	}
+	if got := envMap(out.Env); len(got) != 2 || got["PATH"] != "/usr/bin" || got["LANG"] != "C" {
+		t.Fatalf("native env = %#v, want only caller environment", got)
+	}
+	if len(out.Args) != 0 {
+		t.Fatalf("native args = %#v, want empty", out.Args)
+	}
+}
+
+func TestClaudeConnectorConfigureWithoutProxyRetainsValidationAndDenylist(t *testing.T) {
+	c := ClaudeCode(ClaudeModels{Default: "primary"})
+
+	_, err := c.configureWithoutProxy(stdio.Command{Path: "claude-agent-acp"})
+	var pathErr *PathError
+	if !errors.As(err, &pathErr) {
+		t.Fatalf("ConfigureWithoutProxy() error = %v (%T), want *PathError", err, err)
+	}
+
+	for _, key := range []string{"CLAUDECODE", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"} {
+		t.Run(key, func(t *testing.T) {
+			_, err := c.configureWithoutProxy(stdio.Command{
+				Path: "/opt/claude-agent-acp",
+				Env:  []string{key + "=caller-value"},
+			})
+			var conflict *ConflictingEnvError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("ConfigureWithoutProxy() error = %v (%T), want *ConflictingEnvError", err, err)
+			}
+			if conflict.Key != key {
+				t.Fatalf("ConflictingEnvError.Key = %q, want %q", conflict.Key, key)
+			}
+		})
+	}
+}
+
 func TestClaudeConnectorConfigureRejectsNonAbsolutePath(t *testing.T) {
 	c := ClaudeCode(ClaudeModels{Default: "primary"})
 

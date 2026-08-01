@@ -77,6 +77,14 @@ type HarnessAdapter interface {
 	Configure(stdio.Command, ProxyBinding) (stdio.Command, error)
 }
 
+// noProxyHarnessAdapter is the internal launch seam for connectors that can
+// configure a child without gateway URL, token, or provider overrides. It is
+// selected only when Config.NoProxy is explicitly true; the public
+// HarnessAdapter path remains gateway-backed.
+type noProxyHarnessAdapter interface {
+	configureWithoutProxy(stdio.Command) (stdio.Command, error)
+}
+
 // Config is Dial's complete configuration.
 type Config struct {
 	// OwnedProxy, if set, is started before the ACP child is spawned and
@@ -91,6 +99,10 @@ type Config struct {
 	// *ProxyBinding carries no lifecycle methods at all, no way to act on it
 	// even if it wanted to. Mutually exclusive with OwnedProxy.
 	SharedProxy *ProxyBinding
+	// NoProxy explicitly selects a child-owned authentication path. It is
+	// mutually exclusive with OwnedProxy and SharedProxy and requires Harness
+	// to implement the internal no-proxy connector seam.
+	NoProxy bool
 	// Harness configures Command for whichever ProxyBinding results from
 	// OwnedProxy or SharedProxy.
 	Harness HarnessAdapter
