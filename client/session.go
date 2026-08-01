@@ -63,6 +63,16 @@ const UpdateQueueDepth = 512
 // existing precedent rather than inventing a new value.
 const EventDedupWindowDepth = 512
 
+type queuedUpdate struct {
+	update Update
+	id     uint64
+}
+
+type deliveryWaiter struct {
+	target uint64
+	done   chan error
+}
+
 // NewSessionParams are the caller-supplied parameters for Client.NewSession.
 type NewSessionParams struct {
 	// Cwd is the session's working directory. Must be an absolute path (ACP
@@ -101,10 +111,11 @@ type Session struct {
 
 	out chan Update
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	queue  []Update
-	closed bool
+	mu      sync.Mutex
+	cond    *sync.Cond
+	queue   []queuedUpdate
+	closed  bool
+	aborted bool
 	// updatesDone is closed exactly once by abortUpdates to interrupt a pump
 	// blocked handing an update to an absent Updates reader. pumpDone closes
 	// after pump has closed out, so forced session/client teardown can wait
@@ -123,8 +134,13 @@ type Session struct {
 	// extra item sat parked on pump's stack), making both the true resident
 	// count and DroppedUpdates undercount by however many times pump won
 	// that race.
-	inFlight       int
-	droppedUpdates atomic.Uint64
+	inFlight         int
+	inFlightID       uint64
+	nextDeliveryID   uint64
+	completedThrough uint64
+	completed        map[uint64]struct{}
+	deliveryWaiters  []*deliveryWaiter
+	droppedUpdates   atomic.Uint64
 
 	seenMu    sync.Mutex
 	seen      map[string]struct{}
@@ -203,10 +219,11 @@ func newSession(client *Client, id protocol.SessionID) *Session {
 		id:          id,
 		client:      client,
 		out:         make(chan Update),
-		queue:       make([]Update, 0, sessionUpdateQueueHint),
+		queue:       make([]queuedUpdate, 0, sessionUpdateQueueHint),
 		updatesDone: make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		seen:        make(map[string]struct{}),
+		completed:   make(map[uint64]struct{}),
 		promptSem:   make(chan struct{}, 1),
 	}
 	s.cond = sync.NewCond(&s.mu)
@@ -237,6 +254,56 @@ func (s *Session) Updates() <-chan Update { return s.out }
 // then evicted by its own queue bound because the consumer fell behind.
 // Zero in the expected steady state of an actively-drained session.
 func (s *Session) DroppedUpdates() uint64 { return s.droppedUpdates.Load() }
+
+// WaitForUpdates waits for the protocol notification barrier and then until
+// the Session's pump has handed off every update delivered before that
+// barrier. It does not consume Updates; callers can wait here while another
+// goroutine continues reading the channel. Cancellation and forced session or
+// client teardown release the wait.
+func (s *Session) WaitForUpdates(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.client == nil {
+		return &NotDialedError{}
+	}
+	agent, err := s.client.currentAgent()
+	if err != nil {
+		return err
+	}
+	if err := agent.Conn().WaitForNotifications(ctx); err != nil {
+		return wrapConnError(err)
+	}
+
+	s.mu.Lock()
+	if s.aborted {
+		s.mu.Unlock()
+		return &ClosedError{}
+	}
+	target := s.nextDeliveryID
+	if s.completedThrough >= target {
+		s.mu.Unlock()
+		return nil
+	}
+	w := &deliveryWaiter{target: target, done: make(chan error, 1)}
+	s.deliveryWaiters = append(s.deliveryWaiters, w)
+	s.mu.Unlock()
+
+	select {
+	case err := <-w.done:
+		return err
+	case <-ctx.Done():
+		s.mu.Lock()
+		for i, candidate := range s.deliveryWaiters {
+			if candidate == w {
+				s.deliveryWaiters = append(s.deliveryWaiters[:i], s.deliveryWaiters[i+1:]...)
+				break
+			}
+		}
+		s.mu.Unlock()
+		return ctx.Err()
+	}
+}
 
 // deliver routes one decoded update into the session's queue, applying
 // live-update dedup: a non-replay update whose _meta.eventId has already
@@ -282,7 +349,8 @@ func (s *Session) deliver(u Update) {
 		s.mu.Unlock()
 		return
 	}
-	s.queue = append(s.queue, u)
+	s.nextDeliveryID++
+	s.queue = append(s.queue, queuedUpdate{update: u, id: s.nextDeliveryID})
 	// Resident count includes the one update pump may already be holding
 	// in flight (see inFlight's doc): that item is just as "not yet
 	// delivered to the caller" as anything still in the slice, so it must
@@ -298,7 +366,8 @@ func (s *Session) deliver(u Update) {
 		// so their referenced content is released promptly rather than kept
 		// alive by the backing array until a future reallocation.
 		for i := 0; i < drop; i++ {
-			s.queue[i] = Update{}
+			s.completeDeliveryLocked(s.queue[i].id)
+			s.queue[i] = queuedUpdate{}
 		}
 		s.queue = s.queue[drop:]
 		// drop is bounded above by len(s.queue) (an in-memory slice length,
@@ -308,6 +377,34 @@ func (s *Session) deliver(u Update) {
 	}
 	s.mu.Unlock()
 	s.cond.Signal()
+}
+
+// completeDeliveryLocked records that an update was either handed to the
+// caller or intentionally discarded by the bounded queue. The completed set
+// handles the one legitimate out-of-order case: a queued entry may be dropped
+// while an older entry is blocked in the pump's handoff.
+func (s *Session) completeDeliveryLocked(id uint64) {
+	if id == 0 || id <= s.completedThrough {
+		return
+	}
+	s.completed[id] = struct{}{}
+	for {
+		next := s.completedThrough + 1
+		if _, ok := s.completed[next]; !ok {
+			break
+		}
+		delete(s.completed, next)
+		s.completedThrough = next
+	}
+	for i := 0; i < len(s.deliveryWaiters); {
+		w := s.deliveryWaiters[i]
+		if w.target > s.completedThrough {
+			i++
+			continue
+		}
+		w.done <- nil
+		s.deliveryWaiters = append(s.deliveryWaiters[:i], s.deliveryWaiters[i+1:]...)
+	}
 }
 
 // recordSeenLocked records eventID as seen for dedup and evicts the oldest
@@ -345,21 +442,26 @@ func (s *Session) pump() {
 			return
 		}
 		u := s.queue[0]
-		s.queue[0] = Update{}
+		s.queue[0] = queuedUpdate{}
 		s.queue = s.queue[1:]
 		s.inFlight = 1
+		s.inFlightID = u.id
 		s.mu.Unlock()
 
 		select {
-		case s.out <- u:
+		case s.out <- u.update:
 			s.mu.Lock()
 			s.inFlight = 0
+			s.inFlightID = 0
+			s.completeDeliveryLocked(u.id)
 			s.mu.Unlock()
 		case <-s.updatesDone:
 			s.mu.Lock()
 			s.inFlight = 0
+			s.inFlightID = 0
 			for i := range s.queue {
-				s.queue[i] = Update{}
+				s.completeDeliveryLocked(s.queue[i].id)
+				s.queue[i] = queuedUpdate{}
 			}
 			s.queue = nil
 			s.mu.Unlock()
@@ -386,6 +488,13 @@ func (s *Session) closeUpdates() {
 // while every caller still waits for the same pump completion.
 func (s *Session) abortUpdates() {
 	s.closeUpdates()
+	s.mu.Lock()
+	s.aborted = true
+	for _, w := range s.deliveryWaiters {
+		w.done <- &ClosedError{}
+	}
+	s.deliveryWaiters = nil
+	s.mu.Unlock()
 	s.stopOnce.Do(func() {
 		close(s.updatesDone)
 	})
@@ -417,14 +526,21 @@ func (c *Client) registerSession(id protocol.SessionID) (*Session, error) {
 		s.abortUpdates()
 		return nil, &ClosedError{}
 	}
+	if _, exists := c.sessions[id]; exists {
+		c.sessionsMu.Unlock()
+		s.abortUpdates()
+		return nil, &DuplicateSessionError{SessionID: id}
+	}
 	c.sessions[id] = s
 	c.sessionsMu.Unlock()
 	return s, nil
 }
 
-func (c *Client) unregisterSession(id protocol.SessionID) {
+func (c *Client) unregisterSession(id protocol.SessionID, expected *Session) {
 	c.sessionsMu.Lock()
-	delete(c.sessions, id)
+	if current := c.sessions[id]; current == expected {
+		delete(c.sessions, id)
+	}
 	c.sessionsMu.Unlock()
 }
 
@@ -525,7 +641,7 @@ func (c *Client) LoadSession(ctx context.Context, p LoadSessionParams) (*Session
 		McpServers:            normalizeMcpServers(p.McpServers),
 	})
 	if err != nil {
-		c.unregisterSession(p.SessionID)
+		c.unregisterSession(p.SessionID, sess)
 		sess.abortUpdates()
 		if loadCtx.Err() != nil && ctx.Err() == nil {
 			// loadCtx's own deadline fired, not the caller's ctx: report the
@@ -563,7 +679,7 @@ func (c *Client) ResumeSession(ctx context.Context, p ResumeSessionParams) (*Ses
 		McpServers:            p.McpServers,
 	})
 	if err != nil {
-		c.unregisterSession(p.SessionID)
+		c.unregisterSession(p.SessionID, sess)
 		sess.abortUpdates()
 		return nil, wrapConnError(err)
 	}

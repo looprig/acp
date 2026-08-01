@@ -32,6 +32,17 @@ type NotDialedError struct{}
 
 func (e *NotDialedError) Error() string { return "acp/client: not dialed" }
 
+// DuplicateSessionError reports that an operation attempted to register a
+// Session ID that is already tracked by this Client. The ID is retained for
+// programmatic inspection, but the bounded error text does not echo it.
+type DuplicateSessionError struct {
+	SessionID protocol.SessionID
+}
+
+func (e *DuplicateSessionError) Error() string {
+	return "acp/client: session already registered"
+}
+
 // LoadTimeoutError reports that session/load's response did not arrive
 // within the client's load timeout, even though replay updates may have
 // already been consumed (see the design doc's "Replay-idle tolerance in the

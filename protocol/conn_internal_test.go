@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"runtime"
 	"sync"
@@ -132,6 +133,77 @@ func TestConnCallContextCancelRemovesPendingEntry(t *testing.T) {
 	if got := client.pendingLen(); got != 0 {
 		t.Fatalf("pendingLen() after cancel = %d, want 0 (leaked pending entry)", got)
 	}
+}
+
+func TestConnWaitForNotificationsWaitsForQueuedJobs(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	barrier, ok := any(client).(interface {
+		WaitForNotifications(context.Context) error
+	})
+	if !ok {
+		t.Fatal("Conn is missing additive WaitForNotifications(context.Context) error API")
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	secondDone := make(chan struct{})
+	client.enqueueNotifyJob(func() {
+		close(started)
+		<-release
+	})
+	client.enqueueNotifyJob(func() { close(secondDone) })
+
+	barrierDone := make(chan error, 1)
+	go func() { barrierDone <- barrier.WaitForNotifications(context.Background()) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first notification job")
+	}
+	select {
+	case err := <-barrierDone:
+		t.Fatalf("notification barrier returned before queued jobs drained: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-barrierDone; err != nil {
+		t.Fatalf("WaitForNotifications() error = %v", err)
+	}
+	select {
+	case <-secondDone:
+	default:
+		t.Fatal("notification barrier returned before the second queued job completed")
+	}
+}
+
+func TestConnWaitForNotificationsIsCancellationAware(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	barrier, ok := any(client).(interface {
+		WaitForNotifications(context.Context) error
+	})
+	if !ok {
+		t.Fatal("Conn is missing additive WaitForNotifications(context.Context) error API")
+	}
+
+	release := make(chan struct{})
+	client.enqueueNotifyJob(func() { <-release })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := barrier.WaitForNotifications(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForNotifications() error = %v, want context.DeadlineExceeded", err)
+	}
+	close(release)
 }
 
 // --- disjoint id spaces ---

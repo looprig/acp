@@ -73,6 +73,168 @@ func TestNewSessionPropagatesAgentError(t *testing.T) {
 	}
 }
 
+func TestNewSessionRejectsDuplicateIDWithoutReplacement(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	c, fa := dialTestClient(t, Options{})
+	fa.onNewSession = func(req protocol.NewSessionRequest) (protocol.NewSessionResponse, error) {
+		return protocol.NewSessionResponse{SessionID: "sess-duplicate"}, nil
+	}
+
+	first, err := c.NewSession(context.Background(), NewSessionParams{})
+	if err != nil {
+		t.Fatalf("first NewSession() error = %v", err)
+	}
+	var second *Session
+	t.Cleanup(func() {
+		first.abortUpdates()
+		if second != nil {
+			second.abortUpdates()
+		}
+	})
+
+	second, err = c.NewSession(context.Background(), NewSessionParams{})
+	var duplicateErr *DuplicateSessionError
+	if !errors.As(err, &duplicateErr) {
+		t.Fatalf("second NewSession() error = %v (%T), want *DuplicateSessionError", err, err)
+	}
+	if duplicateErr.SessionID != first.ID() {
+		t.Fatalf("DuplicateSessionError.SessionID = %q, want %q", duplicateErr.SessionID, first.ID())
+	}
+	if second != nil {
+		t.Fatal("second NewSession() returned a Session after duplicate rejection")
+	}
+
+	c.sessionsMu.Lock()
+	current := c.sessions[first.ID()]
+	c.sessionsMu.Unlock()
+	if current != first {
+		t.Fatal("duplicate NewSession() replaced the originally registered Session")
+	}
+}
+
+func TestLoadAndResumeRejectDuplicateIDBeforeRPC(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*Client) (*Session, error)
+		set  func(*fakeAgent, *int)
+	}{
+		{
+			name: "load",
+			call: func(c *Client) (*Session, error) {
+				return c.LoadSession(context.Background(), LoadSessionParams{SessionID: "sess-duplicate"})
+			},
+			set: func(fa *fakeAgent, calls *int) {
+				fa.onLoadSession = func(ctx context.Context, fa *fakeAgent, req protocol.LoadSessionRequest) (protocol.LoadSessionResponse, error) {
+					*calls++
+					return protocol.LoadSessionResponse{}, nil
+				}
+			},
+		},
+		{
+			name: "resume",
+			call: func(c *Client) (*Session, error) {
+				return c.ResumeSession(context.Background(), ResumeSessionParams{SessionID: "sess-duplicate"})
+			},
+			set: func(fa *fakeAgent, calls *int) {
+				fa.onResume = func(req protocol.ResumeSessionRequest) (protocol.ResumeSessionResponse, error) {
+					*calls++
+					return protocol.ResumeSessionResponse{}, nil
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assertNoGoroutineLeak(t)
+			c, fa := dialTestClient(t, Options{})
+			fa.onNewSession = func(req protocol.NewSessionRequest) (protocol.NewSessionResponse, error) {
+				return protocol.NewSessionResponse{SessionID: "sess-duplicate"}, nil
+			}
+			first, err := c.NewSession(context.Background(), NewSessionParams{})
+			if err != nil {
+				t.Fatalf("first NewSession() error = %v", err)
+			}
+			var second *Session
+			t.Cleanup(func() {
+				first.abortUpdates()
+				if second != nil {
+					second.abortUpdates()
+				}
+			})
+			var calls int
+			test.set(fa, &calls)
+			second, err = test.call(c)
+			var duplicateErr *DuplicateSessionError
+			if !errors.As(err, &duplicateErr) {
+				t.Fatalf("duplicate %s error = %v (%T), want *DuplicateSessionError", test.name, err, err)
+			}
+			if duplicateErr.SessionID != "sess-duplicate" {
+				t.Fatalf("duplicate %s error SessionID = %q, want sess-duplicate", test.name, duplicateErr.SessionID)
+			}
+			if second != nil {
+				t.Fatalf("duplicate %s returned a Session", test.name)
+			}
+			if calls != 0 {
+				t.Fatalf("duplicate %s RPC calls = %d, want 0", test.name, calls)
+			}
+
+			c.sessionsMu.Lock()
+			current := c.sessions[first.ID()]
+			c.sessionsMu.Unlock()
+			if current != first {
+				t.Fatalf("duplicate %s replaced the originally registered Session", test.name)
+			}
+		})
+	}
+}
+
+func TestFailedLoadDoesNotDeleteReplacementSession(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	c, fa := dialTestClient(t, Options{})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	fa.onLoadSession = func(ctx context.Context, fa *fakeAgent, req protocol.LoadSessionRequest) (protocol.LoadSessionResponse, error) {
+		close(entered)
+		<-release
+		return protocol.LoadSessionResponse{}, protocol.InvalidParams("load failed", nil)
+	}
+
+	loadDone := make(chan error, 1)
+	go func() {
+		_, err := c.LoadSession(context.Background(), LoadSessionParams{SessionID: "sess-cleanup"})
+		loadDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first load")
+	}
+
+	c.sessionsMu.Lock()
+	first := c.sessions["sess-cleanup"]
+	replacement := newSession(c, "sess-cleanup")
+	c.sessions["sess-cleanup"] = replacement
+	c.sessionsMu.Unlock()
+	t.Cleanup(func() {
+		if first != nil {
+			first.abortUpdates()
+		}
+		replacement.abortUpdates()
+	})
+
+	close(release)
+	if err := <-loadDone; err == nil {
+		t.Fatal("failed LoadSession() error = nil, want the injected failure")
+	}
+	c.sessionsMu.Lock()
+	current := c.sessions["sess-cleanup"]
+	c.sessionsMu.Unlock()
+	if current != replacement {
+		t.Fatal("failed LoadSession() removed a replacement Session with the same ID")
+	}
+}
+
 func TestNewSessionRejectsRegistrationAfterCloseSnapshot(t *testing.T) {
 	assertNoGoroutineLeak(t)
 	agentSide, clientSide := net.Pipe()

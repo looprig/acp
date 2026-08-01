@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -92,6 +93,126 @@ func TestCloseAllSessionsReleasesUndrainedPump(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for Updates() to close after client close")
+	}
+}
+
+func TestSessionWaitForUpdatesWaitsForPumpHandoff(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	c, _ := dialTestClient(t, Options{})
+	sess := newSession(c, "sess-wait-updates")
+	t.Cleanup(func() { sess.abortUpdates() })
+	sess.deliver(Update{SessionUpdate: chunkText("queued")})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sess.mu.Lock()
+		inFlight := sess.inFlight
+		sess.mu.Unlock()
+		if inFlight == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the update pump to block")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	waiter, ok := any(sess).(interface {
+		WaitForUpdates(context.Context) error
+	})
+	if !ok {
+		t.Fatal("Session is missing additive WaitForUpdates(context.Context) error API")
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- waiter.WaitForUpdates(context.Background()) }()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("WaitForUpdates() returned before the queued update was handed off: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	select {
+	case <-sess.Updates():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out receiving the queued update")
+	}
+	if err := <-waitDone; err != nil {
+		t.Fatalf("WaitForUpdates() error = %v", err)
+	}
+}
+
+func TestSessionWaitForUpdatesHonorsCancellation(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	c, _ := dialTestClient(t, Options{})
+	sess := newSession(c, "sess-wait-cancel")
+	t.Cleanup(func() { sess.abortUpdates() })
+	sess.deliver(Update{SessionUpdate: chunkText("queued")})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sess.mu.Lock()
+		inFlight := sess.inFlight
+		sess.mu.Unlock()
+		if inFlight == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the update pump to block")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	waiter, ok := any(sess).(interface {
+		WaitForUpdates(context.Context) error
+	})
+	if !ok {
+		t.Fatal("Session is missing additive WaitForUpdates(context.Context) error API")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := waiter.WaitForUpdates(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForUpdates() error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestSessionWaitForUpdatesUnblocksOnAbort(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	c, fa := dialTestClient(t, Options{})
+	sess := newSessionForTest(t, c, fa, "sess-wait-close")
+	sess.deliver(Update{SessionUpdate: chunkText("queued")})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sess.mu.Lock()
+		inFlight := sess.inFlight
+		sess.mu.Unlock()
+		if inFlight == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the update pump to block")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	waitForUpdates, ok := any(sess).(interface {
+		WaitForUpdates(context.Context) error
+	})
+	if !ok {
+		t.Fatal("Session is missing additive WaitForUpdates(context.Context) error API")
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- waitForUpdates.WaitForUpdates(context.Background()) }()
+
+	sess.abortUpdates()
+	select {
+	case err := <-waitDone:
+		var closedErr *ClosedError
+		if !errors.As(err, &closedErr) {
+			t.Fatalf("WaitForUpdates() error = %v, want *ClosedError", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForUpdates() remained blocked after session abort")
 	}
 }
 

@@ -141,10 +141,11 @@ type Conn struct {
 	// across different notification methods, and including a buffered flush
 	// relative to a live notification for the same method that arrives
 	// concurrently with registration (see HandleNotify).
-	notifyMu     sync.Mutex
-	notifyCond   *sync.Cond
-	notifyQueue  []func()
-	notifyClosed bool
+	notifyOrderMu sync.Mutex
+	notifyMu      sync.Mutex
+	notifyCond    *sync.Cond
+	notifyQueue   []func()
+	notifyClosed  bool
 
 	done         chan struct{}
 	readLoopDone chan struct{}
@@ -196,6 +197,48 @@ func (c *Conn) Done() <-chan struct{} { return c.done }
 // the final count once the Conn is closed.
 func (c *Conn) DroppedNotifications() uint64 { return c.droppedNotifications.Load() }
 
+// WaitForNotifications waits until all notification jobs enqueued before this
+// call have finished executing in the Conn's ordered notification worker. It
+// is cancellation-aware and returns *ConnClosedError if the Conn closes before
+// the barrier reaches the worker. A caller should not invoke it from inside a
+// notification handler, because that handler is itself ahead of the barrier.
+func (c *Conn) WaitForNotifications(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	markerDone := make(chan struct{})
+	c.notifyOrderMu.Lock()
+	c.notifyMu.Lock()
+	if c.notifyClosed {
+		c.notifyMu.Unlock()
+		c.notifyOrderMu.Unlock()
+		return c.closedError()
+	}
+	c.notifyQueue = append(c.notifyQueue, func() { close(markerDone) })
+	c.notifyMu.Unlock()
+	c.notifyOrderMu.Unlock()
+	c.notifyCond.Signal()
+
+	select {
+	case <-markerDone:
+		return nil
+	case <-c.done:
+		return c.closedError()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Conn) closedError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeErr != nil {
+		return c.closeErr
+	}
+	return &ConnClosedError{}
+}
+
 // Handle registers h as the handler for incoming requests with the given
 // method. A later call with the same method replaces the previous handler.
 func (c *Conn) Handle(method string, h HandlerFunc) {
@@ -220,6 +263,8 @@ func (c *Conn) Handle(method string, h HandlerFunc) {
 // buffered notification for method has already been pushed onto the shared
 // queue ahead of it.
 func (c *Conn) HandleNotify(method string, h NotifyFunc) {
+	c.notifyOrderMu.Lock()
+	defer c.notifyOrderMu.Unlock()
 	c.handlersMu.Lock()
 	c.notifyHandlers[method] = h
 	buffered := c.notifyBuffers[method]
@@ -569,6 +614,8 @@ func (c *Conn) buildResponse(id ID, result any, err error) *Response {
 // notification is buffered (bounded, drop-oldest-on-overflow) for a
 // HandleNotify registration that may come later.
 func (c *Conn) dispatchNotification(n *Notification) {
+	c.notifyOrderMu.Lock()
+	defer c.notifyOrderMu.Unlock()
 	c.handlersMu.Lock()
 
 	if h, ok := c.notifyHandlers[n.Method]; ok {

@@ -55,8 +55,9 @@ const (
 // dialAttempt is the shared handle concurrent Dial callers wait on while one
 // of them owns the in-flight connection attempt.
 type dialAttempt struct {
-	done chan struct{}
-	err  error
+	done   chan struct{}
+	err    error
+	cancel context.CancelFunc
 }
 
 // Client is one connection to a foreign ACP agent, spawned as a subprocess
@@ -161,15 +162,20 @@ func (c *Client) Dial(ctx context.Context) error {
 				return ctx.Err()
 			}
 		default: // dialIdle
-			w := &dialAttempt{done: make(chan struct{})}
+			attemptCtx, cancel := context.WithCancel(ctx)
+			w := &dialAttempt{done: make(chan struct{}), cancel: cancel}
 			c.waiter = w
 			c.state = dialDialing
 			c.mu.Unlock()
 
-			err := c.attemptConnect(ctx)
+			err := c.attemptConnect(attemptCtx)
 
 			c.mu.Lock()
-			if err != nil {
+			if c.state == dialClosed {
+				// Close wins the attempt's terminal race. In particular, do
+				// not let a successful attempt resurrect the Client to ready.
+				err = &ClosedError{}
+			} else if err != nil {
 				c.state = dialIdle
 			} else {
 				c.state = dialReady
@@ -177,6 +183,7 @@ func (c *Client) Dial(ctx context.Context) error {
 			c.waiter = nil
 			c.mu.Unlock()
 
+			cancel()
 			w.err = err
 			close(w.done)
 			return err
@@ -221,6 +228,14 @@ func (c *Client) finishConnect(ctx context.Context, proc *stdio.Proc, r io.Reade
 	}
 
 	c.mu.Lock()
+	if c.state == dialClosed {
+		c.mu.Unlock()
+		_ = conn.Close()
+		if proc != nil {
+			_ = proc.Kill()
+		}
+		return &ClosedError{}
+	}
 	c.proc, c.conn, c.agent, c.initRes = proc, conn, agent, resp
 	c.mu.Unlock()
 
@@ -308,8 +323,15 @@ func (c *Client) Close(ctx context.Context) error {
 		return nil
 	}
 	conn, proc := c.conn, c.proc
+	var cancel context.CancelFunc
+	if c.state == dialDialing && c.waiter != nil {
+		cancel = c.waiter.cancel
+	}
 	c.state = dialClosed
 	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	c.closeDone()
 
 	c.closeAllSessions()

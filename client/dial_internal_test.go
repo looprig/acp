@@ -3,12 +3,14 @@ package client
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/looprig/acp/protocol"
+	"github.com/looprig/acp/transport/stdio"
 )
 
 // newTestClient builds a *Client whose connection attempt is entirely
@@ -184,5 +186,127 @@ func TestDialRespectsContextCancellationWhileWaiting(t *testing.T) {
 	close(release)
 	if err := <-ownerDone; err != nil {
 		t.Fatalf("owner Dial() error = %v, want nil (waiter's cancellation must not disturb the shared attempt)", err)
+	}
+}
+
+func TestDialCloseCancelsInFlightAttempt(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	entered := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAttempt := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+
+	c := newTestClient(func(ctx context.Context) error {
+		close(entered)
+		select {
+		case <-ctx.Done():
+			close(canceled)
+			return ctx.Err()
+		case <-release:
+			return nil
+		}
+	})
+
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- c.Dial(context.Background()) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the owning attempt to start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- c.Close(context.Background()) }()
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Client.Close() error = %v", err)
+	}
+
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		releaseAttempt()
+		<-ownerDone
+		t.Fatal("Client.Close() did not cancel the in-flight dial attempt")
+	}
+
+	var closedErr *ClosedError
+	if err := <-ownerDone; !errors.As(err, &closedErr) {
+		t.Fatalf("owner Dial() error = %v (%T), want *ClosedError", err, err)
+	}
+	c.mu.Lock()
+	state := c.state
+	c.mu.Unlock()
+	if state != dialClosed {
+		t.Fatalf("Client state after close = %v, want dialClosed", state)
+	}
+}
+
+func TestDialCloseRejectsLateFinishConnect(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	agentSide, clientSide := net.Pipe()
+	fa := newFakeAgent(protocol.NewConn(agentSide, agentSide, protocol.ConnOptions{}))
+	initEntered := make(chan struct{})
+	releaseInit := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseInit) })
+	}
+	fa.onInitialize = func(req protocol.InitializeRequest) (protocol.InitializeResponse, error) {
+		close(initEntered)
+		<-releaseInit
+		return protocol.InitializeResponse{ProtocolVersion: protocol.CurrentProtocolVersion}, nil
+	}
+
+	c := New(stdio.Command{}, Options{})
+	c.attemptConnect = func(ctx context.Context) error {
+		// Deliberately use a context the test controls independently: this
+		// models an attempt/handshake implementation that completes after its
+		// owner has observed Close and tests finishConnect's late-publication
+		// guard directly.
+		return c.finishConnect(context.Background(), nil, clientSide, clientSide)
+	}
+	t.Cleanup(func() {
+		release()
+		_ = agentSide.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = c.Close(ctx)
+	})
+
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- c.Dial(context.Background()) }()
+	select {
+	case <-initEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initialize to block")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- c.Close(context.Background()) }()
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Client.Close() error = %v", err)
+	}
+	release()
+
+	var closedErr *ClosedError
+	if err := <-ownerDone; !errors.As(err, &closedErr) {
+		t.Fatalf("owner Dial() error = %v (%T), want *ClosedError", err, err)
+	}
+	c.mu.Lock()
+	state, conn := c.state, c.conn
+	c.mu.Unlock()
+	if state != dialClosed {
+		t.Fatalf("Client state after late finishConnect = %v, want dialClosed", state)
+	}
+	if conn != nil {
+		t.Fatal("late finishConnect published a connection after Client.Close")
+	}
+	select {
+	case <-fa.conn.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("late finishConnect did not close its protocol connection")
 	}
 }
