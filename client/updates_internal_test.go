@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/looprig/acp/protocol"
+	"github.com/looprig/acp/transport/stdio"
 )
 
 func chunkText(text string) protocol.SessionUpdate {
@@ -53,6 +54,44 @@ func TestUpdatesClosesAfterDrainingQueuedUpdates(t *testing.T) {
 	}
 	if len(got) != 2 || got[0] != "one" || got[1] != "two" {
 		t.Fatalf("drained updates = %v, want [one two]", got)
+	}
+}
+
+func TestCloseAllSessionsReleasesUndrainedPump(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	sess := newSession(nil, "sess-close-undrained")
+	sess.deliver(Update{SessionUpdate: chunkText("queued")})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sess.mu.Lock()
+		inFlight := sess.inFlight
+		sess.mu.Unlock()
+		if inFlight == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the update pump to block on the undrained Updates channel")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	c := New(stdio.Command{}, Options{})
+	c.sessionsMu.Lock()
+	c.sessions[sess.ID()] = sess
+	c.sessionsMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.Close(ctx); err != nil {
+		t.Fatalf("Client.Close() error = %v", err)
+	}
+	select {
+	case _, open := <-sess.Updates():
+		if open {
+			t.Fatal("Updates() delivered a queued update after Client.Close(); want the close to release the undrained pump")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Updates() to close after client close")
 	}
 }
 

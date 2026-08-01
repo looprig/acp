@@ -105,6 +105,14 @@ type Session struct {
 	cond   *sync.Cond
 	queue  []Update
 	closed bool
+	// updatesDone is closed exactly once by abortUpdates to interrupt a pump
+	// blocked handing an update to an absent Updates reader. pumpDone closes
+	// after pump has closed out, so forced session/client teardown can wait
+	// for the goroutine to exit rather than leaving it behind.
+	updatesDone chan struct{}
+	pumpDone    chan struct{}
+	closeOnce   sync.Once
+	stopOnce    sync.Once
 	// inFlight is 1 while pump has dequeued an update and is blocked handing
 	// it to Updates() (an unbuffered channel with no guaranteed reader), 0
 	// otherwise. deliver counts it as still "resident" toward
@@ -192,12 +200,14 @@ func (s *Session) Modes() *protocol.SessionModeState {
 // newSession constructs a Session and starts its update-delivery pump.
 func newSession(client *Client, id protocol.SessionID) *Session {
 	s := &Session{
-		id:        id,
-		client:    client,
-		out:       make(chan Update),
-		queue:     make([]Update, 0, sessionUpdateQueueHint),
-		seen:      make(map[string]struct{}),
-		promptSem: make(chan struct{}, 1),
+		id:          id,
+		client:      client,
+		out:         make(chan Update),
+		queue:       make([]Update, 0, sessionUpdateQueueHint),
+		updatesDone: make(chan struct{}),
+		pumpDone:    make(chan struct{}),
+		seen:        make(map[string]struct{}),
+		promptSem:   make(chan struct{}, 1),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	go s.pump()
@@ -211,8 +221,9 @@ func newSession(client *Client, id protocol.SessionID) *Session {
 // yet), buffered internally by a queue (see deliver) so nothing arriving
 // before the caller starts reading is dropped, up to UpdateQueueDepth. The
 // channel is closed once the session is closed (Client.Close, connection
-// death, or a future explicit session close) and every already-queued
-// update has been delivered.
+// death, or a future explicit session close) and every already-queued update
+// has been delivered. Forced client/connection teardown may abandon an update
+// still blocked for an absent reader so the pump can exit.
 func (s *Session) Updates() <-chan Update { return s.out }
 
 // DroppedUpdates reports how many queued session/update notifications have
@@ -315,15 +326,15 @@ func (s *Session) recordSeenLocked(eventID string) {
 }
 
 // pump drains the internal queue in order onto the exposed Updates()
-// channel, blocking (never dropping, from pump's own perspective) when the
-// consumer is slower than delivery — deliver is what enforces
-// UpdateQueueDepth on the producing side, by counting the one update pump
-// may be sitting on (see inFlight) as still resident. Once closeUpdates has
-// been called AND the queue has been fully drained, it closes out and
-// returns: every update still resident at closing time is still delivered,
-// matching Session's "nothing dropped once accepted" contract even at
-// shutdown.
+// channel, blocking when the consumer is slower than delivery — deliver is
+// what enforces UpdateQueueDepth on the producing side, by counting the one
+// update pump may be sitting on (see inFlight). closeUpdates performs a
+// graceful drain; abortUpdates uses the close-aware send to interrupt a
+// blocked handoff when there is no reader, then closes out.
 func (s *Session) pump() {
+	defer close(s.pumpDone)
+	defer close(s.out)
+
 	for {
 		s.mu.Lock()
 		for len(s.queue) == 0 && !s.closed {
@@ -331,7 +342,6 @@ func (s *Session) pump() {
 		}
 		if len(s.queue) == 0 {
 			s.mu.Unlock()
-			close(s.out)
 			return
 		}
 		u := s.queue[0]
@@ -340,21 +350,46 @@ func (s *Session) pump() {
 		s.inFlight = 1
 		s.mu.Unlock()
 
-		s.out <- u
-
-		s.mu.Lock()
-		s.inFlight = 0
-		s.mu.Unlock()
+		select {
+		case s.out <- u:
+			s.mu.Lock()
+			s.inFlight = 0
+			s.mu.Unlock()
+		case <-s.updatesDone:
+			s.mu.Lock()
+			s.inFlight = 0
+			for i := range s.queue {
+				s.queue[i] = Update{}
+			}
+			s.queue = nil
+			s.mu.Unlock()
+			return
+		}
 	}
 }
 
-// closeUpdates marks the session closed, so pump exits (after draining
-// whatever is already queued) instead of waiting for more.
+// closeUpdates marks the session closed so pump drains queued updates instead
+// of waiting for more. It intentionally returns without waiting: callers may
+// begin consuming Updates after close is requested.
 func (s *Session) closeUpdates() {
-	s.mu.Lock()
-	s.closed = true
-	s.mu.Unlock()
-	s.cond.Broadcast()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		s.cond.Broadcast()
+	})
+}
+
+// abortUpdates marks the session closed, interrupts a pump blocked on an
+// undrained Updates channel, and waits until pump has closed that channel.
+// sync.Once makes concurrent Client.Close/connection-death cleanup paths safe
+// while every caller still waits for the same pump completion.
+func (s *Session) abortUpdates() {
+	s.closeUpdates()
+	s.stopOnce.Do(func() {
+		close(s.updatesDone)
+	})
+	<-s.pumpDone
 }
 
 // registerSession constructs and tracks a new Session under id, so inbound
@@ -387,7 +422,7 @@ func (c *Client) closeAllSessions() {
 	c.sessionsMu.Unlock()
 
 	for _, s := range sessions {
-		s.closeUpdates()
+		s.abortUpdates()
 	}
 }
 
@@ -466,7 +501,7 @@ func (c *Client) LoadSession(ctx context.Context, p LoadSessionParams) (*Session
 	})
 	if err != nil {
 		c.unregisterSession(p.SessionID)
-		sess.closeUpdates()
+		sess.abortUpdates()
 		if loadCtx.Err() != nil && ctx.Err() == nil {
 			// loadCtx's own deadline fired, not the caller's ctx: report the
 			// bounded-wait failure as the typed timeout, not a raw
@@ -501,7 +536,7 @@ func (c *Client) ResumeSession(ctx context.Context, p ResumeSessionParams) (*Ses
 	})
 	if err != nil {
 		c.unregisterSession(p.SessionID)
-		sess.closeUpdates()
+		sess.abortUpdates()
 		return nil, wrapConnError(err)
 	}
 	return sess, nil
