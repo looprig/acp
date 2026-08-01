@@ -479,10 +479,10 @@ func (c *Conn) shutdown(cause error) {
 			ch <- callResult{err: c.closeErr}
 		}
 
-		// writer.Close waits for every already-admitted Send to finish being
-		// written before returning, so by the time the raw transport is
-		// closed below, nothing is still relying on it being open.
-		_ = c.writer.Close()
+		// Interrupt raw I/O before waiting for admitted Writer sends. A
+		// blocked Write must see the transport close or Writer.Close can wait
+		// forever, preventing the transport and child process from being
+		// interrupted at all.
 		if closer, ok := c.r.(io.Closer); ok {
 			_ = closer.Close()
 		}
@@ -491,6 +491,7 @@ func (c *Conn) shutdown(cause error) {
 				_ = closer.Close()
 			}
 		}
+		_ = c.writer.Close()
 	})
 }
 

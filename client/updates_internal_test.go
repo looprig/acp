@@ -216,6 +216,50 @@ func TestSessionWaitForUpdatesUnblocksOnAbort(t *testing.T) {
 	}
 }
 
+func TestSessionCompletionMetadataStaysBoundedUnderBackpressure(t *testing.T) {
+	assertNoGoroutineLeak(t)
+	sess := newSession(nil, "sess-completion-metadata")
+	t.Cleanup(func() { sess.abortUpdates() })
+	sess.deliver(Update{SessionUpdate: chunkText("blocked")})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sess.mu.Lock()
+		inFlight := sess.inFlight
+		sess.mu.Unlock()
+		if inFlight == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the oldest handoff to block")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	const rounds = UpdateQueueDepth * 32
+	for i := 0; i < rounds; i++ {
+		sess.deliver(Update{SessionUpdate: chunkText(strconv.Itoa(i))})
+	}
+
+	sess.mu.Lock()
+	metadata := sess.completed
+	sess.mu.Unlock()
+	if metadata.start != 2 {
+		t.Fatalf("completion range start = %d after %d backpressured updates, want 2", metadata.start, rounds)
+	}
+	wantCompleted := uint64(rounds - UpdateQueueDepth + 1)
+	if got := metadata.end - metadata.start + 1; got != wantCompleted {
+		t.Fatalf("completion range width = %d after %d backpressured updates, want %d", got, rounds, wantCompleted)
+	}
+
+	if got := <-sess.Updates(); got.SessionUpdate.AgentMessageChunk.Content.Text.Text != "blocked" {
+		t.Fatal("oldest handoff did not remain first after backpressure")
+	}
+	sess.closeUpdates()
+	for range sess.Updates() {
+	}
+}
+
 // --- _meta.eventId dedup ---
 
 func TestDedupDropsDuplicateLiveUpdatesByEventID(t *testing.T) {

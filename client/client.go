@@ -339,11 +339,11 @@ func (c *Client) Close(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if conn != nil {
-			_ = conn.Close()
-		}
 		if proc != nil {
 			_ = proc.Kill()
+		}
+		if conn != nil {
+			_ = conn.Close()
 		}
 	}()
 

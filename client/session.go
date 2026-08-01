@@ -68,6 +68,11 @@ type queuedUpdate struct {
 	id     uint64
 }
 
+type deliveryRange struct {
+	start uint64
+	end   uint64
+}
+
 type deliveryWaiter struct {
 	target uint64
 	done   chan error
@@ -138,7 +143,7 @@ type Session struct {
 	inFlightID       uint64
 	nextDeliveryID   uint64
 	completedThrough uint64
-	completed        map[uint64]struct{}
+	completed        deliveryRange
 	deliveryWaiters  []*deliveryWaiter
 	droppedUpdates   atomic.Uint64
 
@@ -223,7 +228,6 @@ func newSession(client *Client, id protocol.SessionID) *Session {
 		updatesDone: make(chan struct{}),
 		pumpDone:    make(chan struct{}),
 		seen:        make(map[string]struct{}),
-		completed:   make(map[uint64]struct{}),
 		promptSem:   make(chan struct{}, 1),
 	}
 	s.cond = sync.NewCond(&s.mu)
@@ -380,22 +384,30 @@ func (s *Session) deliver(u Update) {
 }
 
 // completeDeliveryLocked records that an update was either handed to the
-// caller or intentionally discarded by the bounded queue. The completed set
-// handles the one legitimate out-of-order case: a queued entry may be dropped
-// while an older entry is blocked in the pump's handoff.
+// caller or intentionally discarded by the bounded queue. The bounded range
+// handles the one legitimate out-of-order case: a queued FIFO prefix may be
+// dropped while the older in-flight handoff remains blocked. All completions
+// after that gap are consecutive because the pump is single-threaded and the
+// queue drops only from its front.
 func (s *Session) completeDeliveryLocked(id uint64) {
 	if id == 0 || id <= s.completedThrough {
 		return
 	}
-	s.completed[id] = struct{}{}
-	for {
-		next := s.completedThrough + 1
-		if _, ok := s.completed[next]; !ok {
-			break
+	if id == s.completedThrough+1 {
+		s.completedThrough = id
+		if s.completed.start == s.completedThrough+1 {
+			s.completedThrough = s.completed.end
+			s.completed = deliveryRange{}
 		}
-		delete(s.completed, next)
-		s.completedThrough = next
+	} else if s.completed.start == 0 {
+		s.completed = deliveryRange{start: id, end: id}
+	} else if id == s.completed.end+1 {
+		s.completed.end = id
 	}
+	s.notifyDeliveryWaitersLocked()
+}
+
+func (s *Session) notifyDeliveryWaitersLocked() {
 	for i := 0; i < len(s.deliveryWaiters); {
 		w := s.deliveryWaiters[i]
 		if w.target > s.completedThrough {

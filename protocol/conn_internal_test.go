@@ -4,12 +4,43 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
 )
+
+type blockedWriteTransport struct {
+	writeStarted chan struct{}
+	closed       chan struct{}
+	closeOnce    sync.Once
+	writeOnce    sync.Once
+}
+
+func newBlockedWriteTransport() *blockedWriteTransport {
+	return &blockedWriteTransport{
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (t *blockedWriteTransport) Read([]byte) (int, error) {
+	<-t.closed
+	return 0, io.EOF
+}
+
+func (t *blockedWriteTransport) Write([]byte) (int, error) {
+	t.writeOnce.Do(func() { close(t.writeStarted) })
+	<-t.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (t *blockedWriteTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
 
 // assertNoGoroutineLeakInternal mirrors conn_test.go's assertNoGoroutineLeak.
 // Duplicated (rather than shared) because this file lives in package
@@ -204,6 +235,46 @@ func TestConnWaitForNotificationsIsCancellationAware(t *testing.T) {
 		t.Fatalf("WaitForNotifications() error = %v, want context.DeadlineExceeded", err)
 	}
 	close(release)
+}
+
+func TestConnCloseInterruptsBlockedWriterBeforeWaiting(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	transport := newBlockedWriteTransport()
+	conn := NewConn(transport, transport, ConnOptions{})
+	t.Cleanup(func() {
+		_ = transport.Close()
+		_ = conn.Close()
+	})
+
+	notifyDone := make(chan error, 1)
+	go func() { notifyDone <- conn.Notify(context.Background(), "blocked", nil) }()
+	select {
+	case <-transport.writeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Notify to enter the blocked write")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- conn.Close() }()
+	select {
+	case <-transport.closed:
+	case <-time.After(2 * time.Second):
+		// Release the test transport so the pre-fix implementation cannot
+		// strand the test process in its writer wait after this assertion.
+		_ = transport.Close()
+		<-closeDone
+		t.Fatal("Conn.Close() did not interrupt the raw transport before waiting for the blocked writer")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Conn.Close() remained blocked after interrupting the raw transport")
+	}
+	select {
+	case <-notifyDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Notify() remained blocked after Conn.Close()")
+	}
 }
 
 // --- disjoint id spaces ---
