@@ -91,6 +91,66 @@ func TestBuildChildCommandReplacesExistingOverrideKeyInPlace(t *testing.T) {
 	}
 }
 
+func TestBuildChildCommandReplacesAllDuplicateOverrideKeys(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "Claude base URL", key: "ANTHROPIC_BASE_URL", value: "https://gateway.example"},
+		{name: "Claude auth token", key: "ANTHROPIC_AUTH_TOKEN", value: "gateway-token"},
+		{name: "Codex proxy token", key: "LOOPRIG_PROXY_TOKEN", value: "gateway-token"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := stdio.Command{
+				Path: "/bin/x",
+				Env: []string{
+					"PATH=/usr/bin",
+					tc.key + "=stale-first",
+					tc.key + "=stale-second",
+				},
+			}
+
+			out, err := buildChildCommand(cmd, []envOverride{{Key: tc.key, Value: tc.value}}, nil)
+			if err != nil {
+				t.Fatalf("buildChildCommand() error = %v", err)
+			}
+
+			got := sortedCopy(out.Env)
+			want := sortedCopy([]string{
+				"PATH=/usr/bin",
+				tc.key + "=" + tc.value,
+				tc.key + "=" + tc.value,
+			})
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("out.Env = %v, want all duplicate %s entries replaced", got, tc.key)
+			}
+		})
+	}
+}
+
+func TestBuildChildCommandRejectsDuplicateForbiddenNativeAuthKeys(t *testing.T) {
+	for _, key := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "LOOPRIG_PROXY_TOKEN"} {
+		t.Run(key, func(t *testing.T) {
+			cmd := stdio.Command{
+				Path: "/bin/x",
+				Env:  []string{key + "=stale-first", key + "=stale-second"},
+			}
+
+			_, err := buildChildCommand(cmd, nil, []string{key})
+			var conflict *ConflictingEnvError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("buildChildCommand() error = %v (%T), want *ConflictingEnvError", err, err)
+			}
+			if conflict.Key != key {
+				t.Errorf("ConflictingEnvError.Key = %q, want %q", conflict.Key, key)
+			}
+		})
+	}
+}
+
 func TestBuildChildCommandPreservesUnrelatedEntries(t *testing.T) {
 	cmd := stdio.Command{
 		Path: "/bin/x",

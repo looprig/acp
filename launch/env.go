@@ -13,7 +13,7 @@ import (
 )
 
 // envOverride is one environment variable a HarnessAdapter sets on the
-// child it configures: an existing cmd.Env entry with the same key is
+// child it configures: existing cmd.Env entries with the same key are
 // replaced in place (the design doc's "add or replace only their
 // documented gateway variables"); a key with no existing entry is
 // appended.
@@ -44,9 +44,15 @@ func buildChildCommand(cmd stdio.Command, overrides []envOverride, forbidden []s
 	}
 	for _, ov := range overrides {
 		entry := ov.Key + "=" + ov.Value
-		if idx := envIndex(env, ov.Key); idx >= 0 {
-			env[idx] = entry
-		} else {
+		prefix := ov.Key + "="
+		replaced := false
+		for i, kv := range env {
+			if strings.HasPrefix(kv, prefix) {
+				env[i] = entry
+				replaced = true
+			}
+		}
+		if !replaced {
 			env = append(env, entry)
 		}
 	}
