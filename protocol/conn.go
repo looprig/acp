@@ -351,7 +351,7 @@ func (c *Conn) call(ctx context.Context, method string, params, result any, mint
 	c.mu.Unlock()
 
 	req := &Request{ID: id, Method: method, Params: raw}
-	if sendErr := c.writer.Send(req); sendErr != nil {
+	if sendErr := c.writer.SendContext(ctx, req); sendErr != nil {
 		// If our entry is still in the pending table, nobody else will ever
 		// resolve it (a shutdown that already ran would have removed it as
 		// part of its fail-all sweep before the writer could report
@@ -435,7 +435,7 @@ func (c *Conn) Notify(ctx context.Context, method string, params any) error {
 	}
 
 	n := &Notification{Method: method, Params: raw}
-	return c.writer.Send(n)
+	return c.writer.SendContext(ctx, n)
 }
 
 // Close stops c from accepting further Call/Notify calls (which now fail

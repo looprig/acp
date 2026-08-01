@@ -277,6 +277,43 @@ func TestConnCloseInterruptsBlockedWriterBeforeWaiting(t *testing.T) {
 	}
 }
 
+func TestConnNotifyReturnsOnContextCancellationDuringWrite(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	transport := newBlockedWriteTransport()
+	conn := NewConn(transport, transport, ConnOptions{})
+	t.Cleanup(func() {
+		_ = transport.Close()
+		_ = conn.Close()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	notifyDone := make(chan error, 1)
+	go func() { notifyDone <- conn.Notify(ctx, "blocked", nil) }()
+	select {
+	case <-transport.writeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Notify to enter the blocked write")
+	}
+
+	cancel()
+	select {
+	case err := <-notifyDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Notify() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		// Release the pre-fix writer so the test process cannot be left
+		// behind after recording the expected cancellation failure.
+		_ = transport.Close()
+		<-notifyDone
+		t.Fatal("Notify() remained blocked after context cancellation")
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Conn.Close() error = %v", err)
+	}
+}
+
 // --- disjoint id spaces ---
 
 func TestConnDisjointIDSpacesNoCollisionUnderConcurrency(t *testing.T) {

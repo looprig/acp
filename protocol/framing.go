@@ -14,6 +14,7 @@ package protocol
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -150,6 +151,7 @@ func (e *WriterClosedError) Unwrap() error { return e.cause }
 // writeJob is one queued Send: the fully framed line to write, and the
 // channel its result is delivered on.
 type writeJob struct {
+	ctx   context.Context
 	line  []byte
 	errCh chan error
 }
@@ -199,8 +201,7 @@ func (wr *Writer) run(w io.Writer) {
 	for {
 		select {
 		case job := <-wr.queue:
-			_, err := w.Write(job.line)
-			job.errCh <- err
+			wr.runJob(w, job)
 		case <-wr.stopping:
 			// By the time stopping is closed, Close has already waited for
 			// every admitted Send to finish enqueuing (see Close), so
@@ -209,13 +210,23 @@ func (wr *Writer) run(w io.Writer) {
 			for {
 				select {
 				case job := <-wr.queue:
-					_, err := w.Write(job.line)
-					job.errCh <- err
+					wr.runJob(w, job)
 				default:
 					return
 				}
 			}
 		}
+	}
+}
+
+func (wr *Writer) runJob(w io.Writer, job writeJob) {
+	defer wr.admitted.Done()
+	select {
+	case <-job.ctx.Done():
+		job.errCh <- job.ctx.Err()
+	default:
+		_, err := w.Write(job.line)
+		job.errCh <- err
 	}
 }
 
@@ -225,6 +236,20 @@ func (wr *Writer) run(w io.Writer) {
 // *WriterClosedError instead of blocking. It is safe to call Send from any
 // number of goroutines concurrently.
 func (wr *Writer) Send(msg any) error {
+	return wr.SendContext(context.Background(), msg)
+}
+
+// SendContext is Send's cancellation-aware form. If ctx is canceled while a
+// job is queued, the writer skips the underlying write and returns ctx.Err().
+// If the underlying Write is already blocked, SendContext returns ctx.Err()
+// to its caller but keeps the admitted job tracked until the write completes;
+// transport shutdown must still release that write before Writer.Close can
+// finish. This preserves Writer.Close's no-lost-admitted-job accounting and
+// keeps the writer goroutine owned by the Writer rather than by the caller.
+func (wr *Writer) SendContext(ctx context.Context, msg any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("protocol: marshal frame for send: %w", err)
@@ -240,21 +265,32 @@ func (wr *Writer) Send(msg any) error {
 	}
 	wr.admitted.Add(1)
 	wr.mu.Unlock()
-	defer wr.admitted.Done()
 
 	line := make([]byte, 0, len(data)+1)
 	line = append(line, data...)
 	line = append(line, '\n')
 
 	errCh := make(chan error, 1)
+	job := writeJob{ctx: ctx, line: line, errCh: errCh}
 	// This send onto queue cannot block forever: it is only reached while
 	// wr.closed is still false at the moment Close's Wait below could
 	// observe this goroutine, which means the writer goroutine has not yet
 	// been told to stop servicing wr.queue and so is guaranteed to keep
 	// draining it (including growing room for this send) until every
 	// admitted Send — this one included — completes.
-	wr.queue <- writeJob{line: line, errCh: errCh}
-	return <-errCh
+	select {
+	case wr.queue <- job:
+	case <-ctx.Done():
+		wr.admitted.Done()
+		return ctx.Err()
+	}
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Close stops the Writer from accepting any further Send calls, waits for
