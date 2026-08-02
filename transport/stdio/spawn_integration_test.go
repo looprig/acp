@@ -241,6 +241,26 @@ func TestSpawnKillIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSpawnCancellationRacesWithProcessGroupSetup(t *testing.T) {
+	t.Parallel()
+	for i := 0; i < 20; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		proc, err := Spawn(ctx, selfExecCommand(t, "TestCooperativeEchoHelper", []string{
+			"GO_WANT_STDIO_COOPERATIVE_HELPER=1",
+		}, ""))
+		cancel()
+		if err != nil {
+			continue
+		}
+		if err := proc.Kill(); err != nil {
+			var exitErr *ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("Kill() error = %v, want nil or *ExitError", err)
+			}
+		}
+	}
+}
+
 func TestSpawnEnvIsNeverAmbient(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

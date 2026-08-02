@@ -87,9 +87,13 @@ type Proc struct {
 	Stdin  io.WriteCloser
 	Stdout io.Reader
 
-	cmd    *exec.Cmd
-	pgid   int
-	stderr *stderrRing
+	cmd       *exec.Cmd
+	processMu sync.Mutex
+	startDone chan struct{}
+	started   bool
+	startErr  error
+	pgid      int
+	stderr    *stderrRing
 
 	waitOnce sync.Once
 	waitErr  error
@@ -140,10 +144,11 @@ func Spawn(ctx context.Context, cmd Command) (*Proc, error) {
 	}
 
 	p := &Proc{
-		Stdin:  stdin,
-		Stdout: stdout,
-		cmd:    ecmd,
-		stderr: ring,
+		Stdin:     stdin,
+		Stdout:    stdout,
+		cmd:       ecmd,
+		startDone: make(chan struct{}),
+		stderr:    ring,
 	}
 
 	// The default CommandContext Cancel (Process.Kill) only signals the
@@ -157,10 +162,18 @@ func Spawn(ctx context.Context, cmd Command) (*Proc, error) {
 		return nil
 	}
 
-	if err := ecmd.Start(); err != nil {
+	err = ecmd.Start()
+	p.processMu.Lock()
+	if err != nil {
+		p.startErr = err
+		close(p.startDone)
+		p.processMu.Unlock()
 		return nil, err
 	}
 	p.pgid = ecmd.Process.Pid
+	p.started = true
+	close(p.startDone)
+	p.processMu.Unlock()
 	return p, nil
 }
 
@@ -200,7 +213,11 @@ func (p *Proc) Wait() error {
 // Signal sends sig to the entire process group (the leader and every
 // descendant that has not changed its own group).
 func (p *Proc) Signal(sig os.Signal) error {
-	return signalProcessGroup(p.pgid, sig)
+	pgid, err := p.processGroupID()
+	if err != nil {
+		return err
+	}
+	return signalProcessGroup(pgid, sig)
 }
 
 // Kill tears the process group down: SIGINT, a closeGrace grace period for a
@@ -216,14 +233,19 @@ func (p *Proc) Kill() error {
 }
 
 func (p *Proc) teardown() error {
-	_ = interruptProcessGroup(p.pgid)
+	pgid, err := p.processGroupID()
+	if err != nil {
+		return err
+	}
+
+	_ = interruptProcessGroup(pgid)
 
 	exited := make(chan struct{})
 	go func() {
 		// A failed observer cannot safely distinguish a running leader from
 		// an exited one, so treat failure as a request for immediate
 		// escalation.
-		_ = waitProcessExit(p.pgid)
+		_ = waitProcessExit(pgid)
 		close(exited)
 	}()
 
@@ -236,13 +258,23 @@ func (p *Proc) teardown() error {
 		// The leader has exited but remains unreaped, so its pid still
 		// reserves the process-group id while any surviving descendants are
 		// killed.
-		_ = killProcessGroup(p.pgid)
+		_ = killProcessGroup(pgid)
 	case <-timer.C:
 		// Escalate before waiting: the live leader still owns the numeric
 		// pgid.
-		_ = killProcessGroup(p.pgid)
+		_ = killProcessGroup(pgid)
 		<-exited
 	}
 
 	return p.Wait()
+}
+
+func (p *Proc) processGroupID() (int, error) {
+	<-p.startDone
+	p.processMu.Lock()
+	defer p.processMu.Unlock()
+	if !p.started {
+		return 0, p.startErr
+	}
+	return p.pgid, nil
 }
