@@ -195,7 +195,15 @@ func (c *Client) Dial(ctx context.Context) error {
 // cmd as a real subprocess via acp/transport/stdio and hands the resulting
 // pipes to finishConnect.
 func (c *Client) spawnAndConnect(ctx context.Context) error {
-	proc, err := stdio.Spawn(ctx, c.cmd)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// The Dial attempt context belongs to the handshake, not to the
+	// successfully connected client. Dial cancels that context as soon as
+	// finishConnect returns; binding exec.CommandContext to it would kill a
+	// healthy ACP child immediately after initialize. Failed handshakes still
+	// go through finishConnect's explicit proc.Kill path.
+	proc, err := stdio.Spawn(context.WithoutCancel(ctx), c.cmd)
 	if err != nil {
 		return err
 	}
