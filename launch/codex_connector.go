@@ -68,7 +68,8 @@ type CodexConnector struct {
 	// model=` override codex.go's Configure builds (see that file's
 	// doc): codex-acp has no reliable post-session model-switching RPC,
 	// so this value is fixed for this CodexConnector's entire lifetime.
-	// Required.
+	// Required by gateway Configure. Native no-proxy configuration may leave
+	// it empty, in which case no model override is emitted.
 	Model string
 	// Posture is the sandbox/approval posture Configure applies. The
 	// zero value resolves to sane, least-privilege defaults (see
@@ -102,4 +103,7 @@ func (c *CodexConnector) WithModel(model string) *CodexConnector {
 
 // Compile-time proof that CodexConnector actually satisfies HarnessAdapter
 // (see codex.go's Configure).
-var _ HarnessAdapter = (*CodexConnector)(nil)
+var (
+	_ HarnessAdapter       = (*CodexConnector)(nil)
+	_ NativeHarnessAdapter = (*CodexConnector)(nil)
+)

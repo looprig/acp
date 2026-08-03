@@ -61,7 +61,7 @@ func TestClaudeConnectorConfigureSetsExactContract(t *testing.T) {
 }
 
 func TestClaudeConnectorConfigureSetsOptionalCLIPath(t *testing.T) {
-	c := ClaudeCode(ClaudeModels{Default: "primary"})
+	c := ClaudeCode(ClaudeModels{Default: "primary", Small: "small"})
 	c.CLIPath = "/usr/local/bin/claude"
 
 	out, err := c.Configure(stdio.Command{Path: "/opt/claude-agent-acp"}, ProxyBinding{BaseURL: "http://x", Token: "t"})
@@ -90,6 +90,50 @@ func TestClaudeConnectorConfigureWithoutProxyOmitsGatewayOverrides(t *testing.T)
 	}
 	if len(out.Args) != 0 {
 		t.Fatalf("native args = %#v, want empty", out.Args)
+	}
+}
+
+func TestClaudeConnectorConfigureWithoutProxyAcceptsMissingOrPartialModels(t *testing.T) {
+	for name, models := range map[string]ClaudeModels{
+		"both aliases empty":  {Default: "", Small: ""},
+		"default alias empty": {Default: "", Small: "small"},
+		"small alias empty":   {Default: "primary", Small: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := ClaudeCode(models)
+
+			out, err := c.configureWithoutProxy(stdio.Command{
+				Path: "/opt/claude-agent-acp",
+				Env:  []string{"PATH=/usr/bin", "LANG=C"},
+			})
+			if err != nil {
+				t.Fatalf("ConfigureWithoutProxy() error = %v, want native configuration to allow empty aliases", err)
+			}
+			if got := envMap(out.Env); len(got) != 2 || got["PATH"] != "/usr/bin" || got["LANG"] != "C" {
+				t.Fatalf("native env = %#v, want only caller environment", got)
+			}
+			if len(out.Args) != 0 {
+				t.Fatalf("native args = %#v, want empty", out.Args)
+			}
+		})
+	}
+}
+
+func TestClaudeConnectorConfigureRejectsMissingOrPartialModels(t *testing.T) {
+	for name, models := range map[string]ClaudeModels{
+		"both aliases empty":  {Default: "", Small: ""},
+		"default alias empty": {Default: "", Small: "small"},
+		"small alias empty":   {Default: "primary", Small: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := ClaudeCode(models)
+
+			_, err := c.Configure(stdio.Command{Path: "/opt/claude-agent-acp"}, ProxyBinding{BaseURL: "http://x", Token: "t"})
+			var cfgErr *ConfigError
+			if !errors.As(err, &cfgErr) {
+				t.Fatalf("Configure() error = %v (%T), want *ConfigError before launch", err, err)
+			}
+		})
 	}
 }
 
@@ -139,7 +183,7 @@ func TestClaudeConnectorConfigureRejectsNonAbsolutePath(t *testing.T) {
 }
 
 func TestClaudeConnectorConfigureRejectsNonAbsoluteCLIPath(t *testing.T) {
-	c := ClaudeCode(ClaudeModels{Default: "primary"})
+	c := ClaudeCode(ClaudeModels{Default: "primary", Small: "small"})
 	c.CLIPath = "claude"
 
 	_, err := c.Configure(stdio.Command{Path: "/opt/claude-agent-acp"}, ProxyBinding{BaseURL: "http://x", Token: "t"})
@@ -153,7 +197,7 @@ func TestClaudeConnectorConfigureRejectsNonAbsoluteCLIPath(t *testing.T) {
 }
 
 func TestClaudeConnectorConfigureRejectsPreexistingCLAUDECODE(t *testing.T) {
-	c := ClaudeCode(ClaudeModels{Default: "primary"})
+	c := ClaudeCode(ClaudeModels{Default: "primary", Small: "small"})
 
 	cmd := stdio.Command{
 		Path: "/opt/claude-agent-acp",

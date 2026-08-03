@@ -327,6 +327,67 @@ func (h *noProxyFakeHarness) configureWithoutProxy(cmd stdio.Command) (stdio.Com
 
 func (h *noProxyFakeHarness) noProxyCalls() int { return h.noProxyCallsValue }
 
+type publicNativeFakeHarness struct {
+	nativeCalls  int
+	gatewayCalls int
+}
+
+func (h *publicNativeFakeHarness) Configure(cmd stdio.Command, _ ProxyBinding) (stdio.Command, error) {
+	h.gatewayCalls++
+	return cmd, nil
+}
+
+func (h *publicNativeFakeHarness) ConfigureNative(cmd stdio.Command) (stdio.Command, error) {
+	h.nativeCalls++
+	cmd.Args = []string{"native-only"}
+	return cmd, nil
+}
+
+func TestDialNativeUsesPublicNativeHarnessWithoutPrivateSeam(t *testing.T) {
+	harness := &publicNativeFakeHarness{}
+	conn := newFakeConn()
+	var configured stdio.Command
+
+	mc, err := dialNative(context.Background(), NativeConfig{
+		Harness: harness,
+		Command: stdio.Command{Path: "/opt/native-acp", Env: []string{"PATH=/usr/bin"}},
+	}, func(_ context.Context, cmd stdio.Command, _ client.Options) (connCloser, error) {
+		configured = cmd
+		return conn, nil
+	})
+	if err != nil {
+		t.Fatalf("dialNative() error = %v", err)
+	}
+	defer func() { _ = mc.Close(context.Background()) }()
+
+	if harness.nativeCalls != 1 || harness.gatewayCalls != 0 {
+		t.Fatalf("native/gateway calls = %d/%d, want 1/0", harness.nativeCalls, harness.gatewayCalls)
+	}
+	if !equalStrings(configured.Args, []string{"native-only"}) {
+		t.Fatalf("configured args = %v, want public native adapter output", configured.Args)
+	}
+	if mc.owned != nil {
+		t.Fatal("DialNative returned an owned proxy, want native launch to have no proxy")
+	}
+}
+
+func TestDialNativeRejectsNilHarness(t *testing.T) {
+	_, err := DialNative(context.Background(), NativeConfig{})
+	var cfgErr *ConfigError
+	if !errors.As(err, &cfgErr) {
+		t.Fatalf("DialNative() error = %v (%T), want *ConfigError", err, err)
+	}
+}
+
+func TestBuiltInConnectorsExposeNativeHarnessAdapter(t *testing.T) {
+	if _, ok := any(ClaudeCode(ClaudeModels{})).(NativeHarnessAdapter); !ok {
+		t.Fatal("ClaudeConnector does not implement NativeHarnessAdapter")
+	}
+	if _, ok := any(Codex("")).(NativeHarnessAdapter); !ok {
+		t.Fatal("CodexConnector does not implement NativeHarnessAdapter")
+	}
+}
+
 // --- owned startup precedes command configuration and ACP dial ---
 
 func TestDialOwnedProxyOrdering(t *testing.T) {

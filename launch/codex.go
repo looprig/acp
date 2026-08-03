@@ -49,14 +49,15 @@ const (
 // caller-supplied absolute path to the codex-acp executable itself (this
 // connector never performs PATH lookup, invokes npx, or installs anything
 // -- discovery and installation are entirely the caller's responsibility,
-// the same rule claude-agent-acp's Configure follows). The returned
-// Command's Args is entirely replaced with the fixed, ordered `-c
-// key=value` override sequence codexConfigArgs builds (never merged with
-// cmd's own caller-supplied Args: codex-acp's config surface is this
-// connector's exclusive concern, the same "replace rather than merge"
-// precedent claude-agent-acp's Configure sets); its Env carries
-// LOOPRIG_PROXY_TOKEN and never CODEX_HOME. cmd is never mutated; the
-// returned Command is always a fresh copy (see buildChildCommand).
+// the same rule claude-agent-acp's Configure follows). Gateway configuration
+// requires Model to be non-empty. The returned Command's Args is entirely
+// replaced with the fixed, ordered `-c key=value` override sequence
+// codexConfigArgs builds (never merged with cmd's own caller-supplied Args:
+// codex-acp's config surface is this connector's exclusive concern, the same
+// "replace rather than merge" precedent claude-agent-acp's Configure sets);
+// its Env carries LOOPRIG_PROXY_TOKEN and never CODEX_HOME. cmd is never
+// mutated; the returned Command is always a fresh copy (see
+// buildChildCommand).
 func (c *CodexConnector) Configure(cmd stdio.Command, binding ProxyBinding) (stdio.Command, error) {
 	return c.configure(cmd, binding, true)
 }
@@ -68,11 +69,17 @@ func (c *CodexConnector) configureWithoutProxy(cmd stdio.Command) (stdio.Command
 	return c.configure(cmd, ProxyBinding{}, false)
 }
 
+// ConfigureNative implements NativeHarnessAdapter. An empty Model is
+// intentionally passed through so codex-acp can choose its own model.
+func (c *CodexConnector) ConfigureNative(cmd stdio.Command) (stdio.Command, error) {
+	return c.configureWithoutProxy(cmd)
+}
+
 func (c *CodexConnector) configure(cmd stdio.Command, binding ProxyBinding, gateway bool) (stdio.Command, error) {
 	if !cleanAbsolutePath(cmd.Path) {
 		return stdio.Command{}, &PathError{Field: "Path", Reason: "must be a clean absolute path to codex-acp"}
 	}
-	if c.Model == "" {
+	if gateway && c.Model == "" {
 		return stdio.Command{}, &ConfigError{Reason: "CodexConnector.Model is required"}
 	}
 
@@ -99,12 +106,15 @@ func (c *CodexConnector) configure(cmd stdio.Command, binding ProxyBinding, gate
 }
 
 func codexNativeConfigArgs(model string, posture CodexPosture) []string {
-	pairs := [...][2]string{
-		{"model", model},
-		{"approval_policy", posture.ApprovalPolicy},
-		{"sandbox_mode", posture.SandboxMode},
-		{"sandbox_workspace_write.network_access", strconv.FormatBool(posture.SandboxNetworkAccess)},
+	pairs := make([][2]string, 0, 4)
+	if model != "" {
+		pairs = append(pairs, [2]string{"model", model})
 	}
+	pairs = append(pairs,
+		[2]string{"approval_policy", posture.ApprovalPolicy},
+		[2]string{"sandbox_mode", posture.SandboxMode},
+		[2]string{"sandbox_workspace_write.network_access", strconv.FormatBool(posture.SandboxNetworkAccess)},
+	)
 	args := make([]string, 0, len(pairs)*2)
 	for _, p := range pairs {
 		args = append(args, "-c", p[0]+"="+p[1])

@@ -17,7 +17,8 @@ import (
 // ClaudeModels selects the harness-facing aliases for Claude Code's default
 // and lightweight ("small") model roles: the two values SelectDefaultModel
 // and SelectSmallModel look up among the connected adapter's advertised
-// "model" select config option.
+// "model" select config option. Gateway configuration requires both aliases;
+// native no-proxy configuration permits either or both to be empty.
 type ClaudeModels struct {
 	Default string
 	Small   string
@@ -64,8 +65,9 @@ type sessionConfigurer interface {
 // claudecode.go rely on are actually satisfied by the real types they are
 // meant for.
 var (
-	_ sessionConfigurer = (*client.Session)(nil)
-	_ HarnessAdapter    = (*ClaudeConnector)(nil)
+	_ sessionConfigurer    = (*client.Session)(nil)
+	_ HarnessAdapter       = (*ClaudeConnector)(nil)
+	_ NativeHarnessAdapter = (*ClaudeConnector)(nil)
 )
 
 // SelectDefaultModel applies c.Models.Default via session/set_config_option
@@ -80,12 +82,16 @@ func (c *ClaudeConnector) SelectSmallModel(ctx context.Context, sess *client.Ses
 	return c.selectModel(ctx, sess, c.Models.Small)
 }
 
-// selectModel finds sess's "model" category config option, resolves alias
-// against its advertised select values, and applies it via
-// Session.SetConfigOption. A missing model option, or an alias that
-// matches none of its advertised values, fails with *ModelAliasError --
-// never a silent no-op, and never a wire call at all in that case.
+// selectModel finds sess's "model" category config option, resolves a
+// non-empty alias against its advertised select values, and applies it via
+// Session.SetConfigOption. An empty alias is a deliberate no-op. A missing
+// model option, or a non-empty alias that matches none of its advertised
+// values, fails with *ModelAliasError -- never a wire call at all in either
+// case.
 func (c *ClaudeConnector) selectModel(ctx context.Context, sess sessionConfigurer, alias string) error {
+	if alias == "" {
+		return nil
+	}
 	configID, valueID, ok := resolveModelSelection(sess.ConfigOptions(), alias)
 	if !ok {
 		return &ModelAliasError{Alias: alias}

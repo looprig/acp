@@ -132,7 +132,7 @@ func validateConfig(cfg Config) error {
 		if cfg.OwnedProxy != nil || cfg.SharedProxy != nil {
 			return &ConfigError{Reason: "NoProxy is mutually exclusive with OwnedProxy and SharedProxy"}
 		}
-		if _, ok := cfg.Harness.(noProxyHarnessAdapter); !ok {
+		if !supportsNativeHarness(cfg.Harness) {
 			return &ConfigError{Reason: "NoProxy requires a no-proxy harness adapter"}
 		}
 		return nil
@@ -145,6 +145,24 @@ func validateConfig(cfg Config) error {
 		return &ConfigError{Reason: "OwnedProxy and SharedProxy are mutually exclusive, both were set"}
 	}
 	return nil
+}
+
+func supportsNativeHarness(h HarnessAdapter) bool {
+	if _, ok := h.(NativeHarnessAdapter); ok {
+		return true
+	}
+	_, ok := h.(noProxyHarnessAdapter)
+	return ok
+}
+
+func configureNative(h HarnessAdapter, cmd stdio.Command) (stdio.Command, error) {
+	if native, ok := h.(NativeHarnessAdapter); ok {
+		return native.ConfigureNative(cmd)
+	}
+	if legacy, ok := h.(noProxyHarnessAdapter); ok {
+		return legacy.configureWithoutProxy(cmd)
+	}
+	return stdio.Command{}, &ConfigError{Reason: "NoProxy requires a no-proxy harness adapter"}
 }
 
 // Dial validates cfg, starts an owned proxy (if configured), configures
@@ -160,6 +178,27 @@ func validateConfig(cfg Config) error {
 // in the first place, so there is nothing to unwind for it.
 func Dial(ctx context.Context, cfg Config) (*ManagedClient, error) {
 	return dial(ctx, cfg, defaultConnect)
+}
+
+// DialNative launches an ACP harness using its own authentication and model
+// selection. It deliberately constructs the existing Config.NoProxy form and
+// sends it through Dial, so all established no-proxy validation and lifecycle
+// behavior remains in one place. NativeConfig has no proxy fields, making it
+// impossible for this helper to start or borrow a model proxy.
+func DialNative(ctx context.Context, cfg NativeConfig) (*ManagedClient, error) {
+	return dialNative(ctx, cfg, defaultConnect)
+}
+
+func dialNative(ctx context.Context, cfg NativeConfig, connect connectFunc) (*ManagedClient, error) {
+	if cfg.Harness == nil {
+		return nil, &ConfigError{Reason: "NativeConfig.Harness is required"}
+	}
+	return dial(ctx, Config{
+		NoProxy: true,
+		Harness: cfg.Harness,
+		Command: cfg.Command,
+		Client:  cfg.Client,
+	}, connect)
 }
 
 func dial(ctx context.Context, cfg Config, connect connectFunc) (*ManagedClient, error) {
@@ -191,7 +230,7 @@ func dial(ctx context.Context, cfg Config, connect connectFunc) (*ManagedClient,
 		err error
 	)
 	if cfg.NoProxy {
-		cmd, err = cfg.Harness.(noProxyHarnessAdapter).configureWithoutProxy(cfg.Command)
+		cmd, err = configureNative(cfg.Harness, cfg.Command)
 	} else {
 		cmd, err = cfg.Harness.Configure(cfg.Command, binding)
 	}

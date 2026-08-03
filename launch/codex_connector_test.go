@@ -150,11 +150,11 @@ func TestCodexModelChangeDialsANewSessionRatherThanSwitchingInPlace(t *testing.T
 // forbids for Codex ("no post-session model-switching RPC call is ever
 // attempted"). Unlike ClaudeConnector (see claude_connector.go's
 // SelectDefaultModel/SelectSmallModel/ApplyPermissionMode, which
-// deliberately DO accept a *client.Session), CodexConnector's only method
-// besides Configure is WithModel, which operates purely on Go values. If a
-// later change adds any session-touching method to CodexConnector, this
-// test fails immediately, forcing a conscious decision rather than a
-// silent regression.
+// deliberately DO accept a *client.Session), CodexConnector's Configure and
+// ConfigureNative methods only configure fresh process commands, while
+// WithModel operates purely on Go values. If a later change adds any
+// session-touching method to CodexConnector, this test fails immediately,
+// forcing a conscious decision rather than a silent regression.
 func TestCodexConnectorMethodSetNeverTouchesSessionOrCapabilityTypes(t *testing.T) {
 	disallowed := []reflect.Type{
 		reflect.TypeOf((*client.Session)(nil)),
@@ -181,14 +181,15 @@ func TestCodexConnectorMethodSetNeverTouchesSessionOrCapabilityTypes(t *testing.
 	}
 }
 
-// TestCodexConnectorMethodSetIsExactlyConfigureAndWithModel locks down
-// CodexConnector's exported surface: Configure (its HarnessAdapter
-// contract) and WithModel (its "recreate the session" mechanism), and
-// nothing else -- reinforcing the same intent as the type-based check
-// above with an explicit, human-readable method list.
-func TestCodexConnectorMethodSetIsExactlyConfigureAndWithModel(t *testing.T) {
+// TestCodexConnectorMethodSetIsExactlyConfigureConfigureNativeAndWithModel
+// locks down CodexConnector's exported surface: Configure and ConfigureNative
+// (its gateway and native HarnessAdapter contracts) and WithModel (its
+// "recreate the session" mechanism), and nothing else -- reinforcing the
+// same intent as the type-based check above with an explicit, human-readable
+// method list.
+func TestCodexConnectorMethodSetIsExactlyConfigureConfigureNativeAndWithModel(t *testing.T) {
 	typ := reflect.TypeOf(&CodexConnector{})
-	want := map[string]bool{"Configure": true, "WithModel": true}
+	want := map[string]bool{"Configure": true, "ConfigureNative": true, "WithModel": true}
 	if typ.NumMethod() != len(want) {
 		names := make([]string, typ.NumMethod())
 		for i := 0; i < typ.NumMethod(); i++ {

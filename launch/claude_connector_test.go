@@ -256,6 +256,25 @@ func TestSelectModelReturnsTypedAliasMismatchWhenNoModelOptionAdvertised(t *test
 	}
 }
 
+func TestSelectModelNoOpsForEmptyAliasWithoutCallingWire(t *testing.T) {
+	for name, opts := range map[string][]protocol.SessionConfigOption{
+		"model option advertised": {modelOptionWithID("model", "sonnet", "opus")},
+		"model option absent":     nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			sess := &fakeSession{configOptions: opts}
+			c := ClaudeCode(ClaudeModels{})
+
+			if err := c.selectModel(context.Background(), sess, ""); err != nil {
+				t.Fatalf("selectModel() error = %v, want nil for an empty alias", err)
+			}
+			if len(sess.setConfigCalls) != 0 {
+				t.Fatalf("SetConfigOption called %d times, want 0 for an empty alias", len(sess.setConfigCalls))
+			}
+		})
+	}
+}
+
 func TestSelectDefaultAndSmallModelUseTheirOwnAlias(t *testing.T) {
 	c := ClaudeCode(ClaudeModels{Default: "opus", Small: "haiku"})
 	opts := []protocol.SessionConfigOption{modelOptionWithID("model", "haiku", "sonnet", "opus")}

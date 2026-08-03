@@ -77,10 +77,27 @@ type HarnessAdapter interface {
 	Configure(stdio.Command, ProxyBinding) (stdio.Command, error)
 }
 
+// NativeHarnessAdapter configures a child to use the harness's own
+// authentication and model selection. ConfigureNative must preserve the
+// same command-copying, absolute-path, environment, and credential-safety
+// rules as Configure. Explicit native model selection may produce a
+// caller-selected model override (for example, Codex `-c model`), while
+// ConfigureNative must never add gateway URL, gateway token, or gateway
+// provider/base-url overrides. When the model is omitted, model selection
+// remains harness-managed.
+//
+// It embeds HarnessAdapter so one connector has an explicit, reviewable
+// gateway path and native path rather than an ambiguous Configure call whose
+// behavior depends on the binding value.
+type NativeHarnessAdapter interface {
+	HarnessAdapter
+	ConfigureNative(stdio.Command) (stdio.Command, error)
+}
+
 // noProxyHarnessAdapter is the internal launch seam for connectors that can
 // configure a child without gateway URL, token, or provider overrides. It is
-// selected only when Config.NoProxy is explicitly true; the public
-// HarnessAdapter path remains gateway-backed.
+// retained for compatibility with the original internal Config.NoProxy path;
+// new callers should use NativeHarnessAdapter and DialNative.
 type noProxyHarnessAdapter interface {
 	configureWithoutProxy(stdio.Command) (stdio.Command, error)
 }
@@ -101,7 +118,8 @@ type Config struct {
 	SharedProxy *ProxyBinding
 	// NoProxy explicitly selects a child-owned authentication path. It is
 	// mutually exclusive with OwnedProxy and SharedProxy and requires Harness
-	// to implement the internal no-proxy connector seam.
+	// to implement either NativeHarnessAdapter or the legacy internal no-proxy
+	// connector seam. New callers should prefer DialNative.
 	NoProxy bool
 	// Harness configures Command for whichever ProxyBinding results from
 	// OwnedProxy or SharedProxy.
@@ -114,4 +132,13 @@ type Config struct {
 	// Client is passed through unchanged to the underlying acp/client
 	// connection.
 	Client client.Options
+}
+
+// NativeConfig is the proxy-free configuration accepted by DialNative. Its
+// shape deliberately has no OwnedProxy, SharedProxy, or binding field, so a
+// native launch cannot accidentally acquire gateway lifecycle or credentials.
+type NativeConfig struct {
+	Harness NativeHarnessAdapter
+	Command stdio.Command
+	Client  client.Options
 }

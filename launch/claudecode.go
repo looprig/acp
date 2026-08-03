@@ -35,11 +35,12 @@ const (
 // caller-supplied absolute path to the claude-agent-acp executable itself
 // (this connector never performs PATH lookup, invokes npx, or installs
 // anything -- discovery and installation are entirely the caller's
-// responsibility); the returned Command always has an empty argument list
-// (claude-agent-acp takes none) and carries ANTHROPIC_BASE_URL/
-// ANTHROPIC_AUTH_TOKEN set to binding's values, plus CLAUDE_CODE_EXECUTABLE
-// if c.CLIPath is set. cmd is never mutated; the returned Command is always
-// a fresh copy (see buildChildCommand).
+// responsibility); gateway configuration requires both ClaudeModels aliases;
+// the returned Command always has an empty argument list (claude-agent-acp
+// takes none) and carries ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN set to
+// binding's values, plus CLAUDE_CODE_EXECUTABLE if c.CLIPath is set. cmd is
+// never mutated; the returned Command is always a fresh copy (see
+// buildChildCommand).
 func (c *ClaudeConnector) Configure(cmd stdio.Command, binding ProxyBinding) (stdio.Command, error) {
 	return c.configure(cmd, binding, true)
 }
@@ -51,9 +52,19 @@ func (c *ClaudeConnector) configureWithoutProxy(cmd stdio.Command) (stdio.Comman
 	return c.configure(cmd, ProxyBinding{}, false)
 }
 
+// ConfigureNative implements NativeHarnessAdapter. It leaves Claude Code's
+// login and model picker in control when either or both model aliases are
+// omitted.
+func (c *ClaudeConnector) ConfigureNative(cmd stdio.Command) (stdio.Command, error) {
+	return c.configureWithoutProxy(cmd)
+}
+
 func (c *ClaudeConnector) configure(cmd stdio.Command, binding ProxyBinding, gateway bool) (stdio.Command, error) {
 	if !cleanAbsolutePath(cmd.Path) {
 		return stdio.Command{}, &PathError{Field: "Path", Reason: "must be a clean absolute path to claude-agent-acp"}
+	}
+	if gateway && (c.Models.Default == "" || c.Models.Small == "") {
+		return stdio.Command{}, &ConfigError{Reason: "ClaudeConnector.Models.Default and Small are required for gateway configuration"}
 	}
 
 	overrides := make([]envOverride, 0, 3)

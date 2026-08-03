@@ -90,6 +90,35 @@ func TestCodexConnectorConfigureWithoutProxyOmitsGatewayOverrides(t *testing.T) 
 	}
 }
 
+func TestCodexConnectorConfigureWithoutProxyAllowsEmptyModel(t *testing.T) {
+	c := Codex("")
+
+	out, err := c.configureWithoutProxy(stdio.Command{
+		Path: "/opt/codex-acp",
+		Env:  []string{"PATH=/usr/bin", "LANG=C"},
+	})
+	if err != nil {
+		t.Fatalf("ConfigureWithoutProxy() error = %v, want native configuration to allow an empty model", err)
+	}
+	want := []string{
+		"-c", "approval_policy=on-request",
+		"-c", "sandbox_mode=workspace-write",
+		"-c", "sandbox_workspace_write.network_access=false",
+	}
+	if !equalStrings(out.Args, want) {
+		t.Fatalf("native args = %#v, want %#v without a model or gateway provider overrides", out.Args, want)
+	}
+	for _, arg := range out.Args {
+		if arg == "model=" || arg == "model_provider=looprig" || len(arg) >= len("model_providers.") && arg[:len("model_providers.")] == "model_providers." {
+			t.Fatalf("native args contain gateway/model override %q: %#v", arg, out.Args)
+		}
+	}
+	env := envMap(out.Env)
+	if len(env) != 2 || env["PATH"] != "/usr/bin" || env["LANG"] != "C" {
+		t.Fatalf("native env = %#v, want only caller environment", env)
+	}
+}
+
 func TestCodexConnectorConfigureWithoutProxyRetainsValidationAndDenylist(t *testing.T) {
 	c := Codex("gpt-5-codex")
 
