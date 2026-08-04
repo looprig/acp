@@ -2,6 +2,7 @@ package event
 
 import (
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/looprig/core/content"
@@ -48,6 +49,7 @@ const (
 	FieldCause              FieldName = "Cause"
 	FieldCommandID          FieldName = "CommandID"
 	FieldActiveLoopID       FieldName = "ActiveLoopID"
+	FieldCategory           FieldName = "Category"
 	FieldModel              FieldName = "Model"
 	FieldModelKey           FieldName = "ModelKey"
 	FieldContextLimits      FieldName = "ContextLimits"
@@ -58,6 +60,8 @@ const (
 	FieldDefinition         FieldName = "Definition"
 	FieldRunID              FieldName = "RunID"
 	FieldRuntime            FieldName = "Runtime"
+	FieldAgentRuntime       FieldName = "AgentRuntime"
+	FieldACPSessionID       FieldName = "ACPSessionID"
 	FieldDuration           FieldName = "Duration"
 	FieldStage              FieldName = "Stage"
 	FieldReasonCode         FieldName = "ReasonCode"
@@ -182,6 +186,10 @@ func validateEventBody(ev Event) error {
 		if e.ActiveLoopID.IsZero() {
 			return &InvalidEventError{Event: "ActiveLoopChanged", Field: FieldActiveLoopID, Rule: RuleRequired}
 		}
+	case LoopRestoreTombstoned:
+		if !ValidLoopRestoreTombstoneCategory(e.Category) {
+			return &InvalidEventError{Event: "LoopRestoreTombstoned", Field: FieldCategory, Rule: RuleInvalid}
+		}
 	case DelegateRequestAccepted:
 		if e.Cause.CommandID.IsZero() {
 			return &InvalidEventError{Event: "DelegateRequestAccepted", Field: FieldCommandID, Rule: RuleRequired}
@@ -195,7 +203,33 @@ func validateEventBody(ev Event) error {
 	case IntegrationStatus:
 		return validateIntegrationStatus(e)
 	case LoopStarted:
-		return validateModelRuntime("LoopStarted", e.Runtime)
+		if e.Runtime == (ModelRuntime{}) {
+			if e.AgentRuntime == nil {
+				return nil
+			}
+			if err := validateAgentRuntime(*e.AgentRuntime); err != nil {
+				return err
+			}
+			if e.AgentRuntime.Source != "native" || e.AgentRuntime.SelectionKind != "harness-managed" {
+				return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+			}
+			return nil
+		}
+		if err := validateModelRuntime("LoopStarted", e.Runtime); err != nil {
+			return err
+		}
+		if e.AgentRuntime != nil {
+			if err := validateAgentRuntime(*e.AgentRuntime); err != nil {
+				return err
+			}
+			if e.AgentRuntime.Source == "native" && e.AgentRuntime.SelectionKind == "harness-managed" {
+				return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+			}
+		}
+	case LoopAgentSessionBound:
+		if !validAgentRuntimeIdentifier(e.ACPSessionID, false) || e.ACPSessionID == "" {
+			return &InvalidEventError{Event: "LoopAgentSessionBound", Field: FieldACPSessionID, Rule: RuleInvalid}
+		}
 	case ContextMeasured:
 		if e.Visibility() != Public {
 			return &InvalidEventError{Event: "ContextMeasured", Field: FieldVisibility, Rule: RuleInvalid}
@@ -356,6 +390,13 @@ func invalidPermissionReview(name EventName, field FieldName) error {
 // the journal, and a legacy (SchemaVersion 0) manifest projection is never
 // persisted.
 const (
+	maxAgentRuntimeIdentityBytes = 128
+	// maxRuntimeManifestIdentifierBytes bounds the current-schema runtime
+	// identity fields. They are opaque identifiers at this boundary: the
+	// producer owns their meaning, while the journal only accepts the bounded,
+	// secret-free alphabet used by runtime profiles and revisions.
+	maxRuntimeManifestIdentifierBytes = 128
+
 	// The manifest is decoded from untrusted journal input, so its collections
 	// are capped defense-in-depth. The caps are generous: they never trip a
 	// legitimate configuration, only an abusive one.
@@ -368,7 +409,10 @@ const (
 	// disjoint, plus thirteen manifest scalar-field categories including hook
 	// policy. Restore may append one root-agent-name change after AssessDrift,
 	// so that slot is explicit too. It still bounds a decoded hostile event.
-	maxConfigDriftScalarChanges  = 13
+	// Runtime identity contributes three additional bounded scalar changes, and
+	// a configured permission-review policy can contribute one more, each of
+	// which is fail-closed.
+	maxConfigDriftScalarChanges  = 17
 	maxConfigDriftAgentNameSlots = 1
 	maxConfigDriftChanges        = 2*maxConfigManifestTools + 2*maxConfigManifestAppFields + maxConfigDriftScalarChanges + maxConfigDriftAgentNameSlots
 	// MaxConfigMessageLen and MaxConfigActorLen bound the durable, partly
@@ -379,6 +423,87 @@ const (
 	MaxConfigMessageLen = 4096
 	MaxConfigActorLen   = 1024
 )
+
+func validateAgentRuntime(v AgentRuntime) error {
+	if v.Harness == "" || v.Profile == "" || v.CredentialMode == "" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleRequired}
+	}
+	if v.CredentialMode != "native-auth" && v.CredentialMode != "gateway-backed" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	if (v.Source == "") != (v.SelectionKind == "") {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	if v.Source != "" && v.Source != "gateway" && v.Source != "native" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	if v.SelectionKind != "" && v.SelectionKind != "explicit" && v.SelectionKind != "harness-managed" {
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+	}
+	if v.Source != "" {
+		if (v.Source == "gateway" && v.CredentialMode != "gateway-backed") || (v.Source == "native" && v.CredentialMode != "native-auth") {
+			return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+		}
+		if v.SelectionKind == "harness-managed" {
+			if v.Source != "native" || v.ModelAlias != "" || v.SmallModelAlias != "" {
+				return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+			}
+		} else if v.ModelAlias == "" {
+			return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleRequired}
+		}
+	} else if v.ModelAlias == "" {
+		// Legacy AgentRuntime records predate source and selection_kind and
+		// always carried a concrete model alias.
+		return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleRequired}
+	}
+	for _, candidate := range []struct {
+		value      string
+		allowSlash bool
+	}{
+		{v.Harness, false},
+		{v.Profile, true},
+		{v.CredentialMode, false},
+		{v.Source, false},
+		{v.SelectionKind, false},
+		{v.ModelAlias, false},
+		{v.SmallModelAlias, false},
+		{v.ACPSessionID, false},
+	} {
+		if candidate.value != "" && !validAgentRuntimeIdentifier(candidate.value, candidate.allowSlash) {
+			return &InvalidEventError{Event: "LoopStarted", Field: FieldAgentRuntime, Rule: RuleInvalid}
+		}
+	}
+	return nil
+}
+
+func validAgentRuntimeIdentifier(value string, allowSlash bool) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > maxAgentRuntimeIdentityBytes || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return false
+	}
+	if strings.Contains(value, "://") || strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~/") || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") {
+		return false
+	}
+	if !allowSlash && strings.Contains(value, "/") {
+		return false
+	}
+	if allowSlash && strings.Contains(value, "\\") {
+		return false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+		for _, r := range segment {
+			if r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || unicode.IsSpace(r) {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // validateConfigurationAdopted enforces the config-epoch invariants: epoch 1
 // belongs to SessionStarted so an adoption is always >= 2, the adopted
@@ -431,12 +556,51 @@ func validConfigManifestSchema(manifest ConfigManifest, allowLegacy bool) bool {
 		// HookPolicyRev did not exist in schema v1 and is deliberately excluded
 		// from its historical canonical layout. Reject it rather than accepting
 		// policy state that the fingerprint cannot authenticate.
-		return manifest.HookPolicyRev == ""
+		return manifest.HookPolicyRev == "" && zeroRuntimeManifest(manifest)
+	case 2:
+		// Schema v2 has no runtime identity fields. Reject populated fields rather
+		// than accepting data the v2 fingerprint does not authenticate.
+		return zeroRuntimeManifest(manifest)
 	case ManifestSchemaVersion:
-		return true
+		return validRuntimeManifestIdentifier(manifest.RuntimeProfile) &&
+			validRuntimeManifestIdentifier(manifest.RuntimeCatalogRev) &&
+			validRuntimeManifestIdentifier(manifest.RuntimeIdentityRev)
 	default:
 		return false
 	}
+}
+
+// validRuntimeManifestIdentifier validates one current-schema runtime identity
+// field. Empty is valid because native and legacy sessions have no runtime
+// override. Non-empty values are deliberately treated as opaque: this helper
+// does not interpret profiles, catalog revisions, or digests. It only bounds
+// them and permits the identifier alphabet emitted by the runtime producers.
+func validRuntimeManifestIdentifier(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) > maxRuntimeManifestIdentifierBytes || !utf8.ValidString(value) {
+		return false
+	}
+	if strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+		for _, r := range segment {
+			if r == '\\' || r == ':' || r == 0 || unicode.IsControl(r) || unicode.IsSpace(r) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func zeroRuntimeManifest(manifest ConfigManifest) bool {
+	return manifest.RuntimeProfile == "" && manifest.RuntimeCatalogRev == "" &&
+		manifest.RuntimeIdentityRev == ""
 }
 
 func invalidHustle(name EventName, field FieldName) *InvalidEventError {
@@ -748,6 +912,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "WorkspaceRestored", sessionProfile(), true
 	case ActiveLoopChanged:
 		return "ActiveLoopChanged", sessionProfile(), true
+	case LoopRestoreTombstoned:
+		return "LoopRestoreTombstoned", loopProfile(), true
 	case IntegrationStatus:
 		// Session-scoped: an integration is a session-global resource, not a
 		// loop's. Same shape as WorkspaceCheckpointed — only SessionID set.
@@ -793,6 +959,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "CompactWaiterRejected", loopProfile(), true
 	case ForeignSessionBound:
 		return "ForeignSessionBound", loopProfile(), true
+	case LoopAgentSessionBound:
+		return "LoopAgentSessionBound", loopProfile(), true
 	case TokenDelta:
 		return "TokenDelta", stepProfile(), true
 	case TurnStarted:

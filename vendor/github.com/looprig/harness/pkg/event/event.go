@@ -109,7 +109,7 @@ type Header struct {
 	// Cause is the direct cause of this event. For UserInput/SubagentResult
 	// resolution events (TurnStarted, TurnFoldedInto, InputCancelled, InputQueued,
 	// TurnRejected), Cause.CommandID is the submit command id. For an event caused by
-	// a SubagentResult, Cause.LoopID is the producing subagent's loop id (its
+	// a SubagentResult, Cause.LoopID is the producing agent's loop id (its
 	// quiescence wake token). Cause.Agency surfaces who caused it, but ONLY the turn-
 	// resolution events stamp it — TurnStarted, TurnFoldedInto, and InputCancelled
 	// (per design §444-446); InputQueued and TurnRejected carry Cause.CommandID but
@@ -412,6 +412,32 @@ type ActiveLoopChanged struct {
 	ActiveLoopID   uuid.UUID `json:"active_loop_id"`
 }
 
+// LoopRestoreTombstoneCategory is the bounded reason a restored child was kept
+// in the durable topology without a live backend.
+const (
+	LoopRestoreTombstoneRuntimeMismatch    = "runtime_mismatch"
+	LoopRestoreTombstoneRuntimeUnavailable = "runtime_unavailable"
+)
+
+func ValidLoopRestoreTombstoneCategory(category string) bool {
+	switch category {
+	case LoopRestoreTombstoneRuntimeMismatch, LoopRestoreTombstoneRuntimeUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+// LoopRestoreTombstoned records that a non-root child survived restore as a
+// closed, failed registry entry because its durable runtime could not be
+// re-authorized against the current runtime catalog.
+type LoopRestoreTombstoned struct {
+	enduring
+	loopScoped
+	Header
+	Category string `json:"category"`
+}
+
 // LoopIdle is emitted when a loop parks with no active turn. Header.SessionID and
 // Header.LoopID are set; TurnID/StepID are zero. It drives session quiescence.
 type LoopIdle struct {
@@ -430,8 +456,9 @@ type LoopStarted struct {
 	Header
 	// Runtime is the initial resolved model identity, limits, and effort. It is
 	// durable so restore and catalog repair never consult a mutable catalog.
-	Runtime ModelRuntime `json:"runtime,omitzero"`
-	// ParentToolUseID is the durable provider tool-use id of the Subagent tool call
+	Runtime      ModelRuntime  `json:"runtime,omitzero"`
+	AgentRuntime *AgentRuntime `json:"agent_runtime,omitempty"`
+	// ParentToolUseID is the durable provider tool-use id of the agent tool call
 	// that spawned this loop (content.ToolUseBlock.ID), empty for loops not spawned by
 	// a tool call (e.g. the primary/root). It is the durable carrier that correlates a
 	// child loop back to its parent tool call across persist/restore; omitzero so old
@@ -457,6 +484,19 @@ type LoopStarted struct {
 	Description string `json:"description,omitzero"`
 }
 
+// AgentRuntime is the bounded, secret-free identity of the runtime selected for
+// a loop. It is additive so legacy LoopStarted records decode with nil.
+type AgentRuntime struct {
+	Harness         string `json:"harness"`
+	Profile         string `json:"profile"`
+	CredentialMode  string `json:"credential_mode"`
+	Source          string `json:"source,omitempty"`
+	SelectionKind   string `json:"selection_kind,omitempty"`
+	ModelAlias      string `json:"model_alias"`
+	SmallModelAlias string `json:"small_model_alias,omitempty"`
+	ACPSessionID    string `json:"acp_session_id,omitempty"`
+}
+
 // DelegateRequestAccepted is the durable actor-side acceptance of a follow-up
 // machine NoFold request, emitted before it can queue or start.
 type DelegateRequestAccepted struct {
@@ -475,6 +515,14 @@ type ForeignSessionBound struct {
 	ForeignSID string `json:"foreign_sid"`
 }
 
+// LoopAgentSessionBound records the durable foreign agent session binding for a loop.
+type LoopAgentSessionBound struct {
+	enduring
+	loopScoped
+	Header
+	ACPSessionID string `json:"acp_session_id"`
+}
+
 func (SessionStarted) isEvent()          {}
 func (SessionActive) isEvent()           {}
 func (SessionIdle) isEvent()             {}
@@ -489,7 +537,9 @@ func (ConfigurationAdopted) isEvent()    {}
 func (WorkspaceCheckpointed) isEvent()   {}
 func (WorkspaceRestored) isEvent()       {}
 func (ActiveLoopChanged) isEvent()       {}
+func (LoopRestoreTombstoned) isEvent()   {}
 func (LoopIdle) isEvent()                {}
 func (LoopStarted) isEvent()             {}
 func (DelegateRequestAccepted) isEvent() {}
 func (ForeignSessionBound) isEvent()     {}
+func (LoopAgentSessionBound) isEvent()   {}

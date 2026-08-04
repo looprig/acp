@@ -135,11 +135,11 @@ github.com/gorilla/websocket
 # github.com/invopop/jsonschema v0.14.0
 ## explicit; go 1.24
 github.com/invopop/jsonschema
-# github.com/looprig/core v0.4.0
+# github.com/looprig/core v0.5.0
 ## explicit; go 1.25.8
 github.com/looprig/core/content
 github.com/looprig/core/uuid
-# github.com/looprig/harness v0.18.0
+# github.com/looprig/harness v0.19.0
 ## explicit; go 1.26.4
 github.com/looprig/harness/internal/pathutil
 github.com/looprig/harness/pkg/command
