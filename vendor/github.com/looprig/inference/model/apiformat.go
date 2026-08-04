@@ -17,4 +17,8 @@ const (
 	// (POST /v1/responses), distinct from APIFormatOpenAI which names OpenAI
 	// Chat Completions.
 	APIFormatOpenAIResponses APIFormat = "openai-responses"
+
+	// APIFormatBedrockConverse names Amazon Bedrock's model-neutral Converse
+	// and ConverseStream APIs.
+	APIFormatBedrockConverse APIFormat = "bedrock-converse"
 )

@@ -34,7 +34,7 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
-	github.com/looprig/inference v0.6.0 // indirect
+	github.com/looprig/inference v0.7.0 // indirect
 	github.com/looprig/storage v0.3.0 // indirect
 	github.com/openai/openai-go/v3 v3.42.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect

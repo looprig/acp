@@ -153,7 +153,7 @@ github.com/looprig/harness/pkg/loop
 github.com/looprig/harness/pkg/sessionstore
 github.com/looprig/harness/pkg/tool
 github.com/looprig/harness/pkg/workspacestore
-# github.com/looprig/inference v0.6.0
+# github.com/looprig/inference v0.7.0
 ## explicit; go 1.26.4
 github.com/looprig/inference
 github.com/looprig/inference/codec
