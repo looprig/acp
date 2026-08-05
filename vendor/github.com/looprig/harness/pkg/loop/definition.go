@@ -58,6 +58,7 @@ type definitionState struct {
 	contextCounter      contextcount.ContextCounter
 	counterCapability   contextcount.CounterCapability
 	inferenceCapability contextcount.InferenceCapability
+	contextTransports   []ContextTransport
 	contextObservation  ContextObservationPolicy
 	compaction          CompactionPolicy
 	output              *inference.OutputSchema
@@ -169,6 +170,7 @@ func Define(opts ...Option) (Definition, error) {
 	state.model = cloneModel(state.model)
 	state.tools = append([]tool.Definition(nil), state.tools...)
 	state.middlewares = append([]tool.ToolMiddleware(nil), state.middlewares...)
+	state.contextTransports = append([]ContextTransport(nil), state.contextTransports...)
 	state.delegates = dedupeDelegates(state.delegates)
 	state.modes = cloneModes(state.modes)
 	if state.output != nil {
@@ -192,10 +194,11 @@ func validateContextDefinition(resolved *definitionOptions) error {
 	_, hasCapability := resolved.seen["inference_capability"]
 	_, hasObservation := resolved.seen["context_observation"]
 	_, hasCompaction := resolved.seen["compaction"]
+	_, hasContextTransports := resolved.seen["context_transports"]
 	if hasObservation && hasCompaction {
 		return &DefinitionError{Kind: DefinitionConflictingContextPolicy, Field: "context_policy"}
 	}
-	if (hasCapability || hasObservation || hasCompaction) && !hasCounter {
+	if (hasCapability || hasObservation || hasCompaction || hasContextTransports) && !hasCounter {
 		return &DefinitionError{Kind: DefinitionMissingContextCounter, Field: "context_counter"}
 	}
 	if hasCounter && !hasCapability {
@@ -220,6 +223,53 @@ func validateContextDefinition(resolved *definitionOptions) error {
 	if err := contextcount.CompatibleCounter(resolved.inferenceCapability, capability); err != nil {
 		return &DefinitionError{Kind: DefinitionIncompatibleContextCounter, Field: "context_counter", Cause: err}
 	}
+	// Resolve the complete admitted ContextTransport set for this loop and
+	// freeze it onto resolved.contextTransports, which the mode-binding loop
+	// below reads directly. Omitting WithContextTransports synthesizes a
+	// one-element set from the base WithInference model and
+	// WithInferenceCapability value, byte-identical to the historical
+	// single-transport behavior. A caller-supplied set must: contain no
+	// duplicate (Provider, APIFormat, BaseURL) members; have every member's
+	// Capability pass Capability.Validate(); have every member's Capability
+	// compatible with the declared context counter via
+	// contextcount.CompatibleCounter; and contain a member matching the base
+	// model's own transport identity whose Capability matches
+	// WithInferenceCapability exactly.
+	transports := resolved.contextTransports
+	if len(transports) == 0 {
+		transports = []ContextTransport{{
+			Provider: resolved.model.Provider, APIFormat: resolved.model.APIFormat, BaseURL: resolved.model.BaseURL,
+			Capability: resolved.inferenceCapability,
+		}}
+	} else {
+		baseKey := transportKeyOf(resolved.model)
+		foundBase := false
+		seen := make(map[contextTransportKey]struct{}, len(transports))
+		for _, transport := range transports {
+			key := contextTransportKey{Provider: transport.Provider, APIFormat: transport.APIFormat, BaseURL: transport.BaseURL}
+			if _, duplicate := seen[key]; duplicate {
+				return &DefinitionError{Kind: DefinitionDuplicateContextTransport, Field: "context_transports"}
+			}
+			seen[key] = struct{}{}
+			if err := transport.Capability.Validate(); err != nil {
+				return &DefinitionError{Kind: DefinitionInvalidContextTransport, Field: "context_transports", Cause: err}
+			}
+			if err := contextcount.CompatibleCounter(transport.Capability, capability); err != nil {
+				return &DefinitionError{Kind: DefinitionIncompatibleContextCounter, Field: "context_transports", Cause: err}
+			}
+			if key != baseKey {
+				continue
+			}
+			foundBase = true
+			if transport.Capability != resolved.inferenceCapability {
+				return &DefinitionError{Kind: DefinitionInvalidContextTransport, Field: "context_transports"}
+			}
+		}
+		if !foundBase {
+			return &DefinitionError{Kind: DefinitionInvalidContextTransport, Field: "context_transports"}
+		}
+	}
+	resolved.contextTransports = transports
 	if hasCompaction {
 		if err := resolved.compaction.Validate(capability); err != nil {
 			return &DefinitionError{Kind: DefinitionInvalidCompaction, Field: "compaction", Cause: err}
@@ -234,7 +284,7 @@ func validateContextDefinition(resolved *definitionOptions) error {
 		if zeroModel(mode.Model) {
 			continue
 		}
-		if err := validateContextTransportBinding(resolved.model, mode.Model); err != nil {
+		if err := validateContextTransportMembership(resolved.contextTransports, mode.Model); err != nil {
 			return &DefinitionError{Kind: DefinitionInvalidModeBinding, Field: "mode.model", Value: string(mode.Name), Cause: err}
 		}
 	}
@@ -358,6 +408,9 @@ func (d Definition) Delegation() Delegation {
 // PolicyRevision returns a deterministic, secret-free digest of immutable loop
 // behavior used by a rig topology fingerprint. Opaque function-valued collaborators
 // require WithPolicyRevision, whose caller-supplied identity is included here.
+// Adding, removing, or changing a hashed field here shifts this digest for
+// every existing consumer once, surfacing as an ordinary one-time
+// Info-severity DriftTopology on their next restore — expected, not a bug.
 func (d Definition) PolicyRevision() string {
 	if d.state == nil {
 		return ""
@@ -416,6 +469,7 @@ func (d Definition) PolicyRevision() string {
 		PolicyRevision      string
 		CounterCapability   *contextcount.CounterCapability
 		InferenceCapability *contextcount.InferenceCapability
+		ContextTransports   []ContextTransport
 		ContextObservation  *ContextObservationPolicy
 		Compaction          *CompactionPolicy
 		OutputPolicy        *outputPolicyIdentity `json:",omitempty"`
@@ -427,11 +481,27 @@ func (d Definition) PolicyRevision() string {
 		PolicyRevision: d.state.policyRevision,
 		OutputPolicy:   d.state.outputPolicy,
 	}
+	// ContextTransports (and its siblings below) only ever populate here:
+	// validateContextDefinition rejects WithContextTransports without
+	// WithContextCounter (DefinitionMissingContextCounter), so
+	// d.state.contextTransports is provably empty whenever contextCounter is
+	// nil — a future change to that coupling must touch both sites together.
 	if d.state.contextCounter != nil {
 		counter := d.state.counterCapability
 		capability := d.state.inferenceCapability
 		projection.CounterCapability = &counter
 		projection.InferenceCapability = &capability
+		transports := append([]ContextTransport(nil), d.state.contextTransports...)
+		slices.SortFunc(transports, func(a, b ContextTransport) int {
+			if c := strings.Compare(string(a.Provider), string(b.Provider)); c != 0 {
+				return c
+			}
+			if c := strings.Compare(string(a.APIFormat), string(b.APIFormat)); c != 0 {
+				return c
+			}
+			return strings.Compare(a.BaseURL, b.BaseURL)
+		})
+		projection.ContextTransports = transports
 	}
 	if d.state.compaction.CountTimeout != 0 {
 		policy := d.state.compaction
@@ -648,6 +718,10 @@ type BoundDefinition interface {
 	ContextCounter() contextcount.ContextCounter
 	CounterCapability() (contextcount.CounterCapability, bool)
 	InferenceCapability() (contextcount.InferenceCapability, bool)
+	// ContextTransportCapability resolves the declared InferenceCapability for
+	// model's transport, or (zero, false) if that transport is not a member of
+	// this definition's declared ContextTransport set.
+	ContextTransportCapability(model.Model) (contextcount.InferenceCapability, bool)
 	ContextObservationPolicy() (ContextObservationPolicy, bool)
 	CompactionPolicy() (CompactionPolicy, bool)
 	OutputSchema() (*inference.OutputSchema, bool)
@@ -719,6 +793,9 @@ func (b *boundDefinitionState) CounterCapability() (contextcount.CounterCapabili
 }
 func (b *boundDefinitionState) InferenceCapability() (contextcount.InferenceCapability, bool) {
 	return b.definition.inferenceCapability, b.definition.contextCounter != nil
+}
+func (b *boundDefinitionState) ContextTransportCapability(m model.Model) (contextcount.InferenceCapability, bool) {
+	return lookupTransport(b.definition.contextTransports, m)
 }
 func (b *boundDefinitionState) ContextObservationPolicy() (ContextObservationPolicy, bool) {
 	return b.definition.contextObservation, b.definition.contextObservation.CountTimeout != 0
@@ -830,6 +907,24 @@ func WithInferenceCapability(capability contextcount.InferenceCapability) Option
 	}
 }
 
+// WithContextTransports declares the complete set of (wire transport -> trust
+// posture) pairs a live model switch or predeclared mode is allowed to move
+// to. Omitting it synthesizes a one-element set from the base WithInference
+// model and WithInferenceCapability value, byte-identical to today's
+// single-transport behavior. Requires WithContextCounter; see
+// validateContextDefinition for the full set of validations applied to a
+// declared set.
+func WithContextTransports(transports ...ContextTransport) Option {
+	transports = append([]ContextTransport(nil), transports...)
+	return func(o *definitionOptions) error {
+		if err := o.singleton("context_transports"); err != nil {
+			return err
+		}
+		o.contextTransports = transports
+		return nil
+	}
+}
+
 // WithContextObservation installs explicit hard-admission policy without
 // enabling conversation compaction.
 func WithContextObservation(policy ContextObservationPolicy) Option {
@@ -869,7 +964,9 @@ func (d Definition) ContextObservationPolicy() (ContextObservationPolicy, bool) 
 	return d.state.contextObservation, true
 }
 
-// ValidateContextModel checks structural validity and the fixed transport binding.
+// ValidateContextModel checks structural validity and that model's transport
+// identity (Provider/APIFormat/BaseURL) is a member of this definition's
+// declared ContextTransport set (see WithContextTransports).
 func (d Definition) ValidateContextModel(model model.Model) error {
 	if d.state == nil {
 		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "model"}
@@ -887,7 +984,10 @@ func validateDefinitionContextModel(state *definitionState, model model.Model) e
 	if state.contextCounter == nil {
 		return nil
 	}
-	return validateContextTransportBinding(state.model, model)
+	if _, ok := lookupTransport(state.contextTransports, model); !ok {
+		return &ContextTransportNotDeclaredError{Provider: model.Provider, APIFormat: model.APIFormat, BaseURL: model.BaseURL}
+	}
+	return nil
 }
 
 // WithDisplayName sets the loop's user-facing presentation label. Purely
