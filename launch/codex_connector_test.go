@@ -56,6 +56,21 @@ func TestCodexConnectorWithModelReturnsIndependentCopy(t *testing.T) {
 	}
 }
 
+func TestCodexConnectorWithModelEffortReturnsIndependentCopy(t *testing.T) {
+	c := Codex("model-a")
+	c2 := c.WithModelEffort("gpt-5.6-sol", "medium")
+
+	if c2 == c {
+		t.Fatal("WithModelEffort() returned the same pointer, want a distinct CodexConnector")
+	}
+	if c2.Model != "gpt-5.6-sol" || c2.Effort != "medium" {
+		t.Fatalf("configured connector = (model %q, effort %q), want (gpt-5.6-sol, medium)", c2.Model, c2.Effort)
+	}
+	if c.Model != "model-a" || c.Effort != "" {
+		t.Fatalf("original connector mutated to (model %q, effort %q), want (model-a, empty)", c.Model, c.Effort)
+	}
+}
+
 // TestCodexModelChangeProducesNewArgvNeverInPlaceMutation proves that
 // "changing the model" is entirely a matter of building a new
 // CodexConnector (via WithModel) and calling Configure again -- the
@@ -181,15 +196,15 @@ func TestCodexConnectorMethodSetNeverTouchesSessionOrCapabilityTypes(t *testing.
 	}
 }
 
-// TestCodexConnectorMethodSetIsExactlyConfigureConfigureNativeAndWithModel
+// TestCodexConnectorMethodSetIsExactlyConfigureConfigureNativeAndSelectors
 // locks down CodexConnector's exported surface: Configure and ConfigureNative
-// (its gateway and native HarnessAdapter contracts) and WithModel (its
-// "recreate the session" mechanism), and nothing else -- reinforcing the
-// same intent as the type-based check above with an explicit, human-readable
-// method list.
-func TestCodexConnectorMethodSetIsExactlyConfigureConfigureNativeAndWithModel(t *testing.T) {
+// (its gateway and native HarnessAdapter contracts) and the immutable selector
+// helpers (its "recreate the session" mechanisms), and nothing else --
+// reinforcing the same intent as the type-based check above with an explicit,
+// human-readable method list.
+func TestCodexConnectorMethodSetIsExactlyConfigureConfigureNativeAndSelectors(t *testing.T) {
 	typ := reflect.TypeOf(&CodexConnector{})
-	want := map[string]bool{"Configure": true, "ConfigureNative": true, "WithModel": true}
+	want := map[string]bool{"Configure": true, "ConfigureNative": true, "WithModel": true, "WithModelEffort": true}
 	if typ.NumMethod() != len(want) {
 		names := make([]string, typ.NumMethod())
 		for i := 0; i < typ.NumMethod(); i++ {

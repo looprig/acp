@@ -71,6 +71,15 @@ type CodexConnector struct {
 	// Required by gateway Configure. Native no-proxy configuration may leave
 	// it empty, in which case no model override is emitted.
 	Model string
+	// Effort is codex-acp's neutral reasoning-effort selector. It is applied
+	// only by native launches, alongside Model, as a separate
+	// model_reasoning_effort override. An empty value leaves effort selection
+	// to Codex itself.
+	Effort string
+	// effortExplicit distinguishes the new paired selector API from the
+	// legacy Codex(model) constructor, whose model-only native behavior is
+	// retained for compatibility with existing callers.
+	effortExplicit bool
 	// Posture is the sandbox/approval posture Configure applies. The
 	// zero value resolves to sane, least-privilege defaults (see
 	// CodexPosture.resolve).
@@ -98,6 +107,19 @@ func Codex(model string) *CodexConnector {
 func (c *CodexConnector) WithModel(model string) *CodexConnector {
 	clone := *c
 	clone.Model = model
+	return &clone
+}
+
+// WithModelEffort returns a new *CodexConnector identical to c except for its
+// native model and reasoning-effort selectors. c itself is never mutated. A
+// model and effort must either both be non-empty or both be empty when the
+// resulting connector is configured for a native launch; ConfigureNative
+// reports a typed ConfigError for a partial pair.
+func (c *CodexConnector) WithModelEffort(model, effort string) *CodexConnector {
+	clone := *c
+	clone.Model = model
+	clone.Effort = effort
+	clone.effortExplicit = true
 	return &clone
 }
 

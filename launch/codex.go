@@ -1,7 +1,8 @@
 // codex.go implements CodexConnector's HarnessAdapter half: the codex-acp
 // adapter's executable, argument, and environment contract. See
 // codex_connector.go for CodexConnector's own type, constructor, and
-// WithModel (its "recreate rather than switch" model-change mechanism).
+// immutable selector APIs (its "recreate rather than switch" model-change
+// mechanism).
 //
 // Configure never runs, spawns, or otherwise reaches for codex-acp's own
 // process: version verification is a distinct, explicit preflight step
@@ -82,6 +83,9 @@ func (c *CodexConnector) configure(cmd stdio.Command, binding ProxyBinding, gate
 	if gateway && c.Model == "" {
 		return stdio.Command{}, &ConfigError{Reason: "CodexConnector.Model is required"}
 	}
+	if !gateway && (c.Effort != "" && c.Model == "" || c.effortExplicit && ((c.Model == "") != (c.Effort == ""))) {
+		return stdio.Command{}, &ConfigError{Reason: "CodexConnector.Model and Effort must be provided together for native configuration"}
+	}
 
 	overrides := make([]envOverride, 0, 1)
 	forbidden := []string{envCodexHome}
@@ -100,15 +104,18 @@ func (c *CodexConnector) configure(cmd stdio.Command, binding ProxyBinding, gate
 	if gateway {
 		out.Args = codexConfigArgs(c.Model, binding.BaseURL, posture)
 	} else {
-		out.Args = codexNativeConfigArgs(c.Model, posture)
+		out.Args = codexNativeConfigArgs(c.Model, c.Effort, posture)
 	}
 	return out, nil
 }
 
-func codexNativeConfigArgs(model string, posture CodexPosture) []string {
-	pairs := make([][2]string, 0, 4)
+func codexNativeConfigArgs(model, effort string, posture CodexPosture) []string {
+	pairs := make([][2]string, 0, 5)
 	if model != "" {
 		pairs = append(pairs, [2]string{"model", model})
+	}
+	if effort != "" {
+		pairs = append(pairs, [2]string{"model_reasoning_effort", effort})
 	}
 	pairs = append(pairs,
 		[2]string{"approval_policy", posture.ApprovalPolicy},

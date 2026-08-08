@@ -9,6 +9,7 @@ package launch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/looprig/acp/client"
 	"github.com/looprig/acp/protocol"
@@ -30,6 +31,10 @@ type ClaudeConnector struct {
 	// Models are the harness-facing model aliases SelectDefaultModel and
 	// SelectSmallModel apply.
 	Models ClaudeModels
+	// Effort is the harness-facing reasoning effort SelectEffort applies via
+	// the advertised thought_level config option. Empty leaves effort
+	// selection to Claude Code.
+	Effort string
 	// CLIPath, if non-empty, must be an absolute path pinning the
 	// underlying `claude` CLI claude-agent-acp drives (CLAUDE_CODE_EXECUTABLE
 	// -- see claudecode.go's Configure). Empty omits the variable entirely.
@@ -82,6 +87,14 @@ func (c *ClaudeConnector) SelectSmallModel(ctx context.Context, sess *client.Ses
 	return c.selectModel(ctx, sess, c.Models.Small)
 }
 
+// SelectEffort applies c.Effort via the connected adapter's advertised
+// thought_level select config option. An omitted effort is a deliberate
+// no-op; an unavailable option or value returns *EffortAliasError without a
+// wire call.
+func (c *ClaudeConnector) SelectEffort(ctx context.Context, sess *client.Session) error {
+	return c.selectEffort(ctx, sess, c.Effort)
+}
+
 // selectModel finds sess's "model" category config option, resolves a
 // non-empty alias against its advertised select values, and applies it via
 // Session.SetConfigOption. An empty alias is a deliberate no-op. A missing
@@ -95,6 +108,21 @@ func (c *ClaudeConnector) selectModel(ctx context.Context, sess sessionConfigure
 	configID, valueID, ok := resolveModelSelection(sess.ConfigOptions(), alias)
 	if !ok {
 		return &ModelAliasError{Alias: alias}
+	}
+	return sess.SetConfigOption(ctx, configID, valueID)
+}
+
+// selectEffort resolves effort against the advertised thought_level select
+// option and applies it. Empty effort is a deliberate no-op. Unlike an
+// unmatched model alias, this uses a distinct typed error so callers can
+// report the bounded selector that failed.
+func (c *ClaudeConnector) selectEffort(ctx context.Context, sess sessionConfigurer, effort string) error {
+	if effort == "" {
+		return nil
+	}
+	configID, valueID, ok := resolveEffortSelection(sess.ConfigOptions(), effort)
+	if !ok {
+		return &EffortAliasError{Effort: effort, Alias: effort}
 	}
 	return sess.SetConfigOption(ctx, configID, valueID)
 }
@@ -129,7 +157,23 @@ func applyPermissionMode(ctx context.Context, sess sessionConfigurer, modeID pro
 // value id. ok is false if no model option is found, if it is not a select
 // option, or if alias matches none of its values.
 func resolveModelSelection(opts []protocol.SessionConfigOption, alias string) (protocol.SessionConfigID, protocol.SessionConfigValueID, bool) {
-	opt, configID, ok := findModelOption(opts)
+	return resolveCategorizedSelection(opts, protocol.SessionConfigOptionCategoryModel, alias)
+}
+
+// resolveEffortSelection finds the advertised thought_level selector and
+// resolves an effort against its values.
+func resolveEffortSelection(opts []protocol.SessionConfigOption, effort string) (protocol.SessionConfigID, protocol.SessionConfigValueID, bool) {
+	return resolveCategorizedSelection(opts, protocol.SessionConfigOptionCategoryThoughtLevel, effort)
+}
+
+// resolveCategorizedSelection is intentionally limited to the two selector
+// categories this connector owns. It is shared by model and thought-level
+// resolution without becoming an arbitrary category/value escape hatch.
+func resolveCategorizedSelection(opts []protocol.SessionConfigOption, category protocol.SessionConfigOptionCategory, alias string) (protocol.SessionConfigID, protocol.SessionConfigValueID, bool) {
+	if category != protocol.SessionConfigOptionCategoryModel && category != protocol.SessionConfigOptionCategoryThoughtLevel {
+		return "", "", false
+	}
+	opt, configID, ok := findSelectOption(opts, category)
 	if !ok {
 		return "", "", false
 	}
@@ -146,8 +190,15 @@ func resolveModelSelection(opts []protocol.SessionConfigOption, alias string) (p
 // any other category (mode, model_config, thought_level, or none at all)
 // are ignored, matching the design doc's "select only category model".
 func findModelOption(opts []protocol.SessionConfigOption) (protocol.SessionConfigOption, protocol.SessionConfigID, bool) {
+	return findSelectOption(opts, protocol.SessionConfigOptionCategoryModel)
+}
+
+func findSelectOption(opts []protocol.SessionConfigOption, category protocol.SessionConfigOptionCategory) (protocol.SessionConfigOption, protocol.SessionConfigID, bool) {
+	if category != protocol.SessionConfigOptionCategoryModel && category != protocol.SessionConfigOptionCategoryThoughtLevel {
+		return protocol.SessionConfigOption{}, "", false
+	}
 	for _, opt := range opts {
-		if opt.Category == nil || *opt.Category != protocol.SessionConfigOptionCategoryModel {
+		if opt.Category == nil || *opt.Category != category {
 			continue
 		}
 		if opt.Select == nil {
@@ -160,6 +211,26 @@ func findModelOption(opts []protocol.SessionConfigOption) (protocol.SessionConfi
 		return opt, id, true
 	}
 	return protocol.SessionConfigOption{}, "", false
+}
+
+// EffortAliasError reports that a requested reasoning-effort selector
+// matched no value the connected adapter's advertised thought_level option
+// exposed. Alias is retained as a compatibility spelling for callers that
+// classify selector errors uniformly; Effort is the canonical field.
+type EffortAliasError struct {
+	Effort string
+	Alias  string
+}
+
+// EffortSelectionError is a descriptive alias for EffortAliasError.
+type EffortSelectionError = EffortAliasError
+
+func (e *EffortAliasError) Error() string {
+	value := e.Effort
+	if value == "" {
+		value = e.Alias
+	}
+	return fmt.Sprintf("acp/launch: effort alias %q not advertised by the connected adapter", value)
 }
 
 // findSelectValue reports whether alias matches a SessionConfigSelectOption

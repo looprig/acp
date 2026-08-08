@@ -119,6 +119,57 @@ func TestCodexConnectorConfigureWithoutProxyAllowsEmptyModel(t *testing.T) {
 	}
 }
 
+func TestCodexNativeEffortEmitsSeparateModelAndEffortOverrides(t *testing.T) {
+	c := Codex("").WithModelEffort("gpt-5.6-sol", "medium")
+
+	out, err := c.ConfigureNative(stdio.Command{Path: "/opt/codex-acp"})
+	if err != nil {
+		t.Fatalf("ConfigureNative() error = %v", err)
+	}
+
+	wantPrefix := []string{
+		"-c", "model=gpt-5.6-sol",
+		"-c", "model_reasoning_effort=medium",
+	}
+	if len(out.Args) < len(wantPrefix) || !equalStrings(out.Args[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("native args = %#v, want separate model and effort overrides %v", out.Args, wantPrefix)
+	}
+	for _, arg := range out.Args {
+		if arg == "model=gpt-5.6-sol:medium" || arg == "model=gpt-5.6-sol-medium" {
+			t.Fatalf("native args combined model and effort into %q: %#v", arg, out.Args)
+		}
+	}
+}
+
+func TestCodexNativeOmittedModelAndEffortEmitNeitherOverride(t *testing.T) {
+	c := Codex("").WithModelEffort("", "")
+
+	out, err := c.ConfigureNative(stdio.Command{Path: "/opt/codex-acp"})
+	if err != nil {
+		t.Fatalf("ConfigureNative() error = %v, want omitted selectors to be a no-op", err)
+	}
+	for i := 0; i+1 < len(out.Args); i += 2 {
+		if out.Args[i+1] == "model=" || out.Args[i+1] == "model_reasoning_effort=" || out.Args[i+1] == "model_reasoning_effort" {
+			t.Fatalf("native args contain an omitted selector override %q: %#v", out.Args[i+1], out.Args)
+		}
+	}
+}
+
+func TestCodexNativePartialModelEffortSelectionReturnsTypedConfigError(t *testing.T) {
+	for name, connector := range map[string]*CodexConnector{
+		"model without effort": Codex("").WithModelEffort("gpt-5.6-sol", ""),
+		"effort without model": Codex("").WithModelEffort("", "medium"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := connector.ConfigureNative(stdio.Command{Path: "/opt/codex-acp"})
+			var cfgErr *ConfigError
+			if !errors.As(err, &cfgErr) {
+				t.Fatalf("ConfigureNative() error = %v (%T), want *ConfigError", err, err)
+			}
+		})
+	}
+}
+
 func TestCodexConnectorConfigureWithoutProxyRetainsValidationAndDenylist(t *testing.T) {
 	c := Codex("gpt-5-codex")
 

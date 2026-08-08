@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -23,6 +24,22 @@ func modelOptionWithID(id protocol.SessionConfigID, values ...string) protocol.S
 		ID:       id,
 		Name:     "Model",
 		Category: categoryPtr(protocol.SessionConfigOptionCategoryModel),
+		Select: &protocol.SessionConfigSelect{
+			CurrentValue: protocol.SessionConfigValueID(values[0]),
+			Options:      protocol.SessionConfigSelectOptions{Ungrouped: opts},
+		},
+	}
+}
+
+func thoughtLevelOptionWithID(id protocol.SessionConfigID, values ...string) protocol.SessionConfigOption {
+	opts := make([]protocol.SessionConfigSelectOption, len(values))
+	for i, v := range values {
+		opts[i] = protocol.SessionConfigSelectOption{Name: v, Value: protocol.SessionConfigValueID(v)}
+	}
+	return protocol.SessionConfigOption{
+		ID:       id,
+		Name:     "Thought level",
+		Category: categoryPtr(protocol.SessionConfigOptionCategoryThoughtLevel),
 		Select: &protocol.SessionConfigSelect{
 			CurrentValue: protocol.SessionConfigValueID(values[0]),
 			Options:      protocol.SessionConfigSelectOptions{Ungrouped: opts},
@@ -306,6 +323,59 @@ func TestSelectModelPropagatesSetConfigOptionError(t *testing.T) {
 
 	if err := c.selectModel(context.Background(), sess, "opus"); !errors.Is(err, wantErr) {
 		t.Fatalf("selectModel() error = %v, want to wrap %v", err, wantErr)
+	}
+}
+
+func TestClaudeSelectEffortAppliesAdvertisedThoughtLevelAfterModel(t *testing.T) {
+	c := ClaudeCode(ClaudeModels{Default: "sonnet"})
+	c.Effort = "high"
+	sess := &fakeSession{configOptions: []protocol.SessionConfigOption{
+		modelOptionWithID("model", "sonnet", "opus"),
+		thoughtLevelOptionWithID("thought", "medium", "high"),
+	}}
+
+	if err := c.selectModel(context.Background(), sess, c.Models.Default); err != nil {
+		t.Fatalf("selectModel() error = %v", err)
+	}
+	if err := c.selectEffort(context.Background(), sess, c.Effort); err != nil {
+		t.Fatalf("selectEffort() error = %v", err)
+	}
+
+	want := []setConfigCall{{ConfigID: "model", ValueID: "sonnet"}, {ConfigID: "thought", ValueID: "high"}}
+	if !reflect.DeepEqual(sess.setConfigCalls, want) {
+		t.Fatalf("SetConfigOption calls = %#v, want ordered %#v", sess.setConfigCalls, want)
+	}
+}
+
+func TestClaudeSelectEffortReturnsTypedErrorWithoutCallingWire(t *testing.T) {
+	for name, opts := range map[string][]protocol.SessionConfigOption{
+		"missing thought level option": {modelOptionWithID("model", "sonnet")},
+		"unadvertised effort":          {thoughtLevelOptionWithID("thought", "medium")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sess := &fakeSession{configOptions: opts}
+			err := ClaudeCode(ClaudeModels{}).selectEffort(context.Background(), sess, "high")
+			var effortErr *EffortAliasError
+			if !errors.As(err, &effortErr) {
+				t.Fatalf("selectEffort() error = %v (%T), want *EffortAliasError", err, err)
+			}
+			if effortErr.Effort != "high" {
+				t.Errorf("EffortAliasError.Effort = %q, want %q", effortErr.Effort, "high")
+			}
+			if len(sess.setConfigCalls) != 0 {
+				t.Fatalf("SetConfigOption called %d times, want 0 for an unadvertised effort", len(sess.setConfigCalls))
+			}
+		})
+	}
+}
+
+func TestClaudeSelectEffortNoOpsForEmptySelector(t *testing.T) {
+	sess := &fakeSession{configOptions: []protocol.SessionConfigOption{thoughtLevelOptionWithID("thought", "medium", "high")}}
+	if err := ClaudeCode(ClaudeModels{}).selectEffort(context.Background(), sess, ""); err != nil {
+		t.Fatalf("selectEffort() error = %v, want nil for an omitted selector", err)
+	}
+	if len(sess.setConfigCalls) != 0 {
+		t.Fatalf("SetConfigOption called %d times, want 0 for an omitted selector", len(sess.setConfigCalls))
 	}
 }
 
