@@ -277,6 +277,45 @@ func TestConnWaitForNotificationsThroughDoesNotWaitForLaterNotification(t *testi
 	}
 }
 
+type dispatchReleaseContext struct {
+	release func()
+	once    sync.Once
+}
+
+func (c *dispatchReleaseContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *dispatchReleaseContext) Done() <-chan struct{} {
+	c.once.Do(c.release)
+	return nil
+}
+
+func (c *dispatchReleaseContext) Err() error { return nil }
+
+func (c *dispatchReleaseContext) Value(any) any { return nil }
+
+func TestConnReceiveBarrierWaitsForNotificationDispatchRegistration(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	clientReader, clientWriter := io.Pipe()
+	client := NewConn(clientReader, clientWriter, ConnOptions{})
+	t.Cleanup(func() { client.Close() })
+
+	sequence := client.beginReceiveNotification()
+	handlerDone := make(chan struct{})
+	ctx := &dispatchReleaseContext{release: func() {
+		client.enqueueTrackedNotifyJob(sequence, func() { close(handlerDone) })
+		client.finishReceiveNotification(sequence)
+	}}
+
+	if err := client.WaitForNotificationsThrough(ctx, sequence); err != nil {
+		t.Fatalf("WaitForNotificationsThrough() error = %v", err)
+	}
+	select {
+	case <-handlerDone:
+	default:
+		t.Fatal("receive barrier returned before notification handler completion")
+	}
+}
+
 func TestConnCallContextCancelRemovesPendingEntry(t *testing.T) {
 	assertNoGoroutineLeakInternal(t)
 

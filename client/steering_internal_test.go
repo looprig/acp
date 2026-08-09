@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/looprig/acp/protocol"
 )
 
-func TestPromptAndUpdateCarryMonotonicReceiveSequencesAndBarrier(t *testing.T) {
+func TestOrderedCallPromptAndUpdateCarryMonotonicReceiveSequencesAndBarrier(t *testing.T) {
 	c, fa := dialTestClient(t, Options{})
 	sess := newSessionForTest(t, c, fa, "sess-ordered")
 	fa.onPrompt = func(ctx context.Context, fa *fakeAgent, req protocol.PromptRequest) (protocol.PromptResponse, error) {
@@ -63,7 +64,7 @@ type clientUpdateObservation struct {
 	open   bool
 }
 
-func TestSessionSteerUsesFixedMethodAndTypedOutcome(t *testing.T) {
+func TestExtensionSteerUsesFixedMethodAndTypedOutcome(t *testing.T) {
 	c, fa := dialTestClient(t, Options{})
 	sess := newSessionForTest(t, c, fa, "sess-steer")
 
@@ -111,11 +112,11 @@ func TestSessionSteerUsesFixedMethodAndTypedOutcome(t *testing.T) {
 	}
 }
 
-func TestSessionSteerReturnsTypedPeerError(t *testing.T) {
+func TestExtensionSteerReturnsBoundedTypedPeerError(t *testing.T) {
 	c, fa := dialTestClient(t, Options{})
 	sess := newSessionForTest(t, c, fa, "sess-steer-error")
 	fa.conn.Handle("_session/steering", func(context.Context, string, json.RawMessage) (any, error) {
-		return nil, protocol.InvalidParams("steering rejected", nil)
+		return nil, protocol.InvalidParams("steering rejected", nil).WithData(map[string]string{"secret": "must-not-leak"})
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -127,8 +128,88 @@ func TestSessionSteerReturnsTypedPeerError(t *testing.T) {
 	if result.WriteAdmitted == false {
 		t.Fatal("Steer() reported false write admission after peer response")
 	}
-	var fault *protocol.Fault
-	if !errors.As(err, &fault) {
-		t.Fatalf("Steer() error = %v (%T), want *protocol.Fault", err, err)
+	var steeringErr *SteeringError
+	if !errors.As(err, &steeringErr) {
+		t.Fatalf("Steer() error = %v (%T), want *SteeringError", err, err)
+	}
+	if steeringErr.Code != protocol.ErrorCodeInvalidParams {
+		t.Fatalf("SteeringError.Code = %d, want %d", steeringErr.Code, protocol.ErrorCodeInvalidParams)
+	}
+	if steeringErr.ReceiveSequence == 0 || !steeringErr.WriteAdmitted {
+		t.Fatalf("SteeringError facts = %#v, want admitted response sequence", steeringErr)
+	}
+	if strings.Contains(steeringErr.Error(), "must-not-leak") {
+		t.Fatalf("SteeringError leaked wire data: %q", steeringErr.Error())
+	}
+}
+
+func TestSteeringErrorBoundsHostileFaultMessageAndData(t *testing.T) {
+	const secret = "wire-secret-must-not-leak"
+	fault := &protocol.Fault{
+		Code:    protocol.ErrorCodeInvalidParams,
+		Message: strings.Repeat("x", 4<<20) + secret,
+		Data:    json.RawMessage(strings.Repeat("{\"secret\":\""+secret+"\"}", 4<<20/len(secret))),
+	}
+	err := newSteeringError(fault, protocol.CallResult{
+		WriteAdmitted:    true,
+		ResponseSequence: 42,
+	})
+	var steeringErr *SteeringError
+	if !errors.As(err, &steeringErr) {
+		t.Fatalf("newSteeringError() = %T, want *SteeringError", err)
+	}
+	if len(steeringErr.Message) > maxSteeringErrorMessageBytes {
+		t.Fatalf("SteeringError.Message length = %d, want <= %d", len(steeringErr.Message), maxSteeringErrorMessageBytes)
+	}
+	if strings.Contains(steeringErr.Error(), secret) {
+		t.Fatalf("SteeringError leaked hostile wire data")
+	}
+	if steeringErr.ResponseSequence != 42 || !steeringErr.WriteAdmitted {
+		t.Fatalf("SteeringError facts = %#v, want admission and sequence", steeringErr)
+	}
+}
+
+func TestOrderedCallPromptErrorPreservesFactsBeforeExtensionReply(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	sess := newSessionForTest(t, c, fa, "sess-ordered-error")
+	fa.onPrompt = func(ctx context.Context, fa *fakeAgent, req protocol.PromptRequest) (protocol.PromptResponse, error) {
+		if err := fa.client.SessionUpdate(ctx, protocol.SessionNotification{
+			SessionID: req.SessionID,
+			Update:    chunkText("before-prompt-error"),
+		}); err != nil {
+			return protocol.PromptResponse{}, err
+		}
+		return protocol.PromptResponse{}, protocol.InvalidParams("prompt rejected", nil)
+	}
+	fa.conn.Handle("_session/steering", func(context.Context, string, json.RawMessage) (any, error) {
+		return map[string]any{"outcome": "injected"}, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	promptResult, promptErr := sess.Prompt(ctx, nil)
+	if promptErr == nil {
+		t.Fatal("Prompt() error = nil, want peer error")
+	}
+	if promptResult == nil {
+		t.Fatal("Prompt() result = nil on peer error, want ordered transport facts")
+	}
+	if !promptResult.WriteAdmitted || promptResult.ReceiveSequence == 0 {
+		t.Fatalf("Prompt() facts = %#v, want admitted response sequence", promptResult)
+	}
+	if err := sess.WaitForUpdatesThrough(ctx, promptResult.ReceiveSequence); err != nil {
+		t.Fatalf("WaitForUpdatesThrough() error = %v", err)
+	}
+	update := <-sess.Updates()
+	if update.ReceiveSequence == 0 || update.ReceiveSequence >= promptResult.ReceiveSequence {
+		t.Fatalf("Update.ReceiveSequence = %d, PromptResult.ReceiveSequence = %d; want update first", update.ReceiveSequence, promptResult.ReceiveSequence)
+	}
+
+	steerResult, steerErr := sess.Steer(ctx, SteerParams{Prompt: nil})
+	if steerErr != nil {
+		t.Fatalf("Steer() error = %v", steerErr)
+	}
+	if steerResult.ReceiveSequence <= promptResult.ReceiveSequence {
+		t.Fatalf("SteerResult.ReceiveSequence = %d, PromptResult.ReceiveSequence = %d; want extension reply later", steerResult.ReceiveSequence, promptResult.ReceiveSequence)
 	}
 }

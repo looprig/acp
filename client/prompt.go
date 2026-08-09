@@ -49,7 +49,15 @@ func (s *Session) Prompt(ctx context.Context, blocks []protocol.ContentBlock) (*
 
 	resp, facts, err := agent.PromptWithResult(ctx, protocol.PromptRequest{SessionID: s.id, Prompt: blocks})
 	if err != nil {
-		return nil, wrapConnError(err)
+		// Preserve ordered transport facts even when the peer rejects the
+		// prompt. The response body is absent on an error, so only the facts
+		// fields are populated; callers that only inspect err keep the old
+		// success-path API unchanged.
+		return &PromptResult{
+			ReceiveSequence:  facts.ResponseSequence,
+			ResponseSequence: facts.ResponseSequence,
+			WriteAdmitted:    facts.WriteAdmitted,
+		}, wrapConnError(err)
 	}
 	return &PromptResult{
 		StopReason:       resp.StopReason,

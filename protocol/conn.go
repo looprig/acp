@@ -182,7 +182,13 @@ type Conn struct {
 
 	receiveMu      sync.Mutex
 	receiveThrough uint64
-	receiveChanged chan struct{}
+	// receiveDispatchPending covers the interval after an inbound
+	// notification receives its sequence and before dispatchNotification has
+	// recorded either a handler job or a buffer entry. WaitForNotificationsThrough
+	// waits on this map so publication of receiveThrough cannot overtake that
+	// registration boundary.
+	receiveDispatchPending map[uint64]struct{}
+	receiveChanged         chan struct{}
 }
 
 // NewConn wraps r and w as one JSON-RPC connection and starts its internal
@@ -190,21 +196,22 @@ type Conn struct {
 // and for Call/Notify immediately.
 func NewConn(r io.Reader, w io.Writer, opts ConnOptions) *Conn {
 	c := &Conn{
-		fr:                NewFrameReader(r),
-		writer:            NewWriter(w),
-		r:                 r,
-		w:                 w,
-		pending:           make(map[ID]chan callResult),
-		handlers:          make(map[string]HandlerFunc),
-		notifyHandlers:    make(map[string]NotifyFunc),
-		notifySeqHandlers: make(map[string]NotifyWithSequenceFunc),
-		notifyBuffers:     make(map[string][]bufferedNotification),
-		sem:               make(chan struct{}, MaxInFlightHandlers),
-		done:              make(chan struct{}),
-		readLoopDone:      make(chan struct{}),
-		receiveChanged:    make(chan struct{}),
-		notifyPending:     make(map[uint64]struct{}),
-		notifyChanged:     make(chan struct{}),
+		fr:                     NewFrameReader(r),
+		writer:                 NewWriter(w),
+		r:                      r,
+		w:                      w,
+		pending:                make(map[ID]chan callResult),
+		handlers:               make(map[string]HandlerFunc),
+		notifyHandlers:         make(map[string]NotifyFunc),
+		notifySeqHandlers:      make(map[string]NotifyWithSequenceFunc),
+		notifyBuffers:          make(map[string][]bufferedNotification),
+		sem:                    make(chan struct{}, MaxInFlightHandlers),
+		done:                   make(chan struct{}),
+		readLoopDone:           make(chan struct{}),
+		receiveChanged:         make(chan struct{}),
+		notifyPending:          make(map[uint64]struct{}),
+		notifyChanged:          make(chan struct{}),
+		receiveDispatchPending: make(map[uint64]struct{}),
 	}
 	c.notifyCond = sync.NewCond(&c.notifyMu)
 
@@ -257,12 +264,21 @@ func (c *Conn) WaitForNotificationsThrough(ctx context.Context, receiveSequence 
 	}
 	for {
 		c.receiveMu.Lock()
-		if c.receiveThrough >= receiveSequence {
-			c.receiveMu.Unlock()
-			break
+		observed := c.receiveThrough >= receiveSequence
+		dispatchPending := false
+		if observed {
+			for seq := range c.receiveDispatchPending {
+				if seq <= receiveSequence {
+					dispatchPending = true
+					break
+				}
+			}
 		}
 		changed := c.receiveChanged
 		c.receiveMu.Unlock()
+		if observed && !dispatchPending {
+			break
+		}
 		select {
 		case <-changed:
 		case <-c.done:
@@ -687,9 +703,10 @@ func (c *Conn) readLoop() {
 		case KindRequest:
 			c.dispatchRequest(env.Request)
 		case KindNotification:
-			seq := c.stampReceive()
+			seq := c.beginReceiveNotification()
 			env.Notification.ReceiveSequence = seq
 			c.dispatchNotification(env.Notification)
+			c.finishReceiveNotification(seq)
 		case KindResponse:
 			seq := c.stampReceive()
 			env.Response.ReceiveSequence = seq
@@ -710,6 +727,32 @@ func (c *Conn) stampReceive() uint64 {
 	c.receiveChanged = make(chan struct{})
 	c.receiveMu.Unlock()
 	return seq
+}
+
+// beginReceiveNotification advances the shared receive clock and records the
+// notification as dispatch-pending before publishing the new sequence. This
+// is the first half of the ordered notification admission boundary; the
+// matching finishReceiveNotification runs only after dispatchNotification has
+// recorded a registered handler job or buffered the notification.
+func (c *Conn) beginReceiveNotification() uint64 {
+	c.receiveMu.Lock()
+	c.receiveThrough++
+	seq := c.receiveThrough
+	c.receiveDispatchPending[seq] = struct{}{}
+	close(c.receiveChanged)
+	c.receiveChanged = make(chan struct{})
+	c.receiveMu.Unlock()
+	return seq
+}
+
+// finishReceiveNotification closes the dispatch-pending interval after the
+// notification has been admitted to the registered handler queue or buffer.
+func (c *Conn) finishReceiveNotification(sequence uint64) {
+	c.receiveMu.Lock()
+	delete(c.receiveDispatchPending, sequence)
+	close(c.receiveChanged)
+	c.receiveChanged = make(chan struct{})
+	c.receiveMu.Unlock()
 }
 
 // correlateResponse delivers resp to the pending Call waiting on its id, if

@@ -196,6 +196,16 @@ type Writer struct {
 	// admitted after Close begins waiting.
 	senders  sync.WaitGroup
 	admitted sync.WaitGroup
+	// queued is guarded by mu and mirrors the number of jobs currently in the
+	// buffered queue. It lets admission reserve a slot and increment admitted
+	// before the channel send, so runJob can never call Done before Add.
+	queued int
+	// queueSpace is replaced and closed whenever a queue slot is consumed or
+	// Writer closes. SendContextResult waits on the current generation after a
+	// non-blocking enqueue attempt, then rechecks context cancellation while
+	// holding mu. That makes cancellation-versus-admission a single
+	// linearization point instead of a select race between two ready cases.
+	queueSpace chan struct{}
 
 	queue    chan writeJob
 	stopping chan struct{}
@@ -207,9 +217,10 @@ type Writer struct {
 // ready for concurrent Send calls.
 func NewWriter(w io.Writer) *Writer {
 	wr := &Writer{
-		queue:    make(chan writeJob, SendQueueDepth),
-		stopping: make(chan struct{}),
-		runDone:  make(chan struct{}),
+		queue:      make(chan writeJob, SendQueueDepth),
+		stopping:   make(chan struct{}),
+		runDone:    make(chan struct{}),
+		queueSpace: make(chan struct{}),
 	}
 	go wr.run(w)
 	return wr
@@ -220,6 +231,7 @@ func (wr *Writer) run(w io.Writer) {
 	for {
 		select {
 		case job := <-wr.queue:
+			wr.signalQueueSpace()
 			wr.runJob(w, job)
 		case <-wr.stopping:
 			// By the time stopping is closed, Close has already waited for
@@ -229,6 +241,7 @@ func (wr *Writer) run(w io.Writer) {
 			for {
 				select {
 				case job := <-wr.queue:
+					wr.signalQueueSpace()
 					wr.runJob(w, job)
 				default:
 					return
@@ -287,34 +300,14 @@ func (wr *Writer) SendContextResult(ctx context.Context, msg any) (WriteResult, 
 		return WriteResult{}, &FrameTooLargeError{Limit: MaxMessageBytes}
 	}
 
-	wr.mu.Lock()
-	if wr.closed {
-		wr.mu.Unlock()
-		return WriteResult{}, &WriterClosedError{}
-	}
-	wr.senders.Add(1)
-	wr.admitted.Add(1)
-	wr.mu.Unlock()
-
 	line := make([]byte, 0, len(data)+1)
 	line = append(line, data...)
 	line = append(line, '\n')
 
 	errCh := make(chan error, 1)
 	job := writeJob{line: line, errCh: errCh}
-	// This send onto queue cannot block forever: it is only reached while
-	// wr.closed is still false at the moment Close's Wait below could
-	// observe this goroutine, which means the writer goroutine has not yet
-	// been told to stop servicing wr.queue and so is guaranteed to keep
-	// draining it (including growing room for this send) until every
-	// admitted Send — this one included — completes.
-	select {
-	case wr.queue <- job:
-		wr.senders.Done()
-	case <-ctx.Done():
-		wr.senders.Done()
-		wr.admitted.Done()
-		return WriteResult{}, ctx.Err()
+	if err := wr.admitContext(ctx, job); err != nil {
+		return WriteResult{}, err
 	}
 
 	select {
@@ -323,6 +316,66 @@ func (wr *Writer) SendContextResult(ctx context.Context, msg any) (WriteResult, 
 	case <-ctx.Done():
 		return WriteResult{WriteAdmitted: true}, ctx.Err()
 	}
+}
+
+// admitContext places job on the writer queue or rejects it before admission.
+// The context check and queue send are serialized by mu: a cancellation that
+// is observed before the queue send wins and proves no write, while a queue
+// send that wins under mu is irrevocable and returns WriteAdmitted=true even
+// if the context is canceled immediately afterward.
+func (wr *Writer) admitContext(ctx context.Context, job writeJob) error {
+	wr.mu.Lock()
+	if wr.closed {
+		wr.mu.Unlock()
+		return &WriterClosedError{}
+	}
+	wr.senders.Add(1)
+	for {
+		if wr.closed {
+			wr.senders.Done()
+			wr.mu.Unlock()
+			return &WriterClosedError{}
+		}
+		if err := ctx.Err(); err != nil {
+			wr.senders.Done()
+			wr.mu.Unlock()
+			return err
+		}
+
+		if wr.queued < cap(wr.queue) {
+			// Reserve the queue slot and admitted accounting before the
+			// channel send. The slot reservation makes this send
+			// non-blocking while mu is held, and the Add precedes any
+			// possible runJob Done.
+			wr.queued++
+			wr.admitted.Add(1)
+			wr.queue <- job
+			wr.senders.Done()
+			wr.mu.Unlock()
+			return nil
+		}
+
+		changed := wr.queueSpace
+		wr.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+		}
+		wr.mu.Lock()
+	}
+}
+
+// signalQueueSpace advances the queue-space generation after a worker has
+// consumed one queued job. It also serves as the close wake-up for senders
+// blocked before admission.
+func (wr *Writer) signalQueueSpace() {
+	wr.mu.Lock()
+	if wr.queued > 0 {
+		wr.queued--
+	}
+	close(wr.queueSpace)
+	wr.queueSpace = make(chan struct{})
+	wr.mu.Unlock()
 }
 
 // Close stops the Writer from accepting any further Send calls, waits for
@@ -335,6 +388,8 @@ func (wr *Writer) Close() error {
 	wr.once.Do(func() {
 		wr.mu.Lock()
 		wr.closed = true
+		close(wr.queueSpace)
+		wr.queueSpace = make(chan struct{})
 		wr.mu.Unlock()
 
 		wr.senders.Wait()
