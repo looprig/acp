@@ -139,6 +139,49 @@ func TestConnCallWithResultCarriesAdmissionAndResponseSequence(t *testing.T) {
 	}
 }
 
+func TestConnStartCallSignalsAdmissionBeforeBlockedWrite(t *testing.T) {
+	reader, readerPeer := io.Pipe()
+	sink := newAdmissionGateWriter()
+	c := NewConn(reader, sink, ConnOptions{})
+	defer func() {
+		sink.releaseWrite()
+		_ = readerPeer.Close()
+		_ = c.Close()
+	}()
+
+	h, err := c.StartCall(context.Background(), "blocked.write", nil, nil)
+	if err != nil {
+		t.Fatalf("StartCall() error = %v", err)
+	}
+	if cap(h.Admission()) != 1 || cap(h.Result()) != 1 {
+		t.Fatalf("async channels have capacities admission=%d result=%d, want one each", cap(h.Admission()), cap(h.Result()))
+	}
+	select {
+	case admitted, ok := <-h.Admission():
+		if !ok || !admitted {
+			t.Fatalf("admission = (%v, %v), want one true value", admitted, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for queue admission")
+	}
+	select {
+	case completion := <-h.Result():
+		t.Fatalf("result arrived while raw write/response blocked: %#v", completion)
+	case <-time.After(50 * time.Millisecond):
+	}
+	h.Cancel()
+	completion, ok := <-h.Result()
+	if !ok {
+		t.Fatal("Result() closed before cancellation completion")
+	}
+	if !completion.Facts.WriteAdmitted {
+		t.Fatal("post-admission cancellation lost WriteAdmitted=true")
+	}
+	if !errors.Is(completion.Err, context.Canceled) {
+		t.Fatalf("completion error = %v, want context.Canceled", completion.Err)
+	}
+}
+
 func TestConnCallWithResultCarriesAdmissionOnPeerErrorAndEOF(t *testing.T) {
 	assertNoGoroutineLeakInternal(t)
 

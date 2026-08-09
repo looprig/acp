@@ -166,8 +166,24 @@ type SendResult = WriteResult
 // writeJob is one queued Send: the fully framed line to write, and the
 // channel its result is delivered on.
 type writeJob struct {
-	line  []byte
-	errCh chan error
+	line          []byte
+	errCh         chan error
+	admission     chan<- bool
+	admissionDone chan<- bool
+}
+
+// asyncSendResult is the completion of one internal asynchronous Writer send.
+// Admission is reported separately, at the queue linearization point, so a
+// caller can distinguish a canceled request that was never eligible for the
+// wire from one whose raw write is still draining.
+type asyncSendResult struct {
+	admitted bool
+	err      error
+}
+
+type asyncSend struct {
+	admissionDone <-chan bool
+	done          <-chan asyncSendResult
 }
 
 // Writer serializes concurrent Send calls into a single stream of
@@ -318,6 +334,60 @@ func (wr *Writer) SendContextResult(ctx context.Context, msg any) (WriteResult, 
 	}
 }
 
+// startSendContextWithAdmission is the internal asynchronous counterpart of
+// SendContextResult. It deliberately remains below the public Writer API:
+// only protocol.Conn needs to expose an asynchronous request, while Writer's
+// admission and raw-write semantics stay owned by this package. The caller
+// supplies the public admission channel when needed; the returned send tracks
+// a private admission barrier and a done channel, each resolved exactly once.
+func (wr *Writer) startSendContextWithAdmission(ctx context.Context, msg any, admitted chan bool) (*asyncSend, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("protocol: marshal frame for send: %w", err)
+	}
+	if len(data) > MaxMessageBytes {
+		return nil, &FrameTooLargeError{Limit: MaxMessageBytes}
+	}
+
+	line := make([]byte, 0, len(data)+1)
+	line = append(line, data...)
+	line = append(line, '\n')
+	admissionDone := make(chan bool, 1)
+	done := make(chan asyncSendResult, 1)
+	errCh := make(chan error, 1)
+	send := &asyncSend{admissionDone: admissionDone, done: done}
+	job := writeJob{line: line, errCh: errCh, admission: admitted, admissionDone: admissionDone}
+	go func() {
+		err := wr.admitContext(ctx, job)
+		if err != nil {
+			if job.admission != nil {
+				job.admission <- false
+				close(job.admission)
+			}
+			job.admissionDone <- false
+			close(job.admissionDone)
+			done <- asyncSendResult{admitted: false, err: err}
+			close(done)
+			return
+		}
+		// admitContext sends true and closes admission while holding the
+		// Writer mutex. The receive here is intentionally not needed for
+		// correctness; it only waits for the writer result below.
+		var writeErr error
+		select {
+		case writeErr = <-errCh:
+		case <-ctx.Done():
+			writeErr = ctx.Err()
+		}
+		done <- asyncSendResult{admitted: true, err: writeErr}
+		close(done)
+	}()
+	return send, nil
+}
+
 // admitContext places job on the writer queue or rejects it before admission.
 // The context check and queue send are serialized by mu: a cancellation that
 // is observed before the queue send wins and proves no write, while a queue
@@ -350,6 +420,14 @@ func (wr *Writer) admitContext(ctx context.Context, job writeJob) error {
 			wr.queued++
 			wr.admitted.Add(1)
 			wr.queue <- job
+			if job.admission != nil {
+				job.admission <- true
+				close(job.admission)
+			}
+			if job.admissionDone != nil {
+				job.admissionDone <- true
+				close(job.admissionDone)
+			}
 			wr.senders.Done()
 			wr.mu.Unlock()
 			return nil

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -111,6 +114,255 @@ func TestExtensionSteerUsesFixedMethodAndTypedOutcome(t *testing.T) {
 	if string(got.Meta) != `{"steering":{"idleBehavior":"promptRequired"}}` {
 		t.Fatalf("steering _meta = %s, want caller metadata", got.Meta)
 	}
+}
+
+func TestStartSteerCancellationBeforeAdmissionDoesNotWrite(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	sess := newSessionForTest(t, c, fa, "sess-steer-async-pre-admission")
+
+	var calls atomic.Int32
+	fa.conn.Handle(methodSessionSteering, func(context.Context, string, json.RawMessage) (any, error) {
+		calls.Add(1)
+		return map[string]any{"outcome": "injected"}, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h := sess.StartSteer(ctx, SteerParams{Prompt: []protocol.ContentBlock{{
+		Text: &protocol.TextContent{Text: "must not write"},
+	}}})
+
+	if got := cap(h.Admission()); got != 1 {
+		t.Fatalf("Admission() capacity = %d, want 1", got)
+	}
+	if got := cap(h.Result()); got != 1 {
+		t.Fatalf("Result() capacity = %d, want 1", got)
+	}
+	select {
+	case admitted, ok := <-h.Admission():
+		if !ok || admitted {
+			t.Fatalf("admission = (%v, %v), want one false value", admitted, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for pre-admission result")
+	}
+	if _, ok := <-h.Admission(); ok {
+		t.Fatal("Admission() delivered more than one value")
+	}
+	completion := <-h.Result()
+	if completion.Err == nil {
+		t.Fatal("StartSteer() completion error = nil, want cancellation")
+	}
+	var steeringErr *SteeringError
+	if !errors.As(completion.Err, &steeringErr) {
+		t.Fatalf("completion error = %v (%T), want *SteeringError", completion.Err, completion.Err)
+	}
+	if steeringErr.WriteAdmitted {
+		t.Fatal("pre-admission SteeringError reported WriteAdmitted=true")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("steering handler calls = %d, want zero", got)
+	}
+	if _, ok := <-h.Result(); ok {
+		t.Fatal("Result() delivered more than one completion")
+	}
+}
+
+func TestStartSteerReportsAdmissionBeforeBlockedResponse(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	sess := newSessionForTest(t, c, fa, "sess-steer-async-admitted")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fa.conn.Handle(methodSessionSteering, func(context.Context, string, json.RawMessage) (any, error) {
+		close(started)
+		<-release
+		return map[string]any{"outcome": "injected", "reason": "accepted"}, nil
+	})
+
+	h := sess.StartSteer(context.Background(), SteerParams{Prompt: []protocol.ContentBlock{{
+		Text: &protocol.TextContent{Text: "hold response"},
+	}}})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for steering request")
+	}
+	select {
+	case admitted, ok := <-h.Admission():
+		if !ok || !admitted {
+			t.Fatalf("admission = (%v, %v), want one true value", admitted, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for early admission")
+	}
+	select {
+	case completion := <-h.Result():
+		t.Fatalf("result arrived while response blocked: %#v", completion)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	completion, ok := <-h.Result()
+	if !ok {
+		t.Fatal("Result() closed before completion")
+	}
+	if completion.Err != nil {
+		t.Fatalf("completion error = %v, want nil", completion.Err)
+	}
+	if completion.Result.Outcome != SteerOutcomeInjected || !completion.Result.WriteAdmitted {
+		t.Fatalf("completion result = %#v, want injected/admitted", completion.Result)
+	}
+	if completion.Result.ReceiveSequence == 0 || completion.Result.ResponseSequence == 0 {
+		t.Fatalf("completion sequences = %#v, want response sequence facts", completion.Result)
+	}
+}
+
+func TestStartSteerCancellationAfterAdmissionReportsUnknownDelivery(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	sess := newSessionForTest(t, c, fa, "sess-steer-async-cancel")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fa.conn.Handle(methodSessionSteering, func(context.Context, string, json.RawMessage) (any, error) {
+		close(started)
+		<-release
+		return map[string]any{"outcome": "injected"}, nil
+	})
+
+	h := sess.StartSteer(context.Background(), SteerParams{Prompt: []protocol.ContentBlock{{
+		Text: &protocol.TextContent{Text: "cancel after admission"},
+	}}})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for steering request")
+	}
+	select {
+	case admitted, ok := <-h.Admission():
+		if !ok || !admitted {
+			t.Fatalf("admission = (%v, %v), want one true value", admitted, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for admission")
+	}
+	h.Cancel()
+	completion, ok := <-h.Result()
+	if !ok {
+		t.Fatal("Result() closed before cancellation completion")
+	}
+	if completion.Err == nil {
+		t.Fatal("completion error = nil, want cancellation")
+	}
+	var steeringErr *SteeringError
+	if !errors.As(completion.Err, &steeringErr) {
+		t.Fatalf("completion error = %v (%T), want *SteeringError", completion.Err, completion.Err)
+	}
+	if !steeringErr.WriteAdmitted {
+		t.Fatal("post-admission cancellation lost WriteAdmitted=true")
+	}
+	if steeringErr.ReceiveSequence != 0 || steeringErr.ResponseSequence != 0 {
+		t.Fatalf("canceled SteeringError facts = %#v, want no response sequence", steeringErr)
+	}
+	close(release)
+	if _, ok := <-h.Result(); ok {
+		t.Fatal("Result() delivered more than one completion")
+	}
+}
+
+func TestStartSteerConnectionCloseCompletesOnceWithAdmissionFacts(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	sess := newSessionForTest(t, c, fa, "sess-steer-async-close")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fa.conn.Handle(methodSessionSteering, func(context.Context, string, json.RawMessage) (any, error) {
+		close(started)
+		<-release
+		return nil, &protocol.ConnClosedError{}
+	})
+
+	h := sess.StartSteer(context.Background(), SteerParams{Prompt: []protocol.ContentBlock{{
+		Text: &protocol.TextContent{Text: "close connection"},
+	}}})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for steering request")
+	}
+	select {
+	case admitted, ok := <-h.Admission():
+		if !ok || !admitted {
+			t.Fatalf("admission = (%v, %v), want one true value", admitted, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for admission")
+	}
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer closeCancel()
+	if err := c.Close(closeCtx); err != nil {
+		t.Fatalf("Client.Close() error = %v", err)
+	}
+	completion, ok := <-h.Result()
+	if !ok {
+		t.Fatal("Result() closed before connection-close completion")
+	}
+	if completion.Err == nil {
+		t.Fatal("connection-close completion error = nil")
+	}
+	var steeringErr *SteeringError
+	if !errors.As(completion.Err, &steeringErr) {
+		t.Fatalf("connection-close error = %v (%T), want *SteeringError", completion.Err, completion.Err)
+	}
+	if !steeringErr.WriteAdmitted {
+		t.Fatal("connection-close SteeringError lost WriteAdmitted=true")
+	}
+	close(release)
+	if _, ok := <-h.Result(); ok {
+		t.Fatal("Result() delivered more than one completion")
+	}
+}
+
+func TestStartSteerConcurrentCallsCompleteExactlyOnce(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	sess := newSessionForTest(t, c, fa, "sess-steer-async-concurrent")
+	fa.conn.Handle(methodSessionSteering, func(context.Context, string, json.RawMessage) (any, error) {
+		return map[string]any{"outcome": "injected"}, nil
+	})
+
+	const calls = 32
+	handles := make([]*SteerHandle, calls)
+	for i := range handles {
+		handles[i] = sess.StartSteer(context.Background(), SteerParams{Prompt: []protocol.ContentBlock{{
+			Text: &protocol.TextContent{Text: fmt.Sprintf("concurrent-%d", i)},
+		}}})
+	}
+	var wg sync.WaitGroup
+	for i, h := range handles {
+		wg.Add(1)
+		go func(i int, h *SteerHandle) {
+			defer wg.Done()
+			admitted, ok := <-h.Admission()
+			if !ok || !admitted {
+				t.Errorf("call %d admission = (%v, %v), want true", i, admitted, ok)
+				return
+			}
+			completion, ok := <-h.Result()
+			if !ok {
+				t.Errorf("call %d result channel closed before completion", i)
+				return
+			}
+			if completion.Err != nil || completion.Result.Outcome != SteerOutcomeInjected {
+				t.Errorf("call %d completion = %#v, want injected success", i, completion)
+			}
+			if _, ok := <-h.Admission(); ok {
+				t.Errorf("call %d admission delivered twice", i)
+			}
+			if _, ok := <-h.Result(); ok {
+				t.Errorf("call %d result delivered twice", i)
+			}
+		}(i, h)
+	}
+	wg.Wait()
 }
 
 func TestExtensionSteerReturnsBoundedTypedPeerError(t *testing.T) {

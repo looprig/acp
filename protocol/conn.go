@@ -99,6 +99,52 @@ type CallResult struct {
 	ReceiveSequence  uint64
 }
 
+// AsyncCallResult is the exactly-once completion of one asynchronous Call.
+// Facts are retained even when Err is non-nil, including cancellation,
+// connection closure, and peer faults.
+type AsyncCallResult struct {
+	Facts CallResult
+	Err   error
+}
+
+// CallHandle is the minimal asynchronous request primitive used by typed ACP
+// extension calls. Admission has capacity one and receives exactly one value
+// (true at Writer queue admission, false when the request is rejected before
+// admission) before closing. Result has capacity one and receives exactly one
+// AsyncCallResult before closing. Cancel is idempotent and only cancels this
+// call's observation; a request admitted to Writer remains eligible for its
+// raw write.
+type CallHandle struct {
+	admission chan bool
+	result    chan AsyncCallResult
+	cancel    context.CancelFunc
+}
+
+// Admission reports the one writer-admission fact for this call.
+func (h *CallHandle) Admission() <-chan bool {
+	if h == nil {
+		return nil
+	}
+	return h.admission
+}
+
+// Result reports the one final call completion.
+func (h *CallHandle) Result() <-chan AsyncCallResult {
+	if h == nil {
+		return nil
+	}
+	return h.result
+}
+
+// Cancel stops waiting for this call's response. If Writer admission already
+// happened, the resulting completion retains Facts.WriteAdmitted=true and the
+// admitted frame is still drained by Writer.
+func (h *CallHandle) Cancel() {
+	if h != nil && h.cancel != nil {
+		h.cancel()
+	}
+}
+
 // ReceiveSequenceOverflowError reports that Conn exhausted its monotonic
 // receive-sequence space. Conn fails closed before dispatching that inbound
 // observation, so sequence zero remains reserved as the "not observed"
@@ -481,6 +527,14 @@ func (c *Conn) CallWithResult(ctx context.Context, method string, params, result
 	return c.call(ctx, method, params, result, c.mintCallID)
 }
 
+// StartCall is Call's asynchronous form. It is primarily consumed by typed
+// ACP extension wrappers that need Writer admission before the eventual
+// response. The returned handle owns one pending entry and resolves it exactly
+// once, even when cancellation races a response or connection shutdown.
+func (c *Conn) StartCall(ctx context.Context, method string, params, result any) (*CallHandle, error) {
+	return c.startCall(ctx, method, params, result, c.mintCallID)
+}
+
 // callExt is Call's counterpart for extension traffic: it mints request ids
 // from the ExtIDBase-configured id space instead of Call's. It is
 // unexported for now — Task 1.7's typed surface is expected to expose it (or
@@ -492,6 +546,136 @@ func (c *Conn) callExt(ctx context.Context, method string, params, result any) e
 
 func (c *Conn) mintCallID() int64 { return c.nextCallID.Add(1) }
 func (c *Conn) mintExtID() int64  { return c.nextExtID.Add(1) }
+
+func (c *Conn) startCall(ctx context.Context, method string, params, result any, mintID func() int64) (*CallHandle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	var raw json.RawMessage
+	if params != nil {
+		r, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("protocol: marshal call params: %w", err)
+		}
+		raw = r
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		err := error(c.closeErr)
+		c.mu.Unlock()
+		return nil, err
+	}
+
+	id := NewNumberID(mintID())
+	pending := make(chan callResult, 1)
+	c.pending[id] = pending
+	c.mu.Unlock()
+
+	callCtx, cancel := context.WithCancel(ctx)
+	h := &CallHandle{
+		admission: make(chan bool, 1),
+		result:    make(chan AsyncCallResult, 1),
+		cancel:    cancel,
+	}
+	req := &Request{ID: id, Method: method, Params: raw}
+	go c.runAsyncCall(callCtx, id, req, result, pending, h)
+	return h, nil
+}
+
+func (c *Conn) runAsyncCall(
+	ctx context.Context,
+	id ID,
+	req *Request,
+	result any,
+	pending <-chan callResult,
+	h *CallHandle,
+) {
+	defer h.cancel()
+	defer close(h.result)
+
+	send, sendErr := c.writer.startSendContextWithAdmission(ctx, req, h.admission)
+	if sendErr != nil {
+		c.publishAsyncAdmission(h, false)
+		facts, err := c.abandonPendingCall(id, pending, CallResult{}, sendErr)
+		c.publishAsyncResult(h, facts, err)
+		return
+	}
+
+	admitted, ok := <-send.admissionDone
+	if !ok {
+		admitted = false
+	}
+	if !admitted {
+		sendResult := <-send.done
+		facts, err := c.abandonPendingCall(id, pending, CallResult{}, sendResult.err)
+		c.publishAsyncResult(h, facts, err)
+		return
+	}
+
+	var sendDone <-chan asyncSendResult = send.done
+	var cancelCh <-chan struct{}
+	for {
+		select {
+		case res := <-pending:
+			// A correlated response itself proves that Writer admission
+			// happened, even if an unusual transport reports its raw write
+			// completion slightly later.
+			facts, err := deliverCallResult(res, result, admitted)
+			c.publishAsyncResult(h, facts, err)
+			return
+		case sendResult := <-sendDone:
+			sendDone = nil
+			admitted = sendResult.admitted
+			cancelCh = ctx.Done()
+			if !admitted {
+				facts, err := c.abandonPendingCall(id, pending, CallResult{}, sendResult.err)
+				c.publishAsyncResult(h, facts, err)
+				return
+			}
+			if sendResult.err != nil {
+				facts, err := c.abandonPendingCall(id, pending, CallResult{WriteAdmitted: admitted}, sendResult.err)
+				c.publishAsyncResult(h, facts, err)
+				return
+			}
+		case <-cancelCh:
+			facts, err := c.abandonPendingCall(id, pending, CallResult{WriteAdmitted: admitted}, ctx.Err())
+			c.publishAsyncResult(h, facts, err)
+			return
+		}
+	}
+}
+
+func (c *Conn) publishAsyncAdmission(h *CallHandle, admitted bool) {
+	h.admission <- admitted
+	close(h.admission)
+}
+
+func (c *Conn) publishAsyncResult(h *CallHandle, facts CallResult, err error) {
+	h.result <- AsyncCallResult{Facts: facts, Err: err}
+}
+
+// abandonPendingCall removes id if this async call still owns it. If a
+// response or shutdown already won that ownership race, prefer the queued
+// authoritative result over the caller's cancellation/send error.
+func (c *Conn) abandonPendingCall(id ID, pending <-chan callResult, fallback CallResult, fallbackErr error) (CallResult, error) {
+	c.mu.Lock()
+	_, stillPending := c.pending[id]
+	if stillPending {
+		delete(c.pending, id)
+	}
+	c.mu.Unlock()
+	if stillPending {
+		return fallback, fallbackErr
+	}
+	select {
+	case res := <-pending:
+		return deliverCallResult(res, nil, fallback.WriteAdmitted)
+	default:
+		return fallback, fallbackErr
+	}
+}
 
 func (c *Conn) call(ctx context.Context, method string, params, result any, mintID func() int64) (CallResult, error) {
 	if err := ctx.Err(); err != nil {

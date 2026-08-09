@@ -38,6 +38,13 @@ func (a *AgentConn) CallExtensionWithResult(ctx context.Context, method string, 
 	return a.conn.call(ctx, method, params, result, a.conn.mintExtID)
 }
 
+// StartExtensionCall is the asynchronous counterpart used by fixed typed
+// extension surfaces. The method string stays in protocol so callers above
+// this package cannot turn the typed client API into arbitrary probing.
+func (a *AgentConn) StartExtensionCall(ctx context.Context, method string, params, result any) (*CallHandle, error) {
+	return a.conn.startCall(ctx, method, params, result, a.conn.mintExtID)
+}
+
 // Initialize calls the agent's "initialize" method.
 func (a *AgentConn) Initialize(ctx context.Context, req InitializeRequest) (*InitializeResponse, error) {
 	var resp InitializeResponse

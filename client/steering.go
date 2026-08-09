@@ -53,6 +53,51 @@ type SteerResult struct {
 	ResponseSequence uint64
 }
 
+// SteerCompletion is the exactly-once terminal value delivered by a
+// SteerHandle. Result retains typed wire and transport facts even when Err is
+// non-nil; Err is bounded by newSteeringError whenever the request reached
+// protocol transport.
+type SteerCompletion struct {
+	Result SteerResult
+	Err    error
+}
+
+// SteerHandle owns one asynchronous fixed-method steering request. Both
+// channels have capacity one and deliver exactly one value before closing.
+// Cancel is idempotent. If admission already reported true, cancellation
+// stops response observation but does not retract the admitted frame.
+type SteerHandle struct {
+	admission chan bool
+	result    chan SteerCompletion
+	cancel    context.CancelFunc
+}
+
+// Admission reports whether this request crossed the protocol Writer queue
+// admission boundary. A false value proves the steering frame was not
+// eligible for the underlying transport.
+func (h *SteerHandle) Admission() <-chan bool {
+	if h == nil {
+		return nil
+	}
+	return h.admission
+}
+
+// Result reports the one final steering completion.
+func (h *SteerHandle) Result() <-chan SteerCompletion {
+	if h == nil {
+		return nil
+	}
+	return h.result
+}
+
+// Cancel cancels this handle's response observation. It never retracts a
+// frame that already crossed Writer admission.
+func (h *SteerHandle) Cancel() {
+	if h != nil && h.cancel != nil {
+		h.cancel()
+	}
+}
+
 const maxSteerReasonBytes = 1024
 
 // maxSteeringErrorMessageBytes bounds peer-controlled diagnostic text kept by
@@ -164,13 +209,35 @@ func (e *SteeringError) Unwrap() error {
 	return e.cause
 }
 
-// Steer sends the fixed _session/steering request for this Session. It does
-// not perform capability/profile allowlisting or an unknown-method probe;
-// those policy decisions belong to the foreign driver.
-func (s *Session) Steer(ctx context.Context, p SteerParams) (SteerResult, error) {
+// StartSteer starts the fixed _session/steering request for this Session. It
+// does not perform capability/profile allowlisting or an unknown-method
+// probe; those policy decisions belong to the foreign driver. The returned
+// handle always resolves both channels exactly once, including not-dialed and
+// closed-client failures.
+func (s *Session) StartSteer(ctx context.Context, p SteerParams) *SteerHandle {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	callCtx, cancel := context.WithCancel(ctx)
+	h := &SteerHandle{
+		admission: make(chan bool, 1),
+		result:    make(chan SteerCompletion, 1),
+		cancel:    cancel,
+	}
+	go s.runSteer(callCtx, h, p)
+	return h
+}
+
+func (s *Session) runSteer(ctx context.Context, h *SteerHandle, p SteerParams) {
+	defer h.cancel()
+	defer close(h.result)
+
 	agent, err := s.client.currentAgent()
 	if err != nil {
-		return SteerResult{}, err
+		h.admission <- false
+		close(h.admission)
+		h.result <- SteerCompletion{Err: err}
+		return
 	}
 
 	p.SessionID = s.id
@@ -178,18 +245,59 @@ func (s *Session) Steer(ctx context.Context, p SteerParams) (SteerResult, error)
 		Outcome string `json:"outcome"`
 		Reason  string `json:"reason,omitempty"`
 	}
-	facts, err := agent.CallExtensionWithResult(ctx, methodSessionSteering, p, &wire)
-	result := SteerResult{
+	call, err := agent.StartExtensionCall(ctx, methodSessionSteering, p, &wire)
+	if err != nil {
+		h.admission <- false
+		close(h.admission)
+		facts := protocol.CallResult{}
+		h.result <- SteerCompletion{Err: newSteeringError(err, facts)}
+		return
+	}
+
+	admitted, ok := <-call.Admission()
+	if !ok {
+		admitted = false
+	}
+	h.admission <- admitted
+	close(h.admission)
+
+	completion, ok := <-call.Result()
+	if !ok {
+		completion = protocol.AsyncCallResult{
+			Facts: protocol.CallResult{WriteAdmitted: admitted},
+			Err:   errors.New("acp/client: steering call ended without a completion"),
+		}
+	}
+	result := steerResultFromWire(wire, completion.Facts)
+	if completion.Err != nil {
+		completion.Err = newSteeringError(completion.Err, completion.Facts)
+	}
+	h.result <- SteerCompletion{Result: result, Err: completion.Err}
+}
+
+func steerResultFromWire(wire struct {
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason,omitempty"`
+}, facts protocol.CallResult) SteerResult {
+	return SteerResult{
 		Outcome:          SteerOutcome(wire.Outcome),
 		Reason:           boundSteerReason(wire.Reason),
 		WriteAdmitted:    facts.WriteAdmitted,
-		ReceiveSequence:  facts.ResponseSequence,
+		ReceiveSequence:  facts.ReceiveSequence,
 		ResponseSequence: facts.ResponseSequence,
 	}
-	if err != nil {
-		return result, newSteeringError(err, facts)
+}
+
+// Steer sends the fixed _session/steering request for this Session and waits
+// for StartSteer's exactly-once completion. It is retained as the synchronous
+// compatibility wrapper for callers that do not need early admission.
+func (s *Session) Steer(ctx context.Context, p SteerParams) (SteerResult, error) {
+	h := s.StartSteer(ctx, p)
+	completion, ok := <-h.Result()
+	if !ok {
+		return SteerResult{}, errors.New("acp/client: steering call ended without a completion")
 	}
-	return result, nil
+	return completion.Result, completion.Err
 }
 
 func newSteeringError(err error, facts protocol.CallResult) error {
@@ -200,7 +308,7 @@ func newSteeringError(err error, facts protocol.CallResult) error {
 		Code:             protocol.ErrorCodeInternalError,
 		Message:          "steering request failed",
 		WriteAdmitted:    facts.WriteAdmitted,
-		ReceiveSequence:  facts.ResponseSequence,
+		ReceiveSequence:  facts.ReceiveSequence,
 		ResponseSequence: facts.ResponseSequence,
 	}
 	var fault *protocol.Fault
