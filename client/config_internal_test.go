@@ -69,6 +69,28 @@ func sampleModeState() *protocol.SessionModeState {
 	}
 }
 
+// TestInitializeMetadataPreservesAbsentOptionalFields proves a successful
+// initialize response with no optional agent information or raw metadata is
+// represented by nil fields, rather than fabricated empty values.
+func TestInitializeMetadataPreservesAbsentOptionalFields(t *testing.T) {
+	client, _ := dialTestClient(t, Options{}, func(fa *fakeAgent) {
+		fa.onInitialize = func(req protocol.InitializeRequest) (protocol.InitializeResponse, error) {
+			return protocol.InitializeResponse{ProtocolVersion: protocol.CurrentProtocolVersion}, nil
+		}
+	})
+
+	got, err := client.InitializeMetadata()
+	if err != nil {
+		t.Fatalf("InitializeMetadata() error = %v", err)
+	}
+	if got.AgentInfo != nil {
+		t.Fatalf("InitializeMetadata().AgentInfo = %#v, want nil", got.AgentInfo)
+	}
+	if got.Meta != nil {
+		t.Fatalf("InitializeMetadata().Meta = %#v, want nil", got.Meta)
+	}
+}
+
 // TestNewSessionRetainsDefensiveCopyOfConfigOptionsAndModes proves NewSession
 // stores its own copy of the session/new response's ConfigOptions/Modes
 // (readable via ConfigOptions()/Modes()) and that mutating the response
