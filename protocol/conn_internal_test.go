@@ -316,6 +316,36 @@ func TestConnReceiveBarrierWaitsForNotificationDispatchRegistration(t *testing.T
 	}
 }
 
+func TestConnReceiveSequenceOverflowFailsClosedWithoutZeroObservation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mint func(*Conn) uint64
+	}{
+		{name: "response", mint: func(client *Conn) uint64 { return client.stampReceive() }},
+		{name: "notification", mint: func(client *Conn) uint64 { return client.beginReceiveNotification() }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assertNoGoroutineLeakInternal(t)
+			clientReader, clientWriter := io.Pipe()
+			client := NewConn(clientReader, clientWriter, ConnOptions{})
+			t.Cleanup(func() { client.Close() })
+
+			client.receiveMu.Lock()
+			client.receiveThrough = ^uint64(0)
+			client.receiveMu.Unlock()
+
+			if sequence := test.mint(client); sequence != 0 {
+				t.Fatalf("receive sequence overflow minted %d, want no sequence", sequence)
+			}
+			select {
+			case <-client.Done():
+			default:
+				t.Fatal("receive sequence overflow did not fail closed")
+			}
+		})
+	}
+}
+
 func TestConnCallContextCancelRemovesPendingEntry(t *testing.T) {
 	assertNoGoroutineLeakInternal(t)
 

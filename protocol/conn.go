@@ -99,6 +99,16 @@ type CallResult struct {
 	ReceiveSequence  uint64
 }
 
+// ReceiveSequenceOverflowError reports that Conn exhausted its monotonic
+// receive-sequence space. Conn fails closed before dispatching that inbound
+// observation, so sequence zero remains reserved as the "not observed"
+// sentinel and is never emitted on a response or notification.
+type ReceiveSequenceOverflowError struct{}
+
+func (e *ReceiveSequenceOverflowError) Error() string {
+	return "protocol: receive sequence overflow"
+}
+
 type bufferedNotification struct {
 	params          json.RawMessage
 	receiveSequence uint64
@@ -704,11 +714,17 @@ func (c *Conn) readLoop() {
 			c.dispatchRequest(env.Request)
 		case KindNotification:
 			seq := c.beginReceiveNotification()
+			if seq == 0 {
+				return
+			}
 			env.Notification.ReceiveSequence = seq
 			c.dispatchNotification(env.Notification)
 			c.finishReceiveNotification(seq)
 		case KindResponse:
 			seq := c.stampReceive()
+			if seq == 0 {
+				return
+			}
 			env.Response.ReceiveSequence = seq
 			c.correlateResponse(env.Response)
 		}
@@ -720,13 +736,7 @@ func (c *Conn) readLoop() {
 // handlers are peer-to-client calls, not observations that a client driver
 // must merge with prompt/update/extension outcomes.
 func (c *Conn) stampReceive() uint64 {
-	c.receiveMu.Lock()
-	c.receiveThrough++
-	seq := c.receiveThrough
-	close(c.receiveChanged)
-	c.receiveChanged = make(chan struct{})
-	c.receiveMu.Unlock()
-	return seq
+	return c.nextReceiveSequence(false)
 }
 
 // beginReceiveNotification advances the shared receive clock and records the
@@ -735,10 +745,25 @@ func (c *Conn) stampReceive() uint64 {
 // matching finishReceiveNotification runs only after dispatchNotification has
 // recorded a registered handler job or buffered the notification.
 func (c *Conn) beginReceiveNotification() uint64 {
+	return c.nextReceiveSequence(true)
+}
+
+// nextReceiveSequence advances the shared receive clock and, for
+// notifications, registers dispatch-pending under the same lock before any
+// waiter can observe the new sequence. On exhaustion it closes the Conn and
+// returns zero without publishing or dispatching an observation.
+func (c *Conn) nextReceiveSequence(notification bool) uint64 {
 	c.receiveMu.Lock()
+	if c.receiveThrough == ^uint64(0) {
+		c.receiveMu.Unlock()
+		c.shutdown(&ReceiveSequenceOverflowError{})
+		return 0
+	}
 	c.receiveThrough++
 	seq := c.receiveThrough
-	c.receiveDispatchPending[seq] = struct{}{}
+	if notification {
+		c.receiveDispatchPending[seq] = struct{}{}
+	}
 	close(c.receiveChanged)
 	c.receiveChanged = make(chan struct{})
 	c.receiveMu.Unlock()

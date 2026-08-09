@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/looprig/acp/protocol"
 )
@@ -166,6 +167,57 @@ func TestSteeringErrorBoundsHostileFaultMessageAndData(t *testing.T) {
 	}
 	if steeringErr.ResponseSequence != 42 || !steeringErr.WriteAdmitted {
 		t.Fatalf("SteeringError facts = %#v, want admission and sequence", steeringErr)
+	}
+}
+
+func TestSteeringErrorPreservesConnectionClosedClassification(t *testing.T) {
+	original := &protocol.ConnClosedError{}
+	err := newSteeringError(original, protocol.CallResult{WriteAdmitted: true})
+
+	var got *protocol.ConnClosedError
+	if !errors.As(err, &got) {
+		t.Fatalf("newSteeringError() = %v, want a *protocol.ConnClosedError cause", err)
+	}
+	if !errors.Is(err, original) {
+		t.Fatal("SteeringError lost errors.Is identity for ConnClosedError")
+	}
+	var closed *ClosedError
+	if !errors.As(err, &closed) {
+		t.Fatal("SteeringError lost client ClosedError classification")
+	}
+}
+
+func TestSteeringErrorPreservesWriterClosedClassification(t *testing.T) {
+	original := &protocol.WriterClosedError{}
+	err := newSteeringError(original, protocol.CallResult{WriteAdmitted: false})
+
+	var got *protocol.WriterClosedError
+	if !errors.As(err, &got) {
+		t.Fatalf("newSteeringError() = %v, want a *protocol.WriterClosedError cause", err)
+	}
+	if !errors.Is(err, original) {
+		t.Fatal("SteeringError lost errors.Is identity for WriterClosedError")
+	}
+}
+
+func TestBoundSteeringMessageInvalidUTF8RespectsByteLimit(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input []byte
+		limit int
+	}{
+		{name: "one invalid byte below rune width", input: []byte{0xff}, limit: 1},
+		{name: "two invalid bytes at replacement boundary", input: []byte{0xff, 0xfe}, limit: 4},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := boundSteeringMessage(string(test.input), test.limit)
+			if len(got) > test.limit {
+				t.Fatalf("boundSteeringMessage() length = %d, want <= %d", len(got), test.limit)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("boundSteeringMessage() returned invalid UTF-8: %x", []byte(got))
+			}
+		})
 	}
 }
 

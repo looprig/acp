@@ -74,6 +74,75 @@ type SteeringError struct {
 	cause            error
 }
 
+type steeringTransportCauseKind uint8
+
+const (
+	steeringTransportCauseGeneric steeringTransportCauseKind = iota + 1
+	steeringTransportCauseConnectionClosed
+	steeringTransportCauseWriterClosed
+)
+
+// boundedSteeringTransportCause retains local transport classification while
+// avoiding an unbounded local error string or an accidental peer Fault cause
+// chain. Is keeps sentinel identity checks useful; As exposes only bounded
+// typed closure facts.
+type boundedSteeringTransportCause struct {
+	kind     steeringTransportCauseKind
+	identity error
+}
+
+func (e *boundedSteeringTransportCause) Error() string {
+	switch e.kind {
+	case steeringTransportCauseConnectionClosed:
+		return "acp/client: connection closed"
+	case steeringTransportCauseWriterClosed:
+		return "acp/client: writer closed"
+	default:
+		return "acp/client: steering transport failed"
+	}
+}
+
+func (e *boundedSteeringTransportCause) Is(target error) bool {
+	if target == nil {
+		return false
+	}
+	switch e.kind {
+	case steeringTransportCauseConnectionClosed:
+		if _, ok := target.(*protocol.ConnClosedError); ok {
+			return true
+		}
+		if _, ok := target.(*ClosedError); ok {
+			return true
+		}
+	case steeringTransportCauseWriterClosed:
+		if _, ok := target.(*protocol.WriterClosedError); ok {
+			return true
+		}
+	}
+	return e.identity != nil && errors.Is(e.identity, target)
+}
+
+func (e *boundedSteeringTransportCause) As(target any) bool {
+	switch target := target.(type) {
+	case **protocol.ConnClosedError:
+		if e.kind == steeringTransportCauseConnectionClosed {
+			*target = &protocol.ConnClosedError{}
+			return true
+		}
+	case **ClosedError:
+		if e.kind == steeringTransportCauseConnectionClosed {
+			*target = &ClosedError{}
+			return true
+		}
+	case **protocol.WriterClosedError:
+		if e.kind == steeringTransportCauseWriterClosed {
+			*target = &protocol.WriterClosedError{}
+			return true
+		}
+	}
+	return false
+}
+
 func (e *SteeringError) Error() string {
 	if e == nil {
 		return "<nil>"
@@ -144,8 +213,31 @@ func newSteeringError(err error, facts protocol.CallResult) error {
 		steeringErr.Code = protocol.ErrorCodeRequestCancelled
 		steeringErr.Message = "steering request canceled"
 		steeringErr.cause = err
+		return steeringErr
 	}
+	steeringErr.cause = boundedSteeringTransportCauseFor(err)
 	return steeringErr
+}
+
+func boundedSteeringTransportCauseFor(err error) error {
+	var connClosed *protocol.ConnClosedError
+	if errors.As(err, &connClosed) {
+		return &boundedSteeringTransportCause{
+			kind:     steeringTransportCauseConnectionClosed,
+			identity: err,
+		}
+	}
+	var writerClosed *protocol.WriterClosedError
+	if errors.As(err, &writerClosed) {
+		return &boundedSteeringTransportCause{
+			kind:     steeringTransportCauseWriterClosed,
+			identity: err,
+		}
+	}
+	return &boundedSteeringTransportCause{
+		kind:     steeringTransportCauseGeneric,
+		identity: err,
+	}
 }
 
 func boundSteerReason(reason string) string {
@@ -162,7 +254,11 @@ func boundSteeringMessage(message string, limit int) string {
 	bounded := make([]byte, 0, minInt(len(message), limit))
 	for len(message) > 0 && len(bounded) < limit {
 		r, size := utf8.DecodeRuneInString(message)
-		if size == 0 || len(bounded)+size > limit {
+		encodedSize := utf8.RuneLen(r)
+		if encodedSize < 0 {
+			encodedSize = 1
+		}
+		if size == 0 || len(bounded)+encodedSize > limit {
 			break
 		}
 		if r < 0x20 && r != '\t' {
