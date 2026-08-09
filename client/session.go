@@ -7,6 +7,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -168,40 +169,153 @@ type Session struct {
 // ID returns the ACP session id this Session was created or loaded with.
 func (s *Session) ID() protocol.SessionID { return s.id }
 
-// copyConfigOptions returns a defensive copy of in: a fresh backing array so
-// a caller mutating the returned slice (or Session mutating its own stored
-// copy later) can never alias the other's memory. Nil in yields nil out
-// (never an empty-but-non-nil slice), matching this package's existing
-// append([]T(nil), src...) idiom elsewhere (see e.g.
-// internal/exampleagent/host.go, agent/list.go).
+func cloneRawMessage(in json.RawMessage) json.RawMessage {
+	if in == nil {
+		return nil
+	}
+	out := make(json.RawMessage, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneStringPtr(in *string) *string {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneCategoryPtr(in *protocol.SessionConfigOptionCategory) *protocol.SessionConfigOptionCategory {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneConfigSelectOption(in protocol.SessionConfigSelectOption) protocol.SessionConfigSelectOption {
+	out := in
+	out.Description = cloneStringPtr(in.Description)
+	out.Meta = cloneRawMessage(in.Meta)
+	return out
+}
+
+func cloneConfigSelectOptions(in []protocol.SessionConfigSelectOption) []protocol.SessionConfigSelectOption {
+	if in == nil {
+		return nil
+	}
+	out := make([]protocol.SessionConfigSelectOption, len(in))
+	for i, option := range in {
+		out[i] = cloneConfigSelectOption(option)
+	}
+	return out
+}
+
+func cloneConfigSelectGroup(in protocol.SessionConfigSelectGroup) protocol.SessionConfigSelectGroup {
+	out := in
+	out.Options = cloneConfigSelectOptions(in.Options)
+	out.Meta = cloneRawMessage(in.Meta)
+	return out
+}
+
+func cloneConfigSelectGroups(in []protocol.SessionConfigSelectGroup) []protocol.SessionConfigSelectGroup {
+	if in == nil {
+		return nil
+	}
+	out := make([]protocol.SessionConfigSelectGroup, len(in))
+	for i, group := range in {
+		out[i] = cloneConfigSelectGroup(group)
+	}
+	return out
+}
+
+func cloneConfigSelect(in *protocol.SessionConfigSelect) *protocol.SessionConfigSelect {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Options = protocol.SessionConfigSelectOptions{
+		Ungrouped: cloneConfigSelectOptions(in.Options.Ungrouped),
+		Grouped:   cloneConfigSelectGroups(in.Options.Grouped),
+	}
+	return &out
+}
+
+func cloneConfigBoolean(in *protocol.SessionConfigBoolean) *protocol.SessionConfigBoolean {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneConfigOption(in protocol.SessionConfigOption) protocol.SessionConfigOption {
+	out := in
+	out.Category = cloneCategoryPtr(in.Category)
+	out.Description = cloneStringPtr(in.Description)
+	out.Meta = cloneRawMessage(in.Meta)
+	out.Select = cloneConfigSelect(in.Select)
+	out.Boolean = cloneConfigBoolean(in.Boolean)
+	return out
+}
+
+// copyConfigOptions returns a deep defensive copy of in: every pointer,
+// RawMessage, variant, and nested option/group slice is cloned so a caller
+// mutating the returned value (or Session mutating its own stored copy later)
+// can never alias the other's memory. Nil in yields nil out, while a non-nil
+// empty slice remains non-nil.
 func copyConfigOptions(in []protocol.SessionConfigOption) []protocol.SessionConfigOption {
 	if in == nil {
 		return nil
 	}
-	return append([]protocol.SessionConfigOption(nil), in...)
+	out := make([]protocol.SessionConfigOption, len(in))
+	for i, option := range in {
+		out[i] = cloneConfigOption(option)
+	}
+	return out
 }
 
-// copyModeState returns a defensive copy of in: a new *SessionModeState with
-// its own AvailableModes backing array. Nil in yields nil out.
+func cloneSessionMode(in protocol.SessionMode) protocol.SessionMode {
+	out := in
+	out.Description = cloneStringPtr(in.Description)
+	out.Meta = cloneRawMessage(in.Meta)
+	return out
+}
+
+func cloneSessionModes(in []protocol.SessionMode) []protocol.SessionMode {
+	if in == nil {
+		return nil
+	}
+	out := make([]protocol.SessionMode, len(in))
+	for i, mode := range in {
+		out[i] = cloneSessionMode(mode)
+	}
+	return out
+}
+
+// copyModeState returns a deep defensive copy of in: a new
+// *SessionModeState with cloned metadata, descriptions, and AvailableModes.
+// Nil in yields nil out, while a non-nil empty AvailableModes slice remains
+// non-nil.
 func copyModeState(in *protocol.SessionModeState) *protocol.SessionModeState {
 	if in == nil {
 		return nil
 	}
 	out := *in
-	out.AvailableModes = append([]protocol.SessionMode(nil), in.AvailableModes...)
+	out.AvailableModes = cloneSessionModes(in.AvailableModes)
+	out.Meta = cloneRawMessage(in.Meta)
 	return &out
 }
 
 // ConfigOptions returns a defensive copy of this Session's most recently
-// known set of session configuration options: session/new's response
-// initially (see NewSession), replaced wholesale by SetConfigOption's own
-// response on every successful call (see SetConfigOption's doc — never a
-// partial merge). Nil if the agent never advertised any, or if this Session
-// was created via LoadSession/ResumeSession, whose config surface this
-// package does not populate from their own responses. The returned slice is
+// known set of session configuration options: session/new, session/load, or
+// session/resume's response initially, replaced wholesale by SetConfigOption's
+// own response on every successful call (see SetConfigOption's doc — never a
+// partial merge). Nil if the agent never advertised any. The returned slice is
 // this Session's own copy: mutating it never affects the Session's internal
-// state, and a later SetConfigOption response never mutates a slice a
-// caller is still holding from an earlier call.
+// state, and a later SetConfigOption response never mutates a slice a caller
+// is still holding from an earlier call.
 func (s *Session) ConfigOptions() []protocol.SessionConfigOption {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
@@ -209,13 +323,25 @@ func (s *Session) ConfigOptions() []protocol.SessionConfigOption {
 }
 
 // Modes returns a defensive copy of this Session's most recently known mode
-// state: session/new's response initially (see NewSession), updated by
-// SetMode on every successful call (see SetMode's doc). Nil under the same
-// conditions as ConfigOptions.
+// state: session/new, session/load, or session/resume's response initially,
+// updated by SetMode on every successful call (see SetMode's doc). Nil if the
+// agent never advertised mode state.
 func (s *Session) Modes() *protocol.SessionModeState {
 	s.configMu.Lock()
 	defer s.configMu.Unlock()
 	return copyModeState(s.modes)
+}
+
+// setConfigState replaces the Session's cached initial configuration state
+// with a defensive copy of an ACP session/new, session/load, or
+// session/resume response. The same lock and copy policy is used for every
+// lifecycle entry point so callers can safely read ConfigOptions/Modes while
+// a session is being registered or restored.
+func (s *Session) setConfigState(configOptions []protocol.SessionConfigOption, modes *protocol.SessionModeState) {
+	s.configMu.Lock()
+	s.configOptions = copyConfigOptions(configOptions)
+	s.modes = copyModeState(modes)
+	s.configMu.Unlock()
 }
 
 // newSession constructs a Session and starts its update-delivery pump.
@@ -605,10 +731,7 @@ func (c *Client) NewSession(ctx context.Context, p NewSessionParams) (*Session, 
 	if err != nil {
 		return nil, err
 	}
-	sess.configMu.Lock()
-	sess.configOptions = copyConfigOptions(resp.ConfigOptions)
-	sess.modes = copyModeState(resp.Modes)
-	sess.configMu.Unlock()
+	sess.setConfigState(resp.ConfigOptions, resp.Modes)
 	return sess, nil
 }
 
@@ -646,7 +769,7 @@ func (c *Client) LoadSession(ctx context.Context, p LoadSessionParams) (*Session
 	loadCtx, cancel := context.WithTimeout(ctx, c.loadTimeout())
 	defer cancel()
 
-	_, err = agent.LoadSession(loadCtx, protocol.LoadSessionRequest{
+	resp, err := agent.LoadSession(loadCtx, protocol.LoadSessionRequest{
 		SessionID:             p.SessionID,
 		Cwd:                   p.Cwd,
 		AdditionalDirectories: p.AdditionalDirectories,
@@ -664,6 +787,7 @@ func (c *Client) LoadSession(ctx context.Context, p LoadSessionParams) (*Session
 		}
 		return nil, wrapConnError(err)
 	}
+	sess.setConfigState(resp.ConfigOptions, resp.Modes)
 	return sess, nil
 }
 
@@ -684,7 +808,7 @@ func (c *Client) ResumeSession(ctx context.Context, p ResumeSessionParams) (*Ses
 		return nil, err
 	}
 
-	_, err = agent.ResumeSession(ctx, protocol.ResumeSessionRequest{
+	resp, err := agent.ResumeSession(ctx, protocol.ResumeSessionRequest{
 		SessionID:             p.SessionID,
 		Cwd:                   p.Cwd,
 		AdditionalDirectories: p.AdditionalDirectories,
@@ -695,6 +819,7 @@ func (c *Client) ResumeSession(ctx context.Context, p ResumeSessionParams) (*Ses
 		sess.abortUpdates()
 		return nil, wrapConnError(err)
 	}
+	sess.setConfigState(resp.ConfigOptions, resp.Modes)
 	return sess, nil
 }
 
@@ -734,11 +859,10 @@ func (s *Session) SetConfigOption(ctx context.Context, configID protocol.Session
 // Session's cached mode state is updated locally instead: CurrentModeID is
 // replaced with the id the caller just requested — the call succeeding is
 // the only confirmation the wire gives — leaving AvailableModes as most
-// recently known. If this Session has no cached mode state yet (a
-// LoadSession/ResumeSession-created Session, whose initial Modes this
-// package does not populate — see Modes' doc), a minimal SessionModeState
-// carrying only the new CurrentModeID is recorded rather than silently
-// discarding the confirmed change.
+// recently known. If this Session has no cached mode state yet (because the
+// agent omitted Modes from session/new, session/load, or session/resume), a
+// minimal SessionModeState carrying only the new CurrentModeID is recorded
+// rather than silently discarding the confirmed change.
 func (s *Session) SetMode(ctx context.Context, modeID protocol.SessionModeID) error {
 	agent, err := s.client.currentAgent()
 	if err != nil {
