@@ -175,7 +175,7 @@ func TestCodexSelectEffortNoOpsForEmptyEffort(t *testing.T) {
 	}
 }
 
-func TestCodexSelectsModelThenEffortFromRefreshedOptions(t *testing.T) {
+func TestCodexLoadThenSelectsModelThenEffortFromRefreshedOptions(t *testing.T) {
 	c := Codex("gpt-5.6-luna")
 	c.Effort = "max"
 	sess := &codexSelectorSession{

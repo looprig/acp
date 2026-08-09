@@ -1,6 +1,6 @@
 // config_internal_test.go covers Task 9's session configuration surface:
-// Session.ConfigOptions/Modes (defensive copies of session/new's response,
-// replaced by SetConfigOption/SetMode's own effects), and the gated
+// Session.ConfigOptions/Modes (defensive copies of session/new, session/load,
+// and session/resume responses, replaced by SetConfigOption/SetMode's own effects), and the gated
 // session/set_model extension (Client.ProveSetModelCapability +
 // Session.SetModel).
 package client
@@ -67,6 +67,105 @@ func sampleModeState() *protocol.SessionModeState {
 			{ID: "plan", Name: "Plan"},
 		},
 	}
+}
+
+func restoreConfigOptions() []protocol.SessionConfigOption {
+	modelCategory := protocol.SessionConfigOptionCategoryModel
+	effortCategory := protocol.SessionConfigOptionCategoryThoughtLevel
+	return []protocol.SessionConfigOption{
+		{
+			ID:       "model",
+			Name:     "Model",
+			Category: &modelCategory,
+			Select: &protocol.SessionConfigSelect{
+				CurrentValue: "gpt-5.6-luna",
+				Options: protocol.SessionConfigSelectOptions{Ungrouped: []protocol.SessionConfigSelectOption{
+					{Name: "Luna", Value: "gpt-5.6-luna"},
+				}},
+			},
+		},
+		{
+			ID:       "reasoning_effort",
+			Name:     "Reasoning effort",
+			Category: &effortCategory,
+			Select: &protocol.SessionConfigSelect{
+				CurrentValue: "max",
+				Options: protocol.SessionConfigSelectOptions{Ungrouped: []protocol.SessionConfigSelectOption{
+					{Name: "Maximum", Value: "max"},
+				}},
+			},
+		},
+	}
+}
+
+func assertRestoredConfigState(t *testing.T, sess *Session, wantOptions []protocol.SessionConfigOption, wantModes *protocol.SessionModeState) {
+	t.Helper()
+	expectedOptions := roundTripJSON(wantOptions)
+	expectedModes := roundTripJSON(wantModes)
+	if got := sess.ConfigOptions(); !reflect.DeepEqual(got, expectedOptions) {
+		t.Fatalf("ConfigOptions() = %#v, want %#v", got, expectedOptions)
+	}
+	if got := sess.Modes(); !reflect.DeepEqual(got, expectedModes) {
+		t.Fatalf("Modes() = %#v, want %#v", got, expectedModes)
+	}
+
+	// Mutating the response-owned values and the accessor results must never
+	// alter the Session's cached copies.
+	if len(wantOptions) > 0 {
+		wantOptions[0].Name = "mutated response"
+	}
+	if wantModes != nil {
+		wantModes.CurrentModeID = "mutated response"
+	}
+	gotOptions := sess.ConfigOptions()
+	gotModes := sess.Modes()
+	if len(gotOptions) > 0 {
+		gotOptions[0].Name = "mutated accessor"
+	}
+	if gotModes != nil {
+		gotModes.CurrentModeID = "mutated accessor"
+	}
+
+	if got := sess.ConfigOptions(); !reflect.DeepEqual(got, expectedOptions) {
+		t.Fatalf("ConfigOptions() after mutation = %#v, want %#v", got, expectedOptions)
+	}
+	if got := sess.Modes(); !reflect.DeepEqual(got, expectedModes) {
+		t.Fatalf("Modes() after mutation = %#v, want %#v", got, expectedModes)
+	}
+}
+
+func TestLoadSessionRetainsAdvertisedConfigOptionsAndModes(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	options := restoreConfigOptions()
+	modes := sampleModeState()
+	fa.onLoadSession = func(ctx context.Context, fa *fakeAgent, req protocol.LoadSessionRequest) (protocol.LoadSessionResponse, error) {
+		return protocol.LoadSessionResponse{ConfigOptions: options, Modes: modes}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sess, err := c.LoadSession(ctx, LoadSessionParams{SessionID: "sess-load-config", Cwd: "/work"})
+	if err != nil {
+		t.Fatalf("LoadSession() error = %v", err)
+	}
+	assertRestoredConfigState(t, sess, options, modes)
+}
+
+func TestResumeSessionRetainsAdvertisedConfigOptionsAndModes(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	options := restoreConfigOptions()
+	modes := sampleModeState()
+	fa.onResume = func(req protocol.ResumeSessionRequest) (protocol.ResumeSessionResponse, error) {
+		return protocol.ResumeSessionResponse{ConfigOptions: options, Modes: modes}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sess, err := c.ResumeSession(ctx, ResumeSessionParams{SessionID: "sess-resume-config", Cwd: "/work"})
+	if err != nil {
+		t.Fatalf("ResumeSession() error = %v", err)
+	}
+	assertRestoredConfigState(t, sess, options, modes)
 }
 
 // TestNewSessionRetainsDefensiveCopyOfConfigOptionsAndModes proves NewSession
@@ -280,9 +379,9 @@ func TestSetModeSendsExactRequestAndUpdatesLocalCurrentMode(t *testing.T) {
 }
 
 // TestSetModeWithNoCachedModesRecordsMinimalState proves SetMode still
-// records the confirmed mode change even when this Session had no cached
-// mode state at all beforehand (e.g. a LoadSession/ResumeSession-created
-// Session), rather than silently discarding it.
+// records the confirmed mode change even when the agent omitted initial mode
+// state from the session/load or session/resume response, rather than
+// silently discarding it.
 func TestSetModeWithNoCachedModesRecordsMinimalState(t *testing.T) {
 	c, fa := dialTestClient(t, Options{})
 	fa.onResume = func(req protocol.ResumeSessionRequest) (protocol.ResumeSessionResponse, error) {
