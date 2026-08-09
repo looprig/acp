@@ -598,7 +598,7 @@ func (c *Conn) runAsyncCall(
 	send, sendErr := c.writer.startSendContextWithAdmission(ctx, req, h.admission)
 	if sendErr != nil {
 		c.publishAsyncAdmission(h, false)
-		facts, err := c.abandonPendingCall(id, pending, CallResult{}, sendErr)
+		facts, err := c.abandonPendingCall(id, pending, result, CallResult{}, sendErr)
 		c.publishAsyncResult(h, facts, err)
 		return
 	}
@@ -609,7 +609,7 @@ func (c *Conn) runAsyncCall(
 	}
 	if !admitted {
 		sendResult := <-send.done
-		facts, err := c.abandonPendingCall(id, pending, CallResult{}, sendResult.err)
+		facts, err := c.abandonPendingCall(id, pending, result, CallResult{}, sendResult.err)
 		c.publishAsyncResult(h, facts, err)
 		return
 	}
@@ -630,17 +630,17 @@ func (c *Conn) runAsyncCall(
 			admitted = sendResult.admitted
 			cancelCh = ctx.Done()
 			if !admitted {
-				facts, err := c.abandonPendingCall(id, pending, CallResult{}, sendResult.err)
+				facts, err := c.abandonPendingCall(id, pending, result, CallResult{}, sendResult.err)
 				c.publishAsyncResult(h, facts, err)
 				return
 			}
 			if sendResult.err != nil {
-				facts, err := c.abandonPendingCall(id, pending, CallResult{WriteAdmitted: admitted}, sendResult.err)
+				facts, err := c.abandonPendingCall(id, pending, result, CallResult{WriteAdmitted: admitted}, sendResult.err)
 				c.publishAsyncResult(h, facts, err)
 				return
 			}
 		case <-cancelCh:
-			facts, err := c.abandonPendingCall(id, pending, CallResult{WriteAdmitted: admitted}, ctx.Err())
+			facts, err := c.abandonPendingCall(id, pending, result, CallResult{WriteAdmitted: admitted}, ctx.Err())
 			c.publishAsyncResult(h, facts, err)
 			return
 		}
@@ -659,7 +659,7 @@ func (c *Conn) publishAsyncResult(h *CallHandle, facts CallResult, err error) {
 // abandonPendingCall removes id if this async call still owns it. If a
 // response or shutdown already won that ownership race, prefer the queued
 // authoritative result over the caller's cancellation/send error.
-func (c *Conn) abandonPendingCall(id ID, pending <-chan callResult, fallback CallResult, fallbackErr error) (CallResult, error) {
+func (c *Conn) abandonPendingCall(id ID, pending <-chan callResult, result any, fallback CallResult, fallbackErr error) (CallResult, error) {
 	c.mu.Lock()
 	_, stillPending := c.pending[id]
 	if stillPending {
@@ -671,7 +671,7 @@ func (c *Conn) abandonPendingCall(id ID, pending <-chan callResult, fallback Cal
 	}
 	select {
 	case res := <-pending:
-		return deliverCallResult(res, nil, fallback.WriteAdmitted)
+		return deliverCallResult(res, result, fallback.WriteAdmitted)
 	default:
 		return fallback, fallbackErr
 	}
@@ -753,7 +753,7 @@ func (c *Conn) call(ctx context.Context, method string, params, result any, mint
 
 func deliverCallResult(res callResult, result any, writeAdmitted bool) (CallResult, error) {
 	facts := CallResult{
-		WriteAdmitted:    writeAdmitted,
+		WriteAdmitted:    writeAdmitted || res.receiveSequence != 0,
 		ResponseSequence: res.receiveSequence,
 		ReceiveSequence:  res.receiveSequence,
 	}
@@ -832,6 +832,13 @@ func (c *Conn) shutdown(cause error) {
 		c.closed = true
 		c.closeErr = &ConnClosedError{cause: cause}
 		pending := c.pending
+		// Publish every shutdown result while still holding mu. A caller that
+		// observes its pending entry removed must then be able to receive the
+		// authoritative close result; it must never fall through to a racing
+		// cancellation error while this publication is still outstanding.
+		for _, ch := range pending {
+			ch <- callResult{err: c.closeErr}
+		}
 		c.pending = make(map[ID]chan callResult)
 		c.mu.Unlock()
 
@@ -841,10 +848,6 @@ func (c *Conn) shutdown(cause error) {
 		c.notifyClosed = true
 		c.notifyMu.Unlock()
 		c.notifyCond.Broadcast()
-
-		for _, ch := range pending {
-			ch <- callResult{err: c.closeErr}
-		}
 
 		// Interrupt raw I/O before waiting for admitted Writer sends. A
 		// blocked Write must see the transport close or Writer.Close can wait
@@ -972,17 +975,19 @@ func (c *Conn) correlateResponse(resp *Response) {
 	ch, ok := c.pending[resp.ID]
 	if ok {
 		delete(c.pending, resp.ID)
+		// Keep publication under the same lock as removal. Otherwise a
+		// concurrent cancellation can observe the missing entry and return its
+		// fallback before this authoritative response reaches the channel.
+		if resp.Error != nil {
+			ch <- callResult{err: FromWireError(resp.Error), receiveSequence: resp.ReceiveSequence}
+		} else {
+			ch <- callResult{raw: resp.Result, receiveSequence: resp.ReceiveSequence}
+		}
 	}
 	c.mu.Unlock()
 	if !ok {
 		return
 	}
-
-	if resp.Error != nil {
-		ch <- callResult{err: FromWireError(resp.Error), receiveSequence: resp.ReceiveSequence}
-		return
-	}
-	ch <- callResult{raw: resp.Result, receiveSequence: resp.ReceiveSequence}
 }
 
 // dispatchRequest routes an incoming request to its registered handler, the

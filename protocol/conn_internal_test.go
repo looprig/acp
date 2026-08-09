@@ -113,6 +113,59 @@ func TestConnPendingTableTracksInFlightCalls(t *testing.T) {
 	}
 }
 
+func TestConnResponsePublicationLinearizesBeforeCancellation(t *testing.T) {
+	const attempts = 10000
+
+	for i := 0; i < attempts; i++ {
+		conn := &Conn{pending: make(map[ID]chan callResult)}
+		id := NewNumberID(int64(i + 1))
+		pending := make(chan callResult, 1)
+		conn.pending[id] = pending
+		response := &Response{
+			ID:              id,
+			Result:          json.RawMessage(`{"accepted":true}`),
+			ReceiveSequence: uint64(i + 1),
+		}
+		published := make(chan struct{})
+		go func() {
+			conn.correlateResponse(response)
+			close(published)
+		}()
+
+		// Observing removal is the cancellation side's linearization point. A
+		// response that has acknowledged ownership must already be available
+		// to the cancellation cleanup; it may not be lost in the gap between
+		// removing the map entry and publishing to its channel.
+		for {
+			conn.mu.Lock()
+			_, stillPending := conn.pending[id]
+			conn.mu.Unlock()
+			if !stillPending {
+				break
+			}
+			runtime.Gosched()
+		}
+
+		var payload struct {
+			Accepted bool `json:"accepted"`
+		}
+		facts, err := conn.abandonPendingCall(id, pending, &payload, CallResult{}, context.Canceled)
+		<-published
+		if err != nil {
+			t.Fatalf("attempt %d: abandonPendingCall() error = %v, want acknowledged response", i, err)
+		}
+		if facts.ResponseSequence != uint64(i+1) || facts.ReceiveSequence != uint64(i+1) {
+			t.Fatalf("attempt %d: response facts = %#v, want sequence %d", i, facts, i+1)
+		}
+		if !facts.WriteAdmitted {
+			t.Fatalf("attempt %d: acknowledged response facts = %#v, want WriteAdmitted=true", i, facts)
+		}
+		if !payload.Accepted {
+			t.Fatalf("attempt %d: acknowledged response payload = %#v, want accepted=true", i, payload)
+		}
+	}
+}
+
 func TestConnCallWithResultCarriesAdmissionAndResponseSequence(t *testing.T) {
 	assertNoGoroutineLeakInternal(t)
 	c1, c2 := net.Pipe()
