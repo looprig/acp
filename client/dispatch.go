@@ -25,7 +25,7 @@ import (
 // MethodNotFound response — no separate "capability disabled" error path is
 // needed.
 func (c *Client) registerClientHandlers(conn *protocol.Conn) {
-	conn.HandleNotify(string(protocol.MethodSessionUpdate), c.handleSessionUpdateNotify)
+	conn.HandleNotifyWithSequence(string(protocol.MethodSessionUpdate), c.handleSessionUpdateNotify)
 
 	if c.opts.Permissions != nil {
 		conn.Handle(string(protocol.MethodSessionRequestPermission), c.handleRequestPermission)
@@ -109,7 +109,7 @@ func wrapHandlerError(op string, err error) error {
 // silently vanishing with no way to observe it. A malformed notification
 // (fails to decode) is dropped the same way: there is no reliable sessionId
 // to attribute it to.
-func (c *Client) handleSessionUpdateNotify(_ context.Context, _ string, params json.RawMessage) {
+func (c *Client) handleSessionUpdateNotify(_ context.Context, _ string, params json.RawMessage, receiveSequence uint64) {
 	var n protocol.SessionNotification
 	if err := json.Unmarshal(params, &n); err != nil {
 		c.countDroppedUpdate()
@@ -124,7 +124,7 @@ func (c *Client) handleSessionUpdateNotify(_ context.Context, _ string, params j
 		return
 	}
 
-	sess.deliver(Update{SessionUpdate: n.Update, Meta: DecodeUpdateMeta(n.Meta)})
+	sess.deliver(Update{SessionUpdate: n.Update, Meta: DecodeUpdateMeta(n.Meta), ReceiveSequence: receiveSequence})
 }
 
 func (c *Client) countDroppedUpdate() {

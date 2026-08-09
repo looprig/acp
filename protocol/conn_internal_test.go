@@ -113,6 +113,170 @@ func TestConnPendingTableTracksInFlightCalls(t *testing.T) {
 	}
 }
 
+func TestConnCallWithResultCarriesAdmissionAndResponseSequence(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+	server.Handle("ordered", func(context.Context, string, json.RawMessage) (any, error) {
+		return map[string]string{"ok": "yes"}, nil
+	})
+
+	var result map[string]string
+	facts, err := client.CallWithResult(context.Background(), "ordered", nil, &result)
+	if err != nil {
+		t.Fatalf("CallWithResult() error = %v", err)
+	}
+	if !facts.WriteAdmitted {
+		t.Fatal("CallWithResult() reported false write admission after successful request")
+	}
+	if facts.ResponseSequence == 0 {
+		t.Fatal("CallWithResult() response sequence = 0, want stamped inbound response")
+	}
+	if result["ok"] != "yes" {
+		t.Fatalf("CallWithResult() result = %#v, want ok=yes", result)
+	}
+}
+
+func TestConnCallWithResultCarriesAdmissionOnPeerErrorAndEOF(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+
+	t.Run("peer error", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		client := NewConn(c1, c1, ConnOptions{})
+		server := NewConn(c2, c2, ConnOptions{})
+		t.Cleanup(func() { client.Close(); server.Close() })
+		server.Handle("error", func(context.Context, string, json.RawMessage) (any, error) {
+			return nil, InvalidParams("bad steering", nil)
+		})
+
+		facts, err := client.CallWithResult(context.Background(), "error", nil, nil)
+		if err == nil {
+			t.Fatal("CallWithResult() error = nil, want peer error")
+		}
+		if !facts.WriteAdmitted || facts.ResponseSequence == 0 {
+			t.Fatalf("CallWithResult() facts = %#v, want admitted response sequence", facts)
+		}
+	})
+
+	t.Run("peer EOF", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		client := NewConn(c1, c1, ConnOptions{})
+		server := NewConn(c2, c2, ConnOptions{})
+		reached := make(chan struct{})
+		release := make(chan struct{})
+		server.Handle("eof", func(context.Context, string, json.RawMessage) (any, error) {
+			close(reached)
+			<-release
+			return nil, nil
+		})
+		t.Cleanup(func() { client.Close(); server.Close() })
+
+		done := make(chan struct{})
+		var facts CallResult
+		var err error
+		go func() {
+			facts, err = client.CallWithResult(context.Background(), "eof", nil, nil)
+			close(done)
+		}()
+		<-reached
+		_ = server.Close()
+		close(release)
+		<-done
+		if err == nil {
+			t.Fatal("CallWithResult() error = nil, want peer EOF/close")
+		}
+		if !facts.WriteAdmitted {
+			t.Fatalf("CallWithResult() facts = %#v, want admitted request after peer close", facts)
+		}
+	})
+}
+
+func TestConnWaitForNotificationsThroughResponseSequence(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	notifyDone := make(chan struct{})
+	client.HandleNotifyWithSequence("ordered.notify", func(context.Context, string, json.RawMessage, uint64) {
+		close(notifyDone)
+	})
+	server.Handle("ordered.call", func(context.Context, string, json.RawMessage) (any, error) {
+		if err := server.Notify(context.Background(), "ordered.notify", map[string]string{"v": "1"}); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	})
+
+	facts, err := client.CallWithResult(context.Background(), "ordered.call", nil, nil)
+	if err != nil {
+		t.Fatalf("CallWithResult() error = %v", err)
+	}
+	if facts.ResponseSequence == 0 {
+		t.Fatal("CallWithResult() response sequence = 0")
+	}
+	if err := client.WaitForNotificationsThrough(context.Background(), facts.ResponseSequence); err != nil {
+		t.Fatalf("WaitForNotificationsThrough() error = %v", err)
+	}
+	select {
+	case <-notifyDone:
+	default:
+		t.Fatal("notification barrier returned before registered handler completed")
+	}
+}
+
+func TestConnWaitForNotificationsThroughDoesNotWaitForLaterNotification(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	firstDone := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	client.HandleNotifyWithSequence("ordered.first", func(context.Context, string, json.RawMessage, uint64) {
+		close(firstDone)
+	})
+	client.HandleNotifyWithSequence("ordered.second", func(context.Context, string, json.RawMessage, uint64) {
+		close(secondStarted)
+		<-releaseSecond
+	})
+	server.Handle("ordered.call", func(context.Context, string, json.RawMessage) (any, error) {
+		if err := server.Notify(context.Background(), "ordered.first", nil); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	})
+
+	facts, err := client.CallWithResult(context.Background(), "ordered.call", nil, nil)
+	if err != nil {
+		t.Fatalf("CallWithResult() error = %v", err)
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- server.Notify(context.Background(), "ordered.second", nil) }()
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for later notification handler to start")
+	}
+	if err := client.WaitForNotificationsThrough(context.Background(), facts.ResponseSequence); err != nil {
+		t.Fatalf("WaitForNotificationsThrough() error = %v", err)
+	}
+	select {
+	case <-firstDone:
+	default:
+		t.Fatal("response-sequence barrier returned before the earlier notification completed")
+	}
+	close(releaseSecond)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("later notification send error = %v", err)
+	}
+}
+
 func TestConnCallContextCancelRemovesPendingEntry(t *testing.T) {
 	assertNoGoroutineLeakInternal(t)
 

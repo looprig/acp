@@ -2,6 +2,7 @@ package protocol_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -206,6 +207,82 @@ func TestWriterSendRejectsOversizedMessage(t *testing.T) {
 	var tooLarge *protocol.FrameTooLargeError
 	if !errors.As(err, &tooLarge) {
 		t.Fatalf("Send() error = %v (%T), want *FrameTooLargeError", err, err)
+	}
+}
+
+func TestWriterSendContextResultReportsPreAdmissionCancellationWithoutWrite(t *testing.T) {
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+	defer w.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, err := w.SendContextResult(ctx, frame{Worker: 1, Seq: 1})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SendContextResult() error = %v, want context.Canceled", err)
+	}
+	if result.WriteAdmitted {
+		t.Fatal("SendContextResult() reported write admission after pre-admission cancellation")
+	}
+	if got := buf.String(); got != "" {
+		t.Fatalf("writer output = %q, want no write", got)
+	}
+}
+
+func TestWriterSendContextResultReportsAdmissionAfterFrameQueued(t *testing.T) {
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+
+	result, err := w.SendContextResult(context.Background(), frame{Worker: 2, Seq: 3})
+	if err != nil {
+		t.Fatalf("SendContextResult() error = %v", err)
+	}
+	if !result.WriteAdmitted {
+		t.Fatal("SendContextResult() reported false write admission after successful send")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := buf.String(); got == "" {
+		t.Fatal("writer output is empty after successful admitted send")
+	}
+}
+
+func TestWriterSendContextResultKeepsAdmissionAfterCancellationDuringWrite(t *testing.T) {
+	sink := newGatedWriter()
+	w := protocol.NewWriter(sink)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct {
+		result protocol.WriteResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := w.SendContextResult(ctx, frame{Worker: 3, Seq: 4})
+		done <- struct {
+			result protocol.WriteResult
+			err    error
+		}{result: result, err: err}
+	}()
+	<-sink.started
+	cancel()
+
+	select {
+	case outcome := <-done:
+		if !errors.Is(outcome.err, context.Canceled) {
+			t.Fatalf("SendContextResult() error = %v, want context.Canceled", outcome.err)
+		}
+		if !outcome.result.WriteAdmitted {
+			t.Fatal("SendContextResult() reported false admission after underlying Write started")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SendContextResult() remained blocked after cancellation during write")
+	}
+
+	close(sink.release)
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
 }
 

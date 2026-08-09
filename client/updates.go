@@ -59,4 +59,8 @@ type Update struct {
 	SessionUpdate protocol.SessionUpdate
 	// Meta is this update's decoded _meta object.
 	Meta UpdateMeta
+	// ReceiveSequence is the Conn-owned monotonic sequence assigned to the
+	// inbound session/update notification before it entered the ordered
+	// notification worker.
+	ReceiveSequence uint64
 }

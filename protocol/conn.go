@@ -44,6 +44,12 @@ type HandlerFunc func(ctx context.Context, method string, params json.RawMessage
 // notifications never receive a response.
 type NotifyFunc func(ctx context.Context, method string, params json.RawMessage)
 
+// NotifyWithSequenceFunc is the ordered form of NotifyFunc. The receive
+// sequence is minted by Conn's single read loop before the notification is
+// queued, so a handler can correlate its delivery with a response without
+// creating another reader or racing a second dispatch path.
+type NotifyWithSequenceFunc func(ctx context.Context, method string, params json.RawMessage, receiveSequence uint64)
+
 // ConnOptions configures a Conn constructed by NewConn.
 type ConnOptions struct {
 	// ExtIDBase sets the starting id minted for extension-traffic calls (the
@@ -77,8 +83,25 @@ func (e *ConnClosedError) Unwrap() error { return e.cause }
 // callResult is what a pending Call is waiting to receive: either a decoded
 // success (raw json result bytes) or a failure.
 type callResult struct {
-	raw json.RawMessage
-	err error
+	raw             json.RawMessage
+	err             error
+	receiveSequence uint64
+}
+
+// CallResult contains ordered transport facts for one Conn call. The
+// response sequence is zero only when no response was received (for example,
+// cancellation or connection loss before the peer replied). WriteAdmitted is
+// true once the request frame crossed Writer's admission boundary; it remains
+// true for every later response, protocol error, timeout, or connection error.
+type CallResult struct {
+	WriteAdmitted    bool
+	ResponseSequence uint64
+	ReceiveSequence  uint64
+}
+
+type bufferedNotification struct {
+	params          json.RawMessage
+	receiveSequence uint64
 }
 
 // Conn is one bidirectional JSON-RPC connection. It routes incoming requests
@@ -107,12 +130,14 @@ type Conn struct {
 
 	// handlersMu guards all handler registration state, including the
 	// per-method notification buffers used before HandleNotify is called.
-	handlersMu     sync.Mutex
-	handlers       map[string]HandlerFunc
-	notifyHandlers map[string]NotifyFunc
-	unknownRequest HandlerFunc
-	unknownNotify  NotifyFunc
-	notifyBuffers  map[string][]json.RawMessage
+	handlersMu        sync.Mutex
+	handlers          map[string]HandlerFunc
+	notifyHandlers    map[string]NotifyFunc
+	notifySeqHandlers map[string]NotifyWithSequenceFunc
+	unknownRequest    HandlerFunc
+	unknownNotify     NotifyFunc
+	unknownNotifySeq  NotifyWithSequenceFunc
+	notifyBuffers     map[string][]bufferedNotification
 
 	droppedNotifications atomic.Uint64
 
@@ -147,9 +172,17 @@ type Conn struct {
 	notifyQueue   []func()
 	notifyClosed  bool
 
+	notifyStateMu sync.Mutex
+	notifyPending map[uint64]struct{}
+	notifyChanged chan struct{}
+
 	done         chan struct{}
 	readLoopDone chan struct{}
 	closeOnce    sync.Once
+
+	receiveMu      sync.Mutex
+	receiveThrough uint64
+	receiveChanged chan struct{}
 }
 
 // NewConn wraps r and w as one JSON-RPC connection and starts its internal
@@ -157,17 +190,21 @@ type Conn struct {
 // and for Call/Notify immediately.
 func NewConn(r io.Reader, w io.Writer, opts ConnOptions) *Conn {
 	c := &Conn{
-		fr:             NewFrameReader(r),
-		writer:         NewWriter(w),
-		r:              r,
-		w:              w,
-		pending:        make(map[ID]chan callResult),
-		handlers:       make(map[string]HandlerFunc),
-		notifyHandlers: make(map[string]NotifyFunc),
-		notifyBuffers:  make(map[string][]json.RawMessage),
-		sem:            make(chan struct{}, MaxInFlightHandlers),
-		done:           make(chan struct{}),
-		readLoopDone:   make(chan struct{}),
+		fr:                NewFrameReader(r),
+		writer:            NewWriter(w),
+		r:                 r,
+		w:                 w,
+		pending:           make(map[ID]chan callResult),
+		handlers:          make(map[string]HandlerFunc),
+		notifyHandlers:    make(map[string]NotifyFunc),
+		notifySeqHandlers: make(map[string]NotifyWithSequenceFunc),
+		notifyBuffers:     make(map[string][]bufferedNotification),
+		sem:               make(chan struct{}, MaxInFlightHandlers),
+		done:              make(chan struct{}),
+		readLoopDone:      make(chan struct{}),
+		receiveChanged:    make(chan struct{}),
+		notifyPending:     make(map[uint64]struct{}),
+		notifyChanged:     make(chan struct{}),
 	}
 	c.notifyCond = sync.NewCond(&c.notifyMu)
 
@@ -206,6 +243,72 @@ func (c *Conn) WaitForNotifications(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return c.waitForNotificationMarker(ctx)
+}
+
+// WaitForNotificationsThrough waits until Conn has observed receiveSequence
+// and every notification at or before that sequence has completed its
+// registered handler. It never reads from a Session.Updates channel; the
+// client layer's session handler has already placed the update in its own
+// queue by the time this barrier completes.
+func (c *Conn) WaitForNotificationsThrough(ctx context.Context, receiveSequence uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for {
+		c.receiveMu.Lock()
+		if c.receiveThrough >= receiveSequence {
+			c.receiveMu.Unlock()
+			break
+		}
+		changed := c.receiveChanged
+		c.receiveMu.Unlock()
+		select {
+		case <-changed:
+		case <-c.done:
+			return c.closedError()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	// readLoop dispatches notifications under notifyOrderMu. Taking that
+	// mutex here closes the small gap between observing receiveThrough and
+	// recording the corresponding handler job in notifyPending.
+	c.notifyOrderMu.Lock()
+	c.notifyOrderMu.Unlock()
+	for {
+		c.notifyStateMu.Lock()
+		pending := false
+		for seq := range c.notifyPending {
+			if seq <= receiveSequence {
+				pending = true
+				break
+			}
+		}
+		changed := c.notifyChanged
+		c.notifyStateMu.Unlock()
+		if !pending {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-c.done:
+			return c.closedError()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// WaitForReceiveSequence is an additive name for
+// WaitForNotificationsThrough. It is useful to callers that want to make
+// clear that responses and notifications share one receive-order clock.
+func (c *Conn) WaitForReceiveSequence(ctx context.Context, receiveSequence uint64) error {
+	return c.WaitForNotificationsThrough(ctx, receiveSequence)
+}
+
+func (c *Conn) waitForNotificationMarker(ctx context.Context) error {
 
 	markerDone := make(chan struct{})
 	c.notifyOrderMu.Lock()
@@ -267,11 +370,32 @@ func (c *Conn) HandleNotify(method string, h NotifyFunc) {
 	defer c.notifyOrderMu.Unlock()
 	c.handlersMu.Lock()
 	c.notifyHandlers[method] = h
+	delete(c.notifySeqHandlers, method)
 	buffered := c.notifyBuffers[method]
 	delete(c.notifyBuffers, method)
-	for _, params := range buffered {
-		params := params
-		c.enqueueNotifyJob(func() { h(context.Background(), method, params) })
+	for _, buffered := range buffered {
+		buffered := buffered
+		c.enqueueTrackedNotifyJob(buffered.receiveSequence, func() { h(context.Background(), method, buffered.params) })
+	}
+	c.handlersMu.Unlock()
+}
+
+// HandleNotifyWithSequence is HandleNotify's ordered form. The callback is
+// invoked by the same single notification worker, with the receive sequence
+// minted by Conn's read loop before enqueueing.
+func (c *Conn) HandleNotifyWithSequence(method string, h NotifyWithSequenceFunc) {
+	c.notifyOrderMu.Lock()
+	defer c.notifyOrderMu.Unlock()
+	c.handlersMu.Lock()
+	c.notifySeqHandlers[method] = h
+	delete(c.notifyHandlers, method)
+	buffered := c.notifyBuffers[method]
+	delete(c.notifyBuffers, method)
+	for _, buffered := range buffered {
+		buffered := buffered
+		c.enqueueTrackedNotifyJob(buffered.receiveSequence, func() {
+			h(context.Background(), method, buffered.params, buffered.receiveSequence)
+		})
 	}
 	c.handlersMu.Unlock()
 }
@@ -295,6 +419,17 @@ func (c *Conn) HandleUnknownRequest(h HandlerFunc) {
 func (c *Conn) HandleUnknownNotify(h NotifyFunc) {
 	c.handlersMu.Lock()
 	c.unknownNotify = h
+	c.unknownNotifySeq = nil
+	c.handlersMu.Unlock()
+}
+
+// HandleUnknownNotifyWithSequence registers the ordered catch-all variant of
+// HandleUnknownNotify. It is primarily useful to protocol adapters that need
+// to observe extension notifications without opening a second reader.
+func (c *Conn) HandleUnknownNotifyWithSequence(h NotifyWithSequenceFunc) {
+	c.handlersMu.Lock()
+	c.unknownNotifySeq = h
+	c.unknownNotify = nil
 	c.handlersMu.Unlock()
 }
 
@@ -309,6 +444,14 @@ func (c *Conn) HandleUnknownNotify(h NotifyFunc) {
 // typed error. A canceled ctx unblocks Call with ctx.Err() and removes the
 // pending entry; it never leaks.
 func (c *Conn) Call(ctx context.Context, method string, params, result any) error {
+	_, err := c.call(ctx, method, params, result, c.mintCallID)
+	return err
+}
+
+// CallWithResult is Call's additive ordered form. It preserves the generic
+// method-string primitive inside protocol while returning write-admission and
+// inbound response sequence facts needed by typed extension callers.
+func (c *Conn) CallWithResult(ctx context.Context, method string, params, result any) (CallResult, error) {
 	return c.call(ctx, method, params, result, c.mintCallID)
 }
 
@@ -317,22 +460,23 @@ func (c *Conn) Call(ctx context.Context, method string, params, result any) erro
 // unexported for now — Task 1.7's typed surface is expected to expose it (or
 // something built on it) for vendor/extension calls once that layer exists.
 func (c *Conn) callExt(ctx context.Context, method string, params, result any) error {
-	return c.call(ctx, method, params, result, c.mintExtID)
+	_, err := c.call(ctx, method, params, result, c.mintExtID)
+	return err
 }
 
 func (c *Conn) mintCallID() int64 { return c.nextCallID.Add(1) }
 func (c *Conn) mintExtID() int64  { return c.nextExtID.Add(1) }
 
-func (c *Conn) call(ctx context.Context, method string, params, result any, mintID func() int64) error {
+func (c *Conn) call(ctx context.Context, method string, params, result any, mintID func() int64) (CallResult, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return CallResult{}, err
 	}
 
 	c.mu.Lock()
 	if c.closed {
 		err := error(c.closeErr)
 		c.mu.Unlock()
-		return err
+		return CallResult{}, err
 	}
 
 	var raw json.RawMessage
@@ -340,7 +484,7 @@ func (c *Conn) call(ctx context.Context, method string, params, result any, mint
 		r, err := json.Marshal(params)
 		if err != nil {
 			c.mu.Unlock()
-			return fmt.Errorf("protocol: marshal call params: %w", err)
+			return CallResult{}, fmt.Errorf("protocol: marshal call params: %w", err)
 		}
 		raw = r
 	}
@@ -351,7 +495,8 @@ func (c *Conn) call(ctx context.Context, method string, params, result any, mint
 	c.mu.Unlock()
 
 	req := &Request{ID: id, Method: method, Params: raw}
-	if sendErr := c.writer.SendContext(ctx, req); sendErr != nil {
+	sendResult, sendErr := c.writer.SendContextResult(ctx, req)
+	if sendErr != nil {
 		// If our entry is still in the pending table, nobody else will ever
 		// resolve it (a shutdown that already ran would have removed it as
 		// part of its fail-all sweep before the writer could report
@@ -367,13 +512,13 @@ func (c *Conn) call(ctx context.Context, method string, params, result any, mint
 		}
 		c.mu.Unlock()
 		if stillPending {
-			return sendErr
+			return CallResult{WriteAdmitted: sendResult.WriteAdmitted}, sendErr
 		}
 	}
 
 	select {
 	case res := <-resultCh:
-		return deliverCallResult(res, result)
+		return deliverCallResult(res, result, sendResult.WriteAdmitted)
 	case <-ctx.Done():
 		c.mu.Lock()
 		_, stillPending := c.pending[id]
@@ -382,30 +527,35 @@ func (c *Conn) call(ctx context.Context, method string, params, result any, mint
 		}
 		c.mu.Unlock()
 		if stillPending {
-			return ctx.Err()
+			return CallResult{WriteAdmitted: sendResult.WriteAdmitted}, ctx.Err()
 		}
 		// The entry was resolved concurrently between ctx firing and us
 		// acquiring the lock (a response arrived, or shutdown swept it):
 		// prefer that real result over ctx.Err() rather than discarding it.
 		select {
 		case res := <-resultCh:
-			return deliverCallResult(res, result)
+			return deliverCallResult(res, result, sendResult.WriteAdmitted)
 		default:
-			return ctx.Err()
+			return CallResult{WriteAdmitted: sendResult.WriteAdmitted}, ctx.Err()
 		}
 	}
 }
 
-func deliverCallResult(res callResult, result any) error {
+func deliverCallResult(res callResult, result any, writeAdmitted bool) (CallResult, error) {
+	facts := CallResult{
+		WriteAdmitted:    writeAdmitted,
+		ResponseSequence: res.receiveSequence,
+		ReceiveSequence:  res.receiveSequence,
+	}
 	if res.err != nil {
-		return res.err
+		return facts, res.err
 	}
 	if result != nil && len(res.raw) > 0 {
 		if err := json.Unmarshal(res.raw, result); err != nil {
-			return fmt.Errorf("protocol: unmarshal call result: %w", err)
+			return facts, fmt.Errorf("protocol: unmarshal call result: %w", err)
 		}
 	}
-	return nil
+	return facts, nil
 }
 
 // Notify sends a JSON-RPC notification for method with params (marshaled to
@@ -413,15 +563,22 @@ func deliverCallResult(res callResult, result any) error {
 // response. Notify returns *ConnClosedError immediately if c is already
 // closed.
 func (c *Conn) Notify(ctx context.Context, method string, params any) error {
+	_, err := c.NotifyWithResult(ctx, method, params)
+	return err
+}
+
+// NotifyWithResult is Notify's admission-aware form. Notifications have no
+// inbound response sequence, so it returns only the writer fact.
+func (c *Conn) NotifyWithResult(ctx context.Context, method string, params any) (WriteResult, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return WriteResult{}, err
 	}
 
 	c.mu.Lock()
 	if c.closed {
 		err := error(c.closeErr)
 		c.mu.Unlock()
-		return err
+		return WriteResult{}, err
 	}
 	c.mu.Unlock()
 
@@ -429,13 +586,13 @@ func (c *Conn) Notify(ctx context.Context, method string, params any) error {
 	if params != nil {
 		r, err := json.Marshal(params)
 		if err != nil {
-			return fmt.Errorf("protocol: marshal notify params: %w", err)
+			return WriteResult{}, fmt.Errorf("protocol: marshal notify params: %w", err)
 		}
 		raw = r
 	}
 
 	n := &Notification{Method: method, Params: raw}
-	return c.writer.SendContext(ctx, n)
+	return c.writer.SendContextResult(ctx, n)
 }
 
 // Close stops c from accepting further Call/Notify calls (which now fail
@@ -530,11 +687,29 @@ func (c *Conn) readLoop() {
 		case KindRequest:
 			c.dispatchRequest(env.Request)
 		case KindNotification:
+			seq := c.stampReceive()
+			env.Notification.ReceiveSequence = seq
 			c.dispatchNotification(env.Notification)
 		case KindResponse:
+			seq := c.stampReceive()
+			env.Response.ReceiveSequence = seq
 			c.correlateResponse(env.Response)
 		}
 	}
+}
+
+// stampReceive advances the one receive-order clock owned by readLoop. It is
+// intentionally called only for inbound responses and notifications: request
+// handlers are peer-to-client calls, not observations that a client driver
+// must merge with prompt/update/extension outcomes.
+func (c *Conn) stampReceive() uint64 {
+	c.receiveMu.Lock()
+	c.receiveThrough++
+	seq := c.receiveThrough
+	close(c.receiveChanged)
+	c.receiveChanged = make(chan struct{})
+	c.receiveMu.Unlock()
+	return seq
 }
 
 // correlateResponse delivers resp to the pending Call waiting on its id, if
@@ -552,10 +727,10 @@ func (c *Conn) correlateResponse(resp *Response) {
 	}
 
 	if resp.Error != nil {
-		ch <- callResult{err: FromWireError(resp.Error)}
+		ch <- callResult{err: FromWireError(resp.Error), receiveSequence: resp.ReceiveSequence}
 		return
 	}
-	ch <- callResult{raw: resp.Result}
+	ch <- callResult{raw: resp.Result, receiveSequence: resp.ReceiveSequence}
 }
 
 // dispatchRequest routes an incoming request to its registered handler, the
@@ -622,18 +797,35 @@ func (c *Conn) dispatchNotification(n *Notification) {
 	if h, ok := c.notifyHandlers[n.Method]; ok {
 		c.handlersMu.Unlock()
 		method, params := n.Method, n.Params
-		c.enqueueNotifyJob(func() { h(context.Background(), method, params) })
+		c.enqueueTrackedNotifyJob(n.ReceiveSequence, func() { h(context.Background(), method, params) })
+		return
+	}
+
+	if h, ok := c.notifySeqHandlers[n.Method]; ok {
+		c.handlersMu.Unlock()
+		method, params, seq := n.Method, n.Params, n.ReceiveSequence
+		c.enqueueTrackedNotifyJob(seq, func() { h(context.Background(), method, params, seq) })
 		return
 	}
 
 	if h := c.unknownNotify; h != nil {
 		c.handlersMu.Unlock()
 		method, params := n.Method, n.Params
-		c.enqueueNotifyJob(func() { h(context.Background(), method, params) })
+		c.enqueueTrackedNotifyJob(n.ReceiveSequence, func() { h(context.Background(), method, params) })
 		return
 	}
 
-	buf := append(c.notifyBuffers[n.Method], n.Params)
+	if h := c.unknownNotifySeq; h != nil {
+		c.handlersMu.Unlock()
+		method, params, seq := n.Method, n.Params, n.ReceiveSequence
+		c.enqueueTrackedNotifyJob(seq, func() { h(context.Background(), method, params, seq) })
+		return
+	}
+
+	buf := append(c.notifyBuffers[n.Method], bufferedNotification{
+		params:          n.Params,
+		receiveSequence: n.ReceiveSequence,
+	})
 	if drop := len(buf) - NotifyBufferDepth; drop > 0 {
 		buf = buf[drop:]
 		// drop is bounded above by len(buf) (an in-memory slice length,
@@ -653,15 +845,45 @@ func (c *Conn) dispatchNotification(n *Notification) {
 // unbounded slice guarded by notifyMu, not a fixed-capacity channel, so a
 // slow (or stalled) notifyWorker can never make a caller — in particular the
 // read loop, via dispatchNotification — block here.
-func (c *Conn) enqueueNotifyJob(job func()) {
+func (c *Conn) enqueueNotifyJob(job func()) bool {
 	c.notifyMu.Lock()
 	if c.notifyClosed {
 		c.notifyMu.Unlock()
-		return
+		return false
 	}
 	c.notifyQueue = append(c.notifyQueue, job)
 	c.notifyMu.Unlock()
 	c.notifyCond.Signal()
+	return true
+}
+
+// enqueueTrackedNotifyJob records a notification handler as pending by its
+// receive sequence and clears that record only after the handler returns.
+// Generic jobs (barriers and white-box test jobs) intentionally use the
+// untracked enqueueNotifyJob path.
+func (c *Conn) enqueueTrackedNotifyJob(sequence uint64, job func()) {
+	if sequence == 0 {
+		c.enqueueNotifyJob(job)
+		return
+	}
+	c.notifyStateMu.Lock()
+	c.notifyPending[sequence] = struct{}{}
+	c.notifyStateMu.Unlock()
+	accepted := c.enqueueNotifyJob(func() {
+		defer c.completeTrackedNotify(sequence)
+		job()
+	})
+	if !accepted {
+		c.completeTrackedNotify(sequence)
+	}
+}
+
+func (c *Conn) completeTrackedNotify(sequence uint64) {
+	c.notifyStateMu.Lock()
+	delete(c.notifyPending, sequence)
+	close(c.notifyChanged)
+	c.notifyChanged = make(chan struct{})
+	c.notifyStateMu.Unlock()
 }
 
 // notifyWorker is the single goroutine that drains the notify queue,

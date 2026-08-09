@@ -148,10 +148,24 @@ func (e *WriterClosedError) Error() string {
 // surfaced from the underlying io.Writer).
 func (e *WriterClosedError) Unwrap() error { return e.cause }
 
+// WriteResult records the one transport fact a caller cannot recover from an
+// ordinary error value: whether the fully-framed message crossed Writer's
+// admission boundary. A false value proves the frame was never eligible for
+// the underlying io.Writer and therefore was not written by Writer. Once the
+// frame is admitted, this remains true even when a later context cancellation
+// or transport failure makes SendContextResult return an error.
+type WriteResult struct {
+	WriteAdmitted bool
+}
+
+// SendResult is an additive spelling for callers that think in terms of the
+// Writer's Send operation rather than the underlying write. It is an alias so
+// both names describe exactly the same admission fact.
+type SendResult = WriteResult
+
 // writeJob is one queued Send: the fully framed line to write, and the
 // channel its result is delivered on.
 type writeJob struct {
-	ctx   context.Context
 	line  []byte
 	errCh chan error
 }
@@ -174,8 +188,13 @@ type writeJob struct {
 // dropped or where a sender whose write already succeeded could still
 // observe a closed error.
 type Writer struct {
-	mu       sync.Mutex
-	closed   bool
+	mu     sync.Mutex
+	closed bool
+	// senders counts calls that have passed the closed check but have not yet
+	// either put a job on queue or abandoned it because their context was
+	// canceled. Close waits for this first so no goroutine can call Add on
+	// admitted after Close begins waiting.
+	senders  sync.WaitGroup
 	admitted sync.WaitGroup
 
 	queue    chan writeJob
@@ -221,13 +240,13 @@ func (wr *Writer) run(w io.Writer) {
 
 func (wr *Writer) runJob(w io.Writer, job writeJob) {
 	defer wr.admitted.Done()
-	select {
-	case <-job.ctx.Done():
-		job.errCh <- job.ctx.Err()
-	default:
-		_, err := w.Write(job.line)
-		job.errCh <- err
-	}
+	// Admission is deliberately the point of no cancellation-based return:
+	// once a job is on queue it is irrevocably eligible for the underlying
+	// write. SendContextResult may already have returned ctx.Err() to its
+	// caller, but the admitted job is still drained and attempted exactly as
+	// Close's accounting promises.
+	_, err := w.Write(job.line)
+	job.errCh <- err
 }
 
 // Send marshals msg as JSON, appends a newline, and hands the resulting
@@ -239,30 +258,41 @@ func (wr *Writer) Send(msg any) error {
 	return wr.SendContext(context.Background(), msg)
 }
 
-// SendContext is Send's cancellation-aware form. If ctx is canceled while a
-// job is queued, the writer skips the underlying write and returns ctx.Err().
-// If the underlying Write is already blocked, SendContext returns ctx.Err()
-// to its caller but keeps the admitted job tracked until the write completes;
-// transport shutdown must still release that write before Writer.Close can
-// finish. This preserves Writer.Close's no-lost-admitted-job accounting and
-// keeps the writer goroutine owned by the Writer rather than by the caller.
+// SendContext is Send's cancellation-aware form. If ctx is canceled before a
+// job is queued, no underlying write is attempted and SendContext returns
+// ctx.Err(). Once the job is admitted, SendContext may still return ctx.Err()
+// while the writer drains and attempts that admitted job; transport shutdown
+// must release a blocked Write before Writer.Close can finish. This preserves
+// Writer.Close's no-lost-admitted-job accounting and keeps the writer
+// goroutine owned by the Writer rather than by the caller.
 func (wr *Writer) SendContext(ctx context.Context, msg any) error {
+	_, err := wr.SendContextResult(ctx, msg)
+	return err
+}
+
+// SendContextResult is SendContext's admission-aware form. A context canceled
+// before the frame is queued returns WriteAdmitted=false and Writer never
+// attempts the underlying write. Once queue admission succeeds, every return
+// carries WriteAdmitted=true, including context cancellation while the raw
+// write or response wait is still in progress.
+func (wr *Writer) SendContextResult(ctx context.Context, msg any) (WriteResult, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return WriteResult{}, err
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("protocol: marshal frame for send: %w", err)
+		return WriteResult{}, fmt.Errorf("protocol: marshal frame for send: %w", err)
 	}
 	if len(data) > MaxMessageBytes {
-		return &FrameTooLargeError{Limit: MaxMessageBytes}
+		return WriteResult{}, &FrameTooLargeError{Limit: MaxMessageBytes}
 	}
 
 	wr.mu.Lock()
 	if wr.closed {
 		wr.mu.Unlock()
-		return &WriterClosedError{}
+		return WriteResult{}, &WriterClosedError{}
 	}
+	wr.senders.Add(1)
 	wr.admitted.Add(1)
 	wr.mu.Unlock()
 
@@ -271,7 +301,7 @@ func (wr *Writer) SendContext(ctx context.Context, msg any) error {
 	line = append(line, '\n')
 
 	errCh := make(chan error, 1)
-	job := writeJob{ctx: ctx, line: line, errCh: errCh}
+	job := writeJob{line: line, errCh: errCh}
 	// This send onto queue cannot block forever: it is only reached while
 	// wr.closed is still false at the moment Close's Wait below could
 	// observe this goroutine, which means the writer goroutine has not yet
@@ -280,16 +310,18 @@ func (wr *Writer) SendContext(ctx context.Context, msg any) error {
 	// admitted Send — this one included — completes.
 	select {
 	case wr.queue <- job:
+		wr.senders.Done()
 	case <-ctx.Done():
+		wr.senders.Done()
 		wr.admitted.Done()
-		return ctx.Err()
+		return WriteResult{}, ctx.Err()
 	}
 
 	select {
 	case err := <-errCh:
-		return err
+		return WriteResult{WriteAdmitted: true}, err
 	case <-ctx.Done():
-		return ctx.Err()
+		return WriteResult{WriteAdmitted: true}, ctx.Err()
 	}
 }
 
@@ -305,6 +337,7 @@ func (wr *Writer) Close() error {
 		wr.closed = true
 		wr.mu.Unlock()
 
+		wr.senders.Wait()
 		wr.admitted.Wait()
 		close(wr.stopping)
 	})
