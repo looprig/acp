@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,6 +167,269 @@ func TestResumeSessionRetainsAdvertisedConfigOptionsAndModes(t *testing.T) {
 		t.Fatalf("ResumeSession() error = %v", err)
 	}
 	assertRestoredConfigState(t, sess, options, modes)
+}
+
+func richConfigOptions() []protocol.SessionConfigOption {
+	modelCategory := protocol.SessionConfigOptionCategoryModel
+	effortCategory := protocol.SessionConfigOptionCategoryThoughtLevel
+	modelDescription := "select the model"
+	modelValueDescription := "the Luna model"
+	effortDescription := "select the reasoning effort"
+	effortValueDescription := "maximum effort"
+	return []protocol.SessionConfigOption{
+		{
+			ID:          "model",
+			Name:        "Model",
+			Category:    &modelCategory,
+			Description: &modelDescription,
+			Meta:        json.RawMessage(`{"option":"model","nested":{"n":1}}`),
+			Select: &protocol.SessionConfigSelect{
+				CurrentValue: "gpt-5.6-luna",
+				Options: protocol.SessionConfigSelectOptions{Ungrouped: []protocol.SessionConfigSelectOption{
+					{
+						Name:        "Luna",
+						Value:       "gpt-5.6-luna",
+						Description: &modelValueDescription,
+						Meta:        json.RawMessage(`{"value":"luna","nested":[1,2]}`),
+					},
+				}},
+			},
+		},
+		{
+			ID:          "reasoning_effort",
+			Name:        "Reasoning effort",
+			Category:    &effortCategory,
+			Description: &effortDescription,
+			Meta:        json.RawMessage(`{"option":"effort"}`),
+			Select: &protocol.SessionConfigSelect{
+				CurrentValue: "max",
+				Options: protocol.SessionConfigSelectOptions{Grouped: []protocol.SessionConfigSelectGroup{
+					{
+						Group: "reasoning",
+						Name:  "Reasoning",
+						Meta:  json.RawMessage(`{"group":true}`),
+						Options: []protocol.SessionConfigSelectOption{
+							{
+								Name:        "Maximum",
+								Value:       "max",
+								Description: &effortValueDescription,
+								Meta:        json.RawMessage(`{"value":"max"}`),
+							},
+						},
+					},
+				}},
+			},
+		},
+		{
+			ID:   "notifications",
+			Name: "Notifications",
+			Meta: json.RawMessage(`{"option":"boolean"}`),
+			Boolean: &protocol.SessionConfigBoolean{
+				CurrentValue: true,
+			},
+		},
+	}
+}
+
+func richModeState() *protocol.SessionModeState {
+	defaultDescription := "normal operation"
+	planDescription := "planning only"
+	return &protocol.SessionModeState{
+		CurrentModeID: "default",
+		AvailableModes: []protocol.SessionMode{
+			{
+				ID:          "default",
+				Name:        "Default",
+				Description: &defaultDescription,
+				Meta:        json.RawMessage(`{"mode":"default"}`),
+			},
+			{
+				ID:          "plan",
+				Name:        "Plan",
+				Description: &planDescription,
+				Meta:        json.RawMessage(`{"mode":"plan","nested":{"x":true}}`),
+			},
+		},
+		Meta: json.RawMessage(`{"state":"modes"}`),
+	}
+}
+
+func mutateConfigState(options []protocol.SessionConfigOption, modes *protocol.SessionModeState) {
+	category := protocol.SessionConfigOptionCategory("mutated-category")
+	if len(options) >= 3 {
+		options[0].Category = &category
+		if options[0].Description != nil {
+			*options[0].Description = "mutated option description"
+		}
+		options[0].Meta[0] = 'X'
+		options[0].Select.CurrentValue = "mutated-model"
+		options[0].Select.Options.Ungrouped[0].Name = "mutated value"
+		if options[0].Select.Options.Ungrouped[0].Description != nil {
+			*options[0].Select.Options.Ungrouped[0].Description = "mutated value description"
+		}
+		options[0].Select.Options.Ungrouped[0].Meta[0] = 'Y'
+
+		if options[1].Description != nil {
+			*options[1].Description = "mutated effort description"
+		}
+		options[1].Meta[0] = 'Z'
+		options[1].Select.CurrentValue = "mutated-effort"
+		options[1].Select.Options.Grouped[0].Name = "mutated group"
+		options[1].Select.Options.Grouped[0].Meta[0] = 'Q'
+		options[1].Select.Options.Grouped[0].Options[0].Name = "mutated grouped value"
+		if options[1].Select.Options.Grouped[0].Options[0].Description != nil {
+			*options[1].Select.Options.Grouped[0].Options[0].Description = "mutated grouped description"
+		}
+		options[1].Select.Options.Grouped[0].Options[0].Meta[0] = 'R'
+		options[2].Meta[0] = 'S'
+		options[2].Boolean.CurrentValue = false
+	}
+	if modes != nil {
+		modes.CurrentModeID = "mutated-mode"
+		modes.Meta[0] = 'T'
+		if len(modes.AvailableModes) >= 2 {
+			modes.AvailableModes[0].Name = "mutated default"
+			*modes.AvailableModes[0].Description = "mutated default description"
+			modes.AvailableModes[0].Meta[0] = 'U'
+			modes.AvailableModes[1].Name = "mutated plan"
+			*modes.AvailableModes[1].Description = "mutated plan description"
+			modes.AvailableModes[1].Meta[0] = 'V'
+		}
+	}
+}
+
+func TestSessionConfigStateDeepCopiesNestedValuesAcrossLifecycle(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*Client, *fakeAgent, context.Context, []protocol.SessionConfigOption, *protocol.SessionModeState) (*Session, error)
+	}{
+		{
+			name: "new",
+			call: func(c *Client, fa *fakeAgent, _ context.Context, options []protocol.SessionConfigOption, modes *protocol.SessionModeState) (*Session, error) {
+				fa.onNewSession = func(protocol.NewSessionRequest) (protocol.NewSessionResponse, error) {
+					return protocol.NewSessionResponse{SessionID: "sess-rich-new", ConfigOptions: options, Modes: modes}, nil
+				}
+				return c.NewSession(context.Background(), NewSessionParams{Cwd: "/work"})
+			},
+		},
+		{
+			name: "load",
+			call: func(c *Client, fa *fakeAgent, _ context.Context, options []protocol.SessionConfigOption, modes *protocol.SessionModeState) (*Session, error) {
+				fa.onLoadSession = func(context.Context, *fakeAgent, protocol.LoadSessionRequest) (protocol.LoadSessionResponse, error) {
+					return protocol.LoadSessionResponse{ConfigOptions: options, Modes: modes}, nil
+				}
+				return c.LoadSession(context.Background(), LoadSessionParams{SessionID: "sess-rich-load", Cwd: "/work"})
+			},
+		},
+		{
+			name: "resume",
+			call: func(c *Client, fa *fakeAgent, _ context.Context, options []protocol.SessionConfigOption, modes *protocol.SessionModeState) (*Session, error) {
+				fa.onResume = func(protocol.ResumeSessionRequest) (protocol.ResumeSessionResponse, error) {
+					return protocol.ResumeSessionResponse{ConfigOptions: options, Modes: modes}, nil
+				}
+				return c.ResumeSession(context.Background(), ResumeSessionParams{SessionID: "sess-rich-resume", Cwd: "/work"})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, fa := dialTestClient(t, Options{})
+			options := richConfigOptions()
+			modes := richModeState()
+			wantOptions := roundTripJSON(options)
+			wantModes := roundTripJSON(modes)
+			sess, err := test.call(c, fa, context.Background(), options, modes)
+			if err != nil {
+				t.Fatalf("restore error = %v", err)
+			}
+
+			mutateConfigState(options, modes)
+			gotOptions := sess.ConfigOptions()
+			gotModes := sess.Modes()
+			if !reflect.DeepEqual(gotOptions, wantOptions) {
+				t.Fatalf("ConfigOptions() = %#v, want %#v", gotOptions, wantOptions)
+			}
+			if !reflect.DeepEqual(gotModes, wantModes) {
+				t.Fatalf("Modes() = %#v, want %#v", gotModes, wantModes)
+			}
+
+			mutateConfigState(gotOptions, gotModes)
+			if got := sess.ConfigOptions(); !reflect.DeepEqual(got, wantOptions) {
+				t.Fatalf("ConfigOptions() after accessor mutation = %#v, want %#v", got, wantOptions)
+			}
+			if got := sess.Modes(); !reflect.DeepEqual(got, wantModes) {
+				t.Fatalf("Modes() after accessor mutation = %#v, want %#v", got, wantModes)
+			}
+		})
+	}
+}
+
+func TestSessionConfigStateClonePreservesNilAndEmptyShapes(t *testing.T) {
+	options := []protocol.SessionConfigOption{{
+		Meta: json.RawMessage{},
+		Select: &protocol.SessionConfigSelect{
+			Options: protocol.SessionConfigSelectOptions{
+				Ungrouped: []protocol.SessionConfigSelectOption{},
+				Grouped:   nil,
+			},
+		},
+	}}
+	modes := &protocol.SessionModeState{
+		AvailableModes: []protocol.SessionMode{},
+		Meta:           json.RawMessage{},
+	}
+	gotOptions := copyConfigOptions(options)
+	gotModes := copyModeState(modes)
+	if gotOptions == nil || gotOptions[0].Meta == nil || gotOptions[0].Select.Options.Ungrouped == nil || gotOptions[0].Select.Options.Grouped != nil {
+		t.Fatalf("copyConfigOptions() did not preserve nil/empty shapes: %#v", gotOptions)
+	}
+	if gotModes == nil || gotModes.Meta == nil || gotModes.AvailableModes == nil {
+		t.Fatalf("copyModeState() did not preserve nil/empty shapes: %#v", gotModes)
+	}
+}
+
+func TestSessionConfigStateConcurrentAccessorMutation(t *testing.T) {
+	c, fa := dialTestClient(t, Options{})
+	options := richConfigOptions()
+	modes := richModeState()
+	fa.onNewSession = func(protocol.NewSessionRequest) (protocol.NewSessionResponse, error) {
+		return protocol.NewSessionResponse{SessionID: "sess-rich-race", ConfigOptions: options, Modes: modes}, nil
+	}
+	sess, err := c.NewSession(context.Background(), NewSessionParams{Cwd: "/work"})
+	if err != nil {
+		t.Fatalf("NewSession() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for ctx.Err() == nil {
+			got := sess.ConfigOptions()
+			gotModes := sess.Modes()
+			mutateConfigState(got, gotModes)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for ctx.Err() == nil {
+			for _, option := range sess.ConfigOptions() {
+				if option.Category != nil && option.Select != nil {
+					_ = *option.Category
+					_ = option.Select.CurrentValue
+				}
+			}
+			if modes := sess.Modes(); modes != nil {
+				for _, mode := range modes.AvailableModes {
+					_ = mode.ID
+				}
+			}
+		}
+	}()
+	wg.Wait()
 }
 
 // TestNewSessionRetainsDefensiveCopyOfConfigOptionsAndModes proves NewSession

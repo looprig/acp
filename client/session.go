@@ -7,6 +7,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -168,27 +169,142 @@ type Session struct {
 // ID returns the ACP session id this Session was created or loaded with.
 func (s *Session) ID() protocol.SessionID { return s.id }
 
-// copyConfigOptions returns a defensive copy of in: a fresh backing array so
-// a caller mutating the returned slice (or Session mutating its own stored
-// copy later) can never alias the other's memory. Nil in yields nil out
-// (never an empty-but-non-nil slice), matching this package's existing
-// append([]T(nil), src...) idiom elsewhere (see e.g.
-// internal/exampleagent/host.go, agent/list.go).
+func cloneRawMessage(in json.RawMessage) json.RawMessage {
+	if in == nil {
+		return nil
+	}
+	out := make(json.RawMessage, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneStringPtr(in *string) *string {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneCategoryPtr(in *protocol.SessionConfigOptionCategory) *protocol.SessionConfigOptionCategory {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneConfigSelectOption(in protocol.SessionConfigSelectOption) protocol.SessionConfigSelectOption {
+	out := in
+	out.Description = cloneStringPtr(in.Description)
+	out.Meta = cloneRawMessage(in.Meta)
+	return out
+}
+
+func cloneConfigSelectOptions(in []protocol.SessionConfigSelectOption) []protocol.SessionConfigSelectOption {
+	if in == nil {
+		return nil
+	}
+	out := make([]protocol.SessionConfigSelectOption, len(in))
+	for i, option := range in {
+		out[i] = cloneConfigSelectOption(option)
+	}
+	return out
+}
+
+func cloneConfigSelectGroup(in protocol.SessionConfigSelectGroup) protocol.SessionConfigSelectGroup {
+	out := in
+	out.Options = cloneConfigSelectOptions(in.Options)
+	out.Meta = cloneRawMessage(in.Meta)
+	return out
+}
+
+func cloneConfigSelectGroups(in []protocol.SessionConfigSelectGroup) []protocol.SessionConfigSelectGroup {
+	if in == nil {
+		return nil
+	}
+	out := make([]protocol.SessionConfigSelectGroup, len(in))
+	for i, group := range in {
+		out[i] = cloneConfigSelectGroup(group)
+	}
+	return out
+}
+
+func cloneConfigSelect(in *protocol.SessionConfigSelect) *protocol.SessionConfigSelect {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Options = protocol.SessionConfigSelectOptions{
+		Ungrouped: cloneConfigSelectOptions(in.Options.Ungrouped),
+		Grouped:   cloneConfigSelectGroups(in.Options.Grouped),
+	}
+	return &out
+}
+
+func cloneConfigBoolean(in *protocol.SessionConfigBoolean) *protocol.SessionConfigBoolean {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func cloneConfigOption(in protocol.SessionConfigOption) protocol.SessionConfigOption {
+	out := in
+	out.Category = cloneCategoryPtr(in.Category)
+	out.Description = cloneStringPtr(in.Description)
+	out.Meta = cloneRawMessage(in.Meta)
+	out.Select = cloneConfigSelect(in.Select)
+	out.Boolean = cloneConfigBoolean(in.Boolean)
+	return out
+}
+
+// copyConfigOptions returns a deep defensive copy of in: every pointer,
+// RawMessage, variant, and nested option/group slice is cloned so a caller
+// mutating the returned value (or Session mutating its own stored copy later)
+// can never alias the other's memory. Nil in yields nil out, while a non-nil
+// empty slice remains non-nil.
 func copyConfigOptions(in []protocol.SessionConfigOption) []protocol.SessionConfigOption {
 	if in == nil {
 		return nil
 	}
-	return append([]protocol.SessionConfigOption(nil), in...)
+	out := make([]protocol.SessionConfigOption, len(in))
+	for i, option := range in {
+		out[i] = cloneConfigOption(option)
+	}
+	return out
 }
 
-// copyModeState returns a defensive copy of in: a new *SessionModeState with
-// its own AvailableModes backing array. Nil in yields nil out.
+func cloneSessionMode(in protocol.SessionMode) protocol.SessionMode {
+	out := in
+	out.Description = cloneStringPtr(in.Description)
+	out.Meta = cloneRawMessage(in.Meta)
+	return out
+}
+
+func cloneSessionModes(in []protocol.SessionMode) []protocol.SessionMode {
+	if in == nil {
+		return nil
+	}
+	out := make([]protocol.SessionMode, len(in))
+	for i, mode := range in {
+		out[i] = cloneSessionMode(mode)
+	}
+	return out
+}
+
+// copyModeState returns a deep defensive copy of in: a new
+// *SessionModeState with cloned metadata, descriptions, and AvailableModes.
+// Nil in yields nil out, while a non-nil empty AvailableModes slice remains
+// non-nil.
 func copyModeState(in *protocol.SessionModeState) *protocol.SessionModeState {
 	if in == nil {
 		return nil
 	}
 	out := *in
-	out.AvailableModes = append([]protocol.SessionMode(nil), in.AvailableModes...)
+	out.AvailableModes = cloneSessionModes(in.AvailableModes)
+	out.Meta = cloneRawMessage(in.Meta)
 	return &out
 }
 
