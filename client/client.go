@@ -76,12 +76,14 @@ type Client struct {
 	// logic (over an in-process net.Pipe peer) without a real subprocess.
 	attemptConnect func(ctx context.Context) error
 
-	mu      sync.Mutex
-	state   dialState
-	waiter  *dialAttempt
-	proc    *stdio.Proc
-	conn    *protocol.Conn
-	agent   *protocol.AgentConn
+	mu     sync.Mutex
+	state  dialState
+	waiter *dialAttempt
+	proc   *stdio.Proc
+	conn   *protocol.Conn
+	agent  *protocol.AgentConn
+	// initRes remains private; callers read its agent information and raw
+	// metadata through InitializeMetadata, which returns defensive copies.
 	initRes *protocol.InitializeResponse
 
 	sessionsMu sync.Mutex

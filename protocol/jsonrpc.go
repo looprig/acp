@@ -130,6 +130,11 @@ type Response struct {
 	ID     ID
 	Result json.RawMessage
 	Error  *Error
+
+	// ReceiveSequence is stamped only on inbound responses by Conn's single
+	// read loop. It is intentionally omitted from JSON-RPC marshaling: this is
+	// a local observation fact, never wire data.
+	ReceiveSequence uint64
 }
 
 // MarshalJSON encodes r as a "jsonrpc":"2.0" response object.
@@ -151,6 +156,10 @@ func (r *Response) MarshalJSON() ([]byte, error) {
 type Notification struct {
 	Method string
 	Params json.RawMessage
+
+	// ReceiveSequence is stamped only on inbound notifications by Conn's
+	// single read loop and is never serialized onto the wire.
+	ReceiveSequence uint64
 }
 
 // MarshalJSON encodes n as a "jsonrpc":"2.0" notification object.

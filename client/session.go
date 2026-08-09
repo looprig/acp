@@ -404,7 +404,10 @@ func (s *Session) WaitForUpdates(ctx context.Context) error {
 	if err := agent.Conn().WaitForNotifications(ctx); err != nil {
 		return wrapConnError(err)
 	}
+	return s.waitForPendingDeliveries(ctx)
+}
 
+func (s *Session) waitForPendingDeliveries(ctx context.Context) error {
 	s.mu.Lock()
 	if s.aborted {
 		s.mu.Unlock()
@@ -433,6 +436,27 @@ func (s *Session) WaitForUpdates(ctx context.Context) error {
 		s.mu.Unlock()
 		return ctx.Err()
 	}
+}
+
+// WaitForUpdatesThrough waits for Conn's receive-order barrier at sequence
+// and therefore proves every session/update notification through that point
+// has completed the registered client handler and entered this Session's
+// delivery queue. It does not consume Updates or create another reader.
+func (s *Session) WaitForUpdatesThrough(ctx context.Context, sequence uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.client == nil {
+		return &NotDialedError{}
+	}
+	agent, err := s.client.currentAgent()
+	if err != nil {
+		return err
+	}
+	if err := agent.Conn().WaitForNotificationsThrough(ctx, sequence); err != nil {
+		return wrapConnError(err)
+	}
+	return nil
 }
 
 // deliver routes one decoded update into the session's queue, applying

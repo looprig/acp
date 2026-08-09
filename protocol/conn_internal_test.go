@@ -113,6 +113,335 @@ func TestConnPendingTableTracksInFlightCalls(t *testing.T) {
 	}
 }
 
+func TestConnResponsePublicationLinearizesBeforeCancellation(t *testing.T) {
+	const attempts = 10000
+
+	for i := 0; i < attempts; i++ {
+		conn := &Conn{pending: make(map[ID]chan callResult)}
+		id := NewNumberID(int64(i + 1))
+		pending := make(chan callResult, 1)
+		conn.pending[id] = pending
+		response := &Response{
+			ID:              id,
+			Result:          json.RawMessage(`{"accepted":true}`),
+			ReceiveSequence: uint64(i + 1),
+		}
+		published := make(chan struct{})
+		go func() {
+			conn.correlateResponse(response)
+			close(published)
+		}()
+
+		// Observing removal is the cancellation side's linearization point. A
+		// response that has acknowledged ownership must already be available
+		// to the cancellation cleanup; it may not be lost in the gap between
+		// removing the map entry and publishing to its channel.
+		for {
+			conn.mu.Lock()
+			_, stillPending := conn.pending[id]
+			conn.mu.Unlock()
+			if !stillPending {
+				break
+			}
+			runtime.Gosched()
+		}
+
+		var payload struct {
+			Accepted bool `json:"accepted"`
+		}
+		facts, err := conn.abandonPendingCall(id, pending, &payload, CallResult{}, context.Canceled)
+		<-published
+		if err != nil {
+			t.Fatalf("attempt %d: abandonPendingCall() error = %v, want acknowledged response", i, err)
+		}
+		if facts.ResponseSequence != uint64(i+1) || facts.ReceiveSequence != uint64(i+1) {
+			t.Fatalf("attempt %d: response facts = %#v, want sequence %d", i, facts, i+1)
+		}
+		if !facts.WriteAdmitted {
+			t.Fatalf("attempt %d: acknowledged response facts = %#v, want WriteAdmitted=true", i, facts)
+		}
+		if !payload.Accepted {
+			t.Fatalf("attempt %d: acknowledged response payload = %#v, want accepted=true", i, payload)
+		}
+	}
+}
+
+func TestConnCallWithResultCarriesAdmissionAndResponseSequence(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+	server.Handle("ordered", func(context.Context, string, json.RawMessage) (any, error) {
+		return map[string]string{"ok": "yes"}, nil
+	})
+
+	var result map[string]string
+	facts, err := client.CallWithResult(context.Background(), "ordered", nil, &result)
+	if err != nil {
+		t.Fatalf("CallWithResult() error = %v", err)
+	}
+	if !facts.WriteAdmitted {
+		t.Fatal("CallWithResult() reported false write admission after successful request")
+	}
+	if facts.ResponseSequence == 0 {
+		t.Fatal("CallWithResult() response sequence = 0, want stamped inbound response")
+	}
+	if result["ok"] != "yes" {
+		t.Fatalf("CallWithResult() result = %#v, want ok=yes", result)
+	}
+}
+
+func TestConnStartCallSignalsAdmissionBeforeBlockedWrite(t *testing.T) {
+	reader, readerPeer := io.Pipe()
+	sink := newAdmissionGateWriter()
+	c := NewConn(reader, sink, ConnOptions{})
+	defer func() {
+		sink.releaseWrite()
+		_ = readerPeer.Close()
+		_ = c.Close()
+	}()
+
+	h, err := c.StartCall(context.Background(), "blocked.write", nil, nil)
+	if err != nil {
+		t.Fatalf("StartCall() error = %v", err)
+	}
+	if cap(h.Admission()) != 1 || cap(h.Result()) != 1 {
+		t.Fatalf("async channels have capacities admission=%d result=%d, want one each", cap(h.Admission()), cap(h.Result()))
+	}
+	select {
+	case admitted, ok := <-h.Admission():
+		if !ok || !admitted {
+			t.Fatalf("admission = (%v, %v), want one true value", admitted, ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for queue admission")
+	}
+	select {
+	case completion := <-h.Result():
+		t.Fatalf("result arrived while raw write/response blocked: %#v", completion)
+	case <-time.After(50 * time.Millisecond):
+	}
+	h.Cancel()
+	completion, ok := <-h.Result()
+	if !ok {
+		t.Fatal("Result() closed before cancellation completion")
+	}
+	if !completion.Facts.WriteAdmitted {
+		t.Fatal("post-admission cancellation lost WriteAdmitted=true")
+	}
+	if !errors.Is(completion.Err, context.Canceled) {
+		t.Fatalf("completion error = %v, want context.Canceled", completion.Err)
+	}
+}
+
+func TestConnCallWithResultCarriesAdmissionOnPeerErrorAndEOF(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+
+	t.Run("peer error", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		client := NewConn(c1, c1, ConnOptions{})
+		server := NewConn(c2, c2, ConnOptions{})
+		t.Cleanup(func() { client.Close(); server.Close() })
+		server.Handle("error", func(context.Context, string, json.RawMessage) (any, error) {
+			return nil, InvalidParams("bad steering", nil)
+		})
+
+		facts, err := client.CallWithResult(context.Background(), "error", nil, nil)
+		if err == nil {
+			t.Fatal("CallWithResult() error = nil, want peer error")
+		}
+		if !facts.WriteAdmitted || facts.ResponseSequence == 0 {
+			t.Fatalf("CallWithResult() facts = %#v, want admitted response sequence", facts)
+		}
+	})
+
+	t.Run("peer EOF", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		client := NewConn(c1, c1, ConnOptions{})
+		server := NewConn(c2, c2, ConnOptions{})
+		reached := make(chan struct{})
+		release := make(chan struct{})
+		server.Handle("eof", func(context.Context, string, json.RawMessage) (any, error) {
+			close(reached)
+			<-release
+			return nil, nil
+		})
+		t.Cleanup(func() { client.Close(); server.Close() })
+
+		done := make(chan struct{})
+		var facts CallResult
+		var err error
+		go func() {
+			facts, err = client.CallWithResult(context.Background(), "eof", nil, nil)
+			close(done)
+		}()
+		<-reached
+		_ = server.Close()
+		close(release)
+		<-done
+		if err == nil {
+			t.Fatal("CallWithResult() error = nil, want peer EOF/close")
+		}
+		if !facts.WriteAdmitted {
+			t.Fatalf("CallWithResult() facts = %#v, want admitted request after peer close", facts)
+		}
+	})
+}
+
+func TestConnWaitForNotificationsThroughResponseSequence(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	notifyDone := make(chan struct{})
+	client.HandleNotifyWithSequence("ordered.notify", func(context.Context, string, json.RawMessage, uint64) {
+		close(notifyDone)
+	})
+	server.Handle("ordered.call", func(context.Context, string, json.RawMessage) (any, error) {
+		if err := server.Notify(context.Background(), "ordered.notify", map[string]string{"v": "1"}); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	})
+
+	facts, err := client.CallWithResult(context.Background(), "ordered.call", nil, nil)
+	if err != nil {
+		t.Fatalf("CallWithResult() error = %v", err)
+	}
+	if facts.ResponseSequence == 0 {
+		t.Fatal("CallWithResult() response sequence = 0")
+	}
+	if err := client.WaitForNotificationsThrough(context.Background(), facts.ResponseSequence); err != nil {
+		t.Fatalf("WaitForNotificationsThrough() error = %v", err)
+	}
+	select {
+	case <-notifyDone:
+	default:
+		t.Fatal("notification barrier returned before registered handler completed")
+	}
+}
+
+func TestConnWaitForNotificationsThroughDoesNotWaitForLaterNotification(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	c1, c2 := net.Pipe()
+	client := NewConn(c1, c1, ConnOptions{})
+	server := NewConn(c2, c2, ConnOptions{})
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	firstDone := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	client.HandleNotifyWithSequence("ordered.first", func(context.Context, string, json.RawMessage, uint64) {
+		close(firstDone)
+	})
+	client.HandleNotifyWithSequence("ordered.second", func(context.Context, string, json.RawMessage, uint64) {
+		close(secondStarted)
+		<-releaseSecond
+	})
+	server.Handle("ordered.call", func(context.Context, string, json.RawMessage) (any, error) {
+		if err := server.Notify(context.Background(), "ordered.first", nil); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	})
+
+	facts, err := client.CallWithResult(context.Background(), "ordered.call", nil, nil)
+	if err != nil {
+		t.Fatalf("CallWithResult() error = %v", err)
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- server.Notify(context.Background(), "ordered.second", nil) }()
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for later notification handler to start")
+	}
+	if err := client.WaitForNotificationsThrough(context.Background(), facts.ResponseSequence); err != nil {
+		t.Fatalf("WaitForNotificationsThrough() error = %v", err)
+	}
+	select {
+	case <-firstDone:
+	default:
+		t.Fatal("response-sequence barrier returned before the earlier notification completed")
+	}
+	close(releaseSecond)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("later notification send error = %v", err)
+	}
+}
+
+type dispatchReleaseContext struct {
+	release func()
+	once    sync.Once
+}
+
+func (c *dispatchReleaseContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *dispatchReleaseContext) Done() <-chan struct{} {
+	c.once.Do(c.release)
+	return nil
+}
+
+func (c *dispatchReleaseContext) Err() error { return nil }
+
+func (c *dispatchReleaseContext) Value(any) any { return nil }
+
+func TestConnReceiveBarrierWaitsForNotificationDispatchRegistration(t *testing.T) {
+	assertNoGoroutineLeakInternal(t)
+	clientReader, clientWriter := io.Pipe()
+	client := NewConn(clientReader, clientWriter, ConnOptions{})
+	t.Cleanup(func() { client.Close() })
+
+	sequence := client.beginReceiveNotification()
+	handlerDone := make(chan struct{})
+	ctx := &dispatchReleaseContext{release: func() {
+		client.enqueueTrackedNotifyJob(sequence, func() { close(handlerDone) })
+		client.finishReceiveNotification(sequence)
+	}}
+
+	if err := client.WaitForNotificationsThrough(ctx, sequence); err != nil {
+		t.Fatalf("WaitForNotificationsThrough() error = %v", err)
+	}
+	select {
+	case <-handlerDone:
+	default:
+		t.Fatal("receive barrier returned before notification handler completion")
+	}
+}
+
+func TestConnReceiveSequenceOverflowFailsClosedWithoutZeroObservation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mint func(*Conn) uint64
+	}{
+		{name: "response", mint: func(client *Conn) uint64 { return client.stampReceive() }},
+		{name: "notification", mint: func(client *Conn) uint64 { return client.beginReceiveNotification() }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assertNoGoroutineLeakInternal(t)
+			clientReader, clientWriter := io.Pipe()
+			client := NewConn(clientReader, clientWriter, ConnOptions{})
+			t.Cleanup(func() { client.Close() })
+
+			client.receiveMu.Lock()
+			client.receiveThrough = ^uint64(0)
+			client.receiveMu.Unlock()
+
+			if sequence := test.mint(client); sequence != 0 {
+				t.Fatalf("receive sequence overflow minted %d, want no sequence", sequence)
+			}
+			select {
+			case <-client.Done():
+			default:
+				t.Fatal("receive sequence overflow did not fail closed")
+			}
+		})
+	}
+}
+
 func TestConnCallContextCancelRemovesPendingEntry(t *testing.T) {
 	assertNoGoroutineLeakInternal(t)
 

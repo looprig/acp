@@ -30,6 +30,21 @@ func NewAgentConn(conn *Conn) *AgentConn {
 // access to it (Close, Done, extension traffic, and so on).
 func (a *AgentConn) Conn() *Conn { return a.conn }
 
+// CallExtensionWithResult is the protocol-owned generic primitive for a
+// vendor/extension request. It deliberately lives on AgentConn rather than
+// in acp/client's public surface so typed client methods can use the disjoint
+// extension id space without exposing arbitrary method probing to callers.
+func (a *AgentConn) CallExtensionWithResult(ctx context.Context, method string, params, result any) (CallResult, error) {
+	return a.conn.call(ctx, method, params, result, a.conn.mintExtID)
+}
+
+// StartExtensionCall is the asynchronous counterpart used by fixed typed
+// extension surfaces. The method string stays in protocol so callers above
+// this package cannot turn the typed client API into arbitrary probing.
+func (a *AgentConn) StartExtensionCall(ctx context.Context, method string, params, result any) (*CallHandle, error) {
+	return a.conn.startCall(ctx, method, params, result, a.conn.mintExtID)
+}
+
 // Initialize calls the agent's "initialize" method.
 func (a *AgentConn) Initialize(ctx context.Context, req InitializeRequest) (*InitializeResponse, error) {
 	var resp InitializeResponse
@@ -109,6 +124,18 @@ func (a *AgentConn) Prompt(ctx context.Context, req PromptRequest) (*PromptRespo
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// PromptWithResult is Prompt's additive ordered form. It exposes the
+// response receive sequence and writer-admission fact while preserving the
+// original Prompt API for callers that do not need ordering evidence.
+func (a *AgentConn) PromptWithResult(ctx context.Context, req PromptRequest) (*PromptResponse, CallResult, error) {
+	var resp PromptResponse
+	facts, err := a.conn.CallWithResult(ctx, string(MethodSessionPrompt), req, &resp)
+	if err != nil {
+		return nil, facts, err
+	}
+	return &resp, facts, nil
 }
 
 // Cancel sends the "session/cancel" notification. It never blocks on a

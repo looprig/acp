@@ -16,6 +16,16 @@ type PromptResult struct {
 	// turn (protocol.StopReasonCancelled) is reported here, in a successful
 	// result — never as an error.
 	StopReason protocol.StopReason
+	// ReceiveSequence is the Conn-owned monotonic sequence assigned to the
+	// prompt response. Notifications with lower sequences were observed by
+	// the same read loop before this completion.
+	ReceiveSequence uint64
+	// ResponseSequence is an additive spelling for callers that use the
+	// protocol terminology for the same receive-order fact.
+	ResponseSequence uint64
+	// WriteAdmitted records whether the prompt request crossed Writer's
+	// admission boundary before any later cancellation or transport error.
+	WriteAdmitted bool
 }
 
 // Prompt sends blocks as one session/prompt turn and blocks until the agent
@@ -37,11 +47,24 @@ func (s *Session) Prompt(ctx context.Context, blocks []protocol.ContentBlock) (*
 		return nil, err
 	}
 
-	resp, err := agent.Prompt(ctx, protocol.PromptRequest{SessionID: s.id, Prompt: blocks})
+	resp, facts, err := agent.PromptWithResult(ctx, protocol.PromptRequest{SessionID: s.id, Prompt: blocks})
 	if err != nil {
-		return nil, wrapConnError(err)
+		// Preserve ordered transport facts even when the peer rejects the
+		// prompt. The response body is absent on an error, so only the facts
+		// fields are populated; callers that only inspect err keep the old
+		// success-path API unchanged.
+		return &PromptResult{
+			ReceiveSequence:  facts.ResponseSequence,
+			ResponseSequence: facts.ResponseSequence,
+			WriteAdmitted:    facts.WriteAdmitted,
+		}, wrapConnError(err)
 	}
-	return &PromptResult{StopReason: resp.StopReason}, nil
+	return &PromptResult{
+		StopReason:       resp.StopReason,
+		ReceiveSequence:  facts.ResponseSequence,
+		ResponseSequence: facts.ResponseSequence,
+		WriteAdmitted:    facts.WriteAdmitted,
+	}, nil
 }
 
 // Cancel sends the session/cancel notification for this session. It does

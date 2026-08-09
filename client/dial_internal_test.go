@@ -1,7 +1,9 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"sync"
@@ -12,6 +14,93 @@ import (
 	"github.com/looprig/acp/protocol"
 	"github.com/looprig/acp/transport/stdio"
 )
+
+// TestInitializeMetadataReturnsDefensiveSnapshot proves a connected Client
+// exposes only a copy of initialize's agent information and raw metadata.
+// Mutating every mutable part of one returned snapshot must not affect a
+// later read from the Client.
+func TestInitializeMetadataReturnsDefensiveSnapshot(t *testing.T) {
+	const responseMeta = `{"steering":{"supported":true}}`
+	const agentMeta = `{"adapter":"claude"}`
+	title := "Claude Agent"
+	c, _ := dialTestClient(t, Options{}, func(fa *fakeAgent) {
+		fa.onInitialize = func(req protocol.InitializeRequest) (protocol.InitializeResponse, error) {
+			return protocol.InitializeResponse{
+				ProtocolVersion: protocol.CurrentProtocolVersion,
+				AgentInfo: &protocol.Implementation{
+					Name:    "claude-agent-acp",
+					Title:   &title,
+					Version: "0.65.0",
+					Meta:    json.RawMessage(agentMeta),
+				},
+				Meta: json.RawMessage(responseMeta),
+			}, nil
+		}
+	})
+
+	got, err := c.InitializeMetadata()
+	if err != nil {
+		t.Fatalf("InitializeMetadata() error = %v", err)
+	}
+	if got.AgentInfo == nil {
+		t.Fatal("InitializeMetadata().AgentInfo = nil, want agent info")
+	}
+	if got.AgentInfo.Title == nil {
+		t.Fatal("InitializeMetadata().AgentInfo.Title = nil, want title")
+	}
+	if got.AgentInfo.Name != "claude-agent-acp" || *got.AgentInfo.Title != title || got.AgentInfo.Version != "0.65.0" {
+		t.Fatalf("InitializeMetadata().AgentInfo = %#v, want original agent info", got.AgentInfo)
+	}
+	if !bytes.Equal(got.AgentInfo.Meta, []byte(agentMeta)) {
+		t.Fatalf("InitializeMetadata().AgentInfo.Meta = %s, want %s", got.AgentInfo.Meta, agentMeta)
+	}
+	if !bytes.Equal(got.Meta, []byte(responseMeta)) {
+		t.Fatalf("InitializeMetadata().Meta = %s, want %s", got.Meta, responseMeta)
+	}
+
+	got.AgentInfo.Name = "mutated-name"
+	*got.AgentInfo.Title = "mutated-title"
+	got.AgentInfo.Meta[0] = 'X'
+	got.Meta[0] = 'X'
+
+	again, err := c.InitializeMetadata()
+	if err != nil {
+		t.Fatalf("InitializeMetadata() second read error = %v", err)
+	}
+	if again.AgentInfo == nil || again.AgentInfo.Name != "claude-agent-acp" || again.AgentInfo.Title == nil || *again.AgentInfo.Title != title || !bytes.Equal(again.AgentInfo.Meta, []byte(agentMeta)) {
+		t.Fatalf("InitializeMetadata() second AgentInfo = %#v, want unchanged snapshot", again.AgentInfo)
+	}
+	if !bytes.Equal(again.Meta, []byte(responseMeta)) {
+		t.Fatalf("InitializeMetadata() second Meta = %s, want unchanged metadata", again.Meta)
+	}
+}
+
+// TestInitializeMetadataLifecycleErrors proves the accessor follows the same
+// typed lifecycle errors as other Client accessors: it rejects both a Client
+// that has not connected and one that has reached terminal closure.
+func TestInitializeMetadataLifecycleErrors(t *testing.T) {
+	c := New(stdio.Command{}, Options{})
+	if _, err := c.InitializeMetadata(); err == nil {
+		t.Fatal("InitializeMetadata() before Dial error = nil, want *NotDialedError")
+	} else {
+		var notDialed *NotDialedError
+		if !errors.As(err, &notDialed) {
+			t.Fatalf("InitializeMetadata() before Dial error = %v (%T), want *NotDialedError", err, err)
+		}
+	}
+
+	if err := c.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := c.InitializeMetadata(); err == nil {
+		t.Fatal("InitializeMetadata() after Close error = nil, want *ClosedError")
+	} else {
+		var closed *ClosedError
+		if !errors.As(err, &closed) {
+			t.Fatalf("InitializeMetadata() after Close error = %v (%T), want *ClosedError", err, err)
+		}
+	}
+}
 
 // newTestClient builds a *Client whose connection attempt is entirely
 // replaced by attempt, bypassing real process spawning and protocol wiring
