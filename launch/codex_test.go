@@ -76,7 +76,6 @@ func TestCodexConnectorConfigureWithoutProxyOmitsGatewayOverrides(t *testing.T) 
 		t.Fatalf("ConfigureWithoutProxy() error = %v", err)
 	}
 	want := []string{
-		"-c", "model=gpt-5-codex",
 		"-c", "approval_policy=on-request",
 		"-c", "sandbox_mode=workspace-write",
 		"-c", "sandbox_workspace_write.network_access=false",
@@ -119,7 +118,7 @@ func TestCodexConnectorConfigureWithoutProxyAllowsEmptyModel(t *testing.T) {
 	}
 }
 
-func TestCodexNativeEffortEmitsSeparateModelAndEffortOverrides(t *testing.T) {
+func TestCodexNativeArgsOmitModelAndEffortOverrides(t *testing.T) {
 	c := Codex("").WithModelEffort("gpt-5.6-sol", "medium")
 
 	out, err := c.ConfigureNative(stdio.Command{Path: "/opt/codex-acp"})
@@ -127,17 +126,13 @@ func TestCodexNativeEffortEmitsSeparateModelAndEffortOverrides(t *testing.T) {
 		t.Fatalf("ConfigureNative() error = %v", err)
 	}
 
-	wantPrefix := []string{
-		"-c", "model=gpt-5.6-sol",
-		"-c", "model_reasoning_effort=medium",
-	}
-	if len(out.Args) < len(wantPrefix) || !equalStrings(out.Args[:len(wantPrefix)], wantPrefix) {
-		t.Fatalf("native args = %#v, want separate model and effort overrides %v", out.Args, wantPrefix)
-	}
 	for _, arg := range out.Args {
-		if arg == "model=gpt-5.6-sol:medium" || arg == "model=gpt-5.6-sol-medium" {
-			t.Fatalf("native args combined model and effort into %q: %#v", arg, out.Args)
+		if arg == "model=gpt-5.6-sol" || arg == "model_reasoning_effort=medium" {
+			t.Fatalf("native args contain a selector override %q, want selectors applied through ACP session config", arg)
 		}
+	}
+	if c.Model != "gpt-5.6-sol" || c.Effort != "medium" {
+		t.Fatalf("connector selection state = (%q, %q), want (gpt-5.6-sol, medium)", c.Model, c.Effort)
 	}
 }
 

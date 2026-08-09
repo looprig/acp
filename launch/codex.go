@@ -1,8 +1,8 @@
 // codex.go implements CodexConnector's HarnessAdapter half: the codex-acp
 // adapter's executable, argument, and environment contract. See
 // codex_connector.go for CodexConnector's own type, constructor, and
-// immutable selector APIs (its "recreate rather than switch" model-change
-// mechanism).
+// immutable selector APIs (the bounded post-session model/effort selection
+// mechanism and the fresh-launch state-copy helpers).
 //
 // Configure never runs, spawns, or otherwise reaches for codex-acp's own
 // process: version verification is a distinct, explicit preflight step
@@ -70,8 +70,11 @@ func (c *CodexConnector) configureWithoutProxy(cmd stdio.Command) (stdio.Command
 	return c.configure(cmd, ProxyBinding{}, false)
 }
 
-// ConfigureNative implements NativeHarnessAdapter. An empty Model is
-// intentionally passed through so codex-acp can choose its own model.
+// ConfigureNative implements NativeHarnessAdapter. It validates the existing
+// native model/effort tuple semantics but deliberately emits neither selector
+// as argv: Codex ACP session options are selected after session/new through
+// SelectModel and SelectEffort. An empty Model is passed through so codex-acp
+// can choose its own model.
 func (c *CodexConnector) ConfigureNative(cmd stdio.Command) (stdio.Command, error) {
 	return c.configureWithoutProxy(cmd)
 }
@@ -83,7 +86,7 @@ func (c *CodexConnector) configure(cmd stdio.Command, binding ProxyBinding, gate
 	if gateway && c.Model == "" {
 		return stdio.Command{}, &ConfigError{Reason: "CodexConnector.Model is required"}
 	}
-	if !gateway && (c.Effort != "" && c.Model == "" || c.effortExplicit && ((c.Model == "") != (c.Effort == ""))) {
+	if !gateway && ((c.Effort != "" && c.Model == "") || c.effortExplicit && ((c.Model == "") != (c.Effort == ""))) {
 		return stdio.Command{}, &ConfigError{Reason: "CodexConnector.Model and Effort must be provided together for native configuration"}
 	}
 
@@ -109,14 +112,11 @@ func (c *CodexConnector) configure(cmd stdio.Command, binding ProxyBinding, gate
 	return out, nil
 }
 
-func codexNativeConfigArgs(model, effort string, posture CodexPosture) []string {
-	pairs := make([][2]string, 0, 5)
-	if model != "" {
-		pairs = append(pairs, [2]string{"model", model})
-	}
-	if effort != "" {
-		pairs = append(pairs, [2]string{"model_reasoning_effort", effort})
-	}
+func codexNativeConfigArgs(_ string, _ string, posture CodexPosture) []string {
+	// Model and effort are intentionally retained on CodexConnector for
+	// post-session ACP selection; native argv carries only posture/configuration
+	// values. codex-acp server mode ignores the selector -c keys.
+	pairs := make([][2]string, 0, 3)
 	pairs = append(pairs,
 		[2]string{"approval_policy", posture.ApprovalPolicy},
 		[2]string{"sandbox_mode", posture.SandboxMode},
