@@ -7,9 +7,9 @@
 // is opaque to ACP, workspace placement is fixed when a rig is defined, and
 // ACP setup carries product concerns (cwd, MCP servers, replay, catalogs,
 // runtime configuration) that Harness itself does not know about. This file
-// therefore defines small, consumer-owned host interfaces that a product
-// (e.g. CodeRig) implements against its own composition root, instead of the
-// facade touching rig.SessionOption or workspace placement directly.
+// therefore defines small, consumer-owned host interfaces that the product
+// composition root implements; the facade does not touch rig.SessionOption or
+// workspace placement directly.
 package agent
 
 import (

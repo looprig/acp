@@ -14,7 +14,7 @@
 // prompt-correlation state machine, its live-event translation, its
 // permission-gate round trip, and its durable-history replay path. Driving
 // this binary over stdio exercises the identical code every real product
-// composition (a future CodeRig-style consumer) would run.
+// composition root would run.
 //
 // # Scripting a turn
 //
