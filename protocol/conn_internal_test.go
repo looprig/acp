@@ -412,6 +412,32 @@ func TestConnReceiveBarrierWaitsForNotificationDispatchRegistration(t *testing.T
 	}
 }
 
+func TestConnWaitForNotificationsThroughChecksContextAfterOrderingBarrier(t *testing.T) {
+	client := &Conn{
+		done:                   make(chan struct{}),
+		receiveChanged:         make(chan struct{}),
+		receiveDispatchPending: make(map[uint64]struct{}),
+		notifyPending:          make(map[uint64]struct{}),
+		notifyChanged:          make(chan struct{}),
+		receiveThrough:         1,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client.notifyOrderMu.Lock()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- client.WaitForNotificationsThrough(ctx, 1) }()
+	// Give WaitForNotificationsThrough time to reach its ordering barrier.
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	client.notifyOrderMu.Unlock()
+
+	if err := <-waitDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitForNotificationsThrough() error = %v, want context.Canceled", err)
+	}
+}
+
 func TestConnReceiveSequenceOverflowFailsClosedWithoutZeroObservation(t *testing.T) {
 	for _, test := range []struct {
 		name string

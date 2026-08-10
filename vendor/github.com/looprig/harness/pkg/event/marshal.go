@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"unicode/utf8"
 
@@ -181,9 +182,11 @@ func encodePayload(ev Event) ([]byte, error) {
 		ConfigurationAdopted,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
 		ActiveLoopChanged,
+		DelegateDeliveryStateChanged,
 		LoopRestoreTombstoned,
 		HustleStarted, HustleCompleted, HustleFailed,
 		PermissionReviewStarted, PermissionReviewCompleted,
+		ProcessStarted, ProcessBackgrounded, ProcessCompleted, ProcessStopRequested, ProcessLost,
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
 		LoopExternalToolsetChanged, ContextMeasured,
 		CompactionCommitted, CompactionRejected, CompactWaiterResolved, CompactWaiterRejected,
@@ -272,13 +275,13 @@ func marshalPermissionRequested(e PermissionRequested) ([]byte, error) {
 }
 
 // turnFailedWire is TurnFailed's wire form: the Err interface has no general codec,
-// so it is projected to a stable {kind,message} pair (RestoredError) — kind from
-// ErrKind, message from Err.Error() — preserving the human-readable cause even when
-// the concrete type cannot survive.
+// so it is projected to a stable {kind,message} pair plus an additive explicit
+// model-facing classification/detail when the live error opts into that marker.
+// Legacy records containing only {kind,message} remain ordinary on restore.
 type turnFailedWire struct {
 	Header
-	TurnIndex TurnIndex      `json:"turn_index,omitzero"`
-	Err       *RestoredError `json:"err,omitempty"`
+	TurnIndex TurnIndex          `json:"turn_index,omitzero"`
+	Err       *restoredErrorWire `json:"err,omitempty"`
 }
 
 func marshalTurnFailed(e TurnFailed) ([]byte, error) {
@@ -293,11 +296,10 @@ func marshalTurnFailed(e TurnFailed) ([]byte, error) {
 	return out, nil
 }
 
-// restoreErroredWire mirrors turnFailedWire for the session-scoped restore failure:
-// Err projects to the same {kind,message} RestoredError pair.
+// restoreErroredWire mirrors turnFailedWire for the session-scoped restore failure.
 type restoreErroredWire struct {
 	Header
-	Err *RestoredError `json:"err,omitempty"`
+	Err *restoredErrorWire `json:"err,omitempty"`
 }
 
 func marshalRestoreErrored(e RestoreErrored) ([]byte, error) {
@@ -311,25 +313,63 @@ func marshalRestoreErrored(e RestoreErrored) ([]byte, error) {
 	return out, nil
 }
 
-// projectError projects a live error to its durable {kind,message} form. A nil
-// error projects to KindUnknown with an empty message (an absent cause), so the
-// restored event always carries a *RestoredError rather than a typed-nil — matching
-// the reconstructed-on-unmarshal contract the round-trip test asserts. An already-
-// restored *RestoredError (the decode form, re-marshaled by journal compaction /
-// checkpoint re-persist) copies its fields directly rather than calling Error():
-// (*RestoredError).Error() renders "<kind>: <message>", so re-projecting through it
-// would accrete a "<kind>: " prefix onto Message on every cycle. Copying makes
-// re-marshal a fixed point — Kind AND Message stable across any number of round-trips
-// (ErrKind already keeps Kind stable the same way).
-func projectError(err error) *RestoredError {
+// restoredErrorWire is the additive durable projection for an error-bearing event.
+// model_facing and model_facing_detail are omitted for ordinary errors, preserving
+// the legacy {kind,message} shape. Safety is accepted only when the explicit boolean
+// marker is true; message/kind alone never opt an error into the model-facing path.
+type restoredErrorWire struct {
+	Kind              string `json:"kind"`
+	Message           string `json:"message"`
+	ModelFacing       bool   `json:"model_facing,omitempty"`
+	ModelFacingDetail string `json:"model_facing_detail,omitempty"`
+}
+
+func (w *restoredErrorWire) errorValue() error {
+	if w == nil {
+		return nil
+	}
+	if w.ModelFacing {
+		return &RestoredModelFacingError{
+			Kind: w.Kind, Message: w.Message,
+			Detail: tool.BoundModelFacingErrorDetail(w.ModelFacingDetail),
+		}
+	}
+	return &RestoredError{Kind: w.Kind, Message: w.Message}
+}
+
+// projectError projects a live error to its durable form. A nil error projects to
+// KindUnknown with an empty message (an absent cause), so the restored event always
+// carries a concrete ordinary RestoredError. An explicitly marked safe detail is
+// copied into separate additive fields after normalization; no ordinary error text
+// or stable kind can opt into that classification.
+func projectError(err error) *restoredErrorWire {
 	if err == nil {
-		return &RestoredError{Kind: KindUnknown, Message: ""}
+		return &restoredErrorWire{Kind: KindUnknown, Message: ""}
+	}
+	var modelRestored *RestoredModelFacingError
+	if errors.As(err, &modelRestored) && modelRestored != nil {
+		wire := &restoredErrorWire{Kind: modelRestored.Kind, Message: modelRestored.Message}
+		if detail, marked := tool.ModelFacingErrorDetail(err); marked {
+			wire.ModelFacing = true
+			wire.ModelFacingDetail = tool.BoundModelFacingErrorDetail(detail)
+		}
+		return wire
 	}
 	var restored *RestoredError
 	if errors.As(err, &restored) {
-		return &RestoredError{Kind: restored.Kind, Message: restored.Message}
+		wire := &restoredErrorWire{Kind: restored.Kind, Message: restored.Message}
+		if detail, marked := tool.ModelFacingErrorDetail(err); marked {
+			wire.ModelFacing = true
+			wire.ModelFacingDetail = tool.BoundModelFacingErrorDetail(detail)
+		}
+		return wire
 	}
-	return &RestoredError{Kind: ErrKind(err), Message: err.Error()}
+	wire := &restoredErrorWire{Kind: ErrKind(err), Message: err.Error()}
+	if detail, marked := tool.ModelFacingErrorDetail(err); marked {
+		wire.ModelFacing = true
+		wire.ModelFacingDetail = tool.BoundModelFacingErrorDetail(detail)
+	}
+	return wire
 }
 
 // mergeEnvelope merges the type discriminator and schema version into a pre-encoded
@@ -612,6 +652,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[WorkspaceRestored](tag, data)
 	case "ActiveLoopChanged":
 		return decodePlain[ActiveLoopChanged](tag, data)
+	case "DelegateDeliveryStateChanged":
+		return decodeDelegateDeliveryStateChanged(data)
 	case "LoopRestoreTombstoned":
 		return decodePlain[LoopRestoreTombstoned](tag, data)
 	case "HustleStarted":
@@ -624,6 +666,16 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[PermissionReviewStarted](tag, data)
 	case "PermissionReviewCompleted":
 		return decodePlain[PermissionReviewCompleted](tag, data)
+	case "ProcessStarted":
+		return decodeProcessLifecycleEvent(tag, data)
+	case "ProcessBackgrounded":
+		return decodeProcessLifecycleEvent(tag, data)
+	case "ProcessCompleted":
+		return decodeProcessLifecycleEvent(tag, data)
+	case "ProcessStopRequested":
+		return decodeProcessLifecycleEvent(tag, data)
+	case "ProcessLost":
+		return decodeProcessLifecycleEvent(tag, data)
 	case "LoopIdle":
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":
@@ -765,6 +817,82 @@ func decodePlain[T any](tag string, data []byte) (Event, error) {
 	return ev, nil
 }
 
+type processLifecycleEventWire struct {
+	Type string  `json:"type"`
+	V    *uint32 `json:"v"`
+	Header
+	Process tool.ProcessLifecycleMetadata `json:"process"`
+}
+
+func decodeProcessLifecycleEvent(tag string, data []byte) (Event, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+
+	var wire processLifecycleEventWire
+	if err := decoder.Decode(&wire); err != nil {
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("trailing JSON value")
+		}
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+
+	switch tag {
+	case "ProcessStarted":
+		return ProcessStarted{Header: wire.Header, Process: wire.Process}, nil
+	case "ProcessBackgrounded":
+		return ProcessBackgrounded{Header: wire.Header, Process: wire.Process}, nil
+	case "ProcessCompleted":
+		return ProcessCompleted{Header: wire.Header, Process: wire.Process}, nil
+	case "ProcessStopRequested":
+		return ProcessStopRequested{Header: wire.Header, Process: wire.Process}, nil
+	case "ProcessLost":
+		return ProcessLost{Header: wire.Header, Process: wire.Process}, nil
+	default:
+		return nil, &UnknownEventTypeError{Type: tag}
+	}
+}
+
+// delegateDeliveryStateChangedWire is the deliberately closed wire shape for
+// DelegateDeliveryStateChanged. Unlike ordinary plain events, this record is a
+// durable ABI boundary: accepting an extra field could let transport-only or
+// model-visible data leak into the journal. Keep the envelope keys and Header
+// fields explicit through embedding, and reject every other key below.
+type delegateDeliveryStateChangedWire struct {
+	Type string  `json:"type"`
+	V    *uint32 `json:"v"`
+	Header
+	RequestID    uuid.UUID             `json:"request_id"`
+	TargetLoopID uuid.UUID             `json:"target_loop_id"`
+	State        DelegateDeliveryState `json:"state"`
+}
+
+func decodeDelegateDeliveryStateChanged(data []byte) (Event, error) {
+	const tag = "DelegateDeliveryStateChanged"
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+
+	var wire delegateDeliveryStateChangedWire
+	if err := decoder.Decode(&wire); err != nil {
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("trailing JSON value")
+		}
+		return nil, &EventDecodeError{Type: tag, Cause: err}
+	}
+
+	return DelegateDeliveryStateChanged{
+		Header:       wire.Header,
+		RequestID:    wire.RequestID,
+		TargetLoopID: wire.TargetLoopID,
+		State:        wire.State,
+	}, nil
+}
+
 func decodeStepDone(data []byte) (Event, error) {
 	var w stepDoneWire
 	if err := json.Unmarshal(data, &w); err != nil {
@@ -804,7 +932,7 @@ func decodeTurnFailed(data []byte) (Event, error) {
 	}
 	ev := TurnFailed{Header: w.Header, TurnIndex: w.TurnIndex}
 	if w.Err != nil {
-		ev.Err = w.Err
+		ev.Err = w.Err.errorValue()
 	}
 	return ev, nil
 }
@@ -816,7 +944,7 @@ func decodeRestoreErrored(data []byte) (Event, error) {
 	}
 	ev := RestoreErrored{Header: w.Header}
 	if w.Err != nil {
-		ev.Err = w.Err
+		ev.Err = w.Err.errorValue()
 	}
 	return ev, nil
 }

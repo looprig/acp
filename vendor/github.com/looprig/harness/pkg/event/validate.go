@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 	model "github.com/looprig/inference/model"
 )
 
@@ -48,7 +49,9 @@ const (
 	FieldTrigger            FieldName = "Trigger"
 	FieldCause              FieldName = "Cause"
 	FieldCommandID          FieldName = "CommandID"
+	FieldRequestID          FieldName = "RequestID"
 	FieldActiveLoopID       FieldName = "ActiveLoopID"
+	FieldTargetLoopID       FieldName = "TargetLoopID"
 	FieldCategory           FieldName = "Category"
 	FieldModel              FieldName = "Model"
 	FieldModelKey           FieldName = "ModelKey"
@@ -76,6 +79,7 @@ const (
 	FieldActor              FieldName = "Actor"
 	FieldGeneration         FieldName = "Generation"
 	FieldTools              FieldName = "Tools"
+	FieldProcess            FieldName = "Process"
 	FieldGateID             FieldName = "GateID"
 	FieldClassifier         FieldName = "Classifier"
 	FieldClassifierRevision FieldName = "ClassifierRevision"
@@ -194,6 +198,16 @@ func validateEventBody(ev Event) error {
 		if e.Cause.CommandID.IsZero() {
 			return &InvalidEventError{Event: "DelegateRequestAccepted", Field: FieldCommandID, Rule: RuleRequired}
 		}
+	case DelegateDeliveryStateChanged:
+		if e.RequestID.IsZero() {
+			return &InvalidEventError{Event: "DelegateDeliveryStateChanged", Field: FieldRequestID, Rule: RuleRequired}
+		}
+		if e.TargetLoopID.IsZero() {
+			return &InvalidEventError{Event: "DelegateDeliveryStateChanged", Field: FieldTargetLoopID, Rule: RuleRequired}
+		}
+		if !e.State.Valid() {
+			return &InvalidEventError{Event: "DelegateDeliveryStateChanged", Field: FieldState, Rule: RuleInvalid}
+		}
 	case LoopInferenceChanged:
 		return validateModelRuntime("LoopInferenceChanged", e.Runtime)
 	case LoopModeChanged:
@@ -282,6 +296,16 @@ func validateEventBody(ev Event) error {
 		return validatePermissionReviewStarted(e)
 	case PermissionReviewCompleted:
 		return validatePermissionReviewCompleted(e)
+	case ProcessStarted:
+		return validateProcessLifecycleEvent("ProcessStarted", e.Header, e.Process, tool.ProcessLifecycleStarted)
+	case ProcessBackgrounded:
+		return validateProcessLifecycleEvent("ProcessBackgrounded", e.Header, e.Process, tool.ProcessLifecycleBackgrounded)
+	case ProcessCompleted:
+		return validateProcessLifecycleEvent("ProcessCompleted", e.Header, e.Process, tool.ProcessLifecycleCompleted)
+	case ProcessStopRequested:
+		return validateProcessLifecycleEvent("ProcessStopRequested", e.Header, e.Process, tool.ProcessLifecycleStopRequested)
+	case ProcessLost:
+		return validateProcessLifecycleEvent("ProcessLost", e.Header, e.Process, tool.ProcessLifecycleLost)
 	case StepDone:
 		return validateStepDoneMessages(e.Messages)
 	case TurnDone:
@@ -377,6 +401,30 @@ func validatePermissionReviewMetadata(
 		strings.TrimSpace(revision) == "" ||
 		len(revision) > gate.MaxPermissionClassifierRevisionBytes {
 		return invalidPermissionReview(name, FieldClassifierRevision)
+	}
+	return nil
+}
+
+func validateProcessLifecycleEvent(
+	name EventName,
+	header Header,
+	metadata tool.ProcessLifecycleMetadata,
+	wantKind tool.ProcessLifecycleKind,
+) error {
+	if metadata.EventID != header.EventID {
+		return &InvalidEventError{Event: name, Field: FieldEventID, Rule: RuleInvalid}
+	}
+	if metadata.SessionID != header.SessionID {
+		return &InvalidEventError{Event: name, Field: FieldSessionID, Rule: RuleInvalid}
+	}
+	if metadata.LoopID != header.LoopID {
+		return &InvalidEventError{Event: name, Field: FieldLoopID, Rule: RuleInvalid}
+	}
+	if metadata.Kind != wantKind {
+		return &InvalidEventError{Event: name, Field: FieldProcess, Rule: RuleInvalid}
+	}
+	if err := metadata.Validate(); err != nil {
+		return &InvalidEventError{Event: name, Field: FieldProcess, Rule: RuleInvalid}
 	}
 	return nil
 }
@@ -912,6 +960,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "WorkspaceRestored", sessionProfile(), true
 	case ActiveLoopChanged:
 		return "ActiveLoopChanged", sessionProfile(), true
+	case DelegateDeliveryStateChanged:
+		return "DelegateDeliveryStateChanged", sessionProfile(), true
 	case LoopRestoreTombstoned:
 		return "LoopRestoreTombstoned", loopProfile(), true
 	case IntegrationStatus:
@@ -928,6 +978,16 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "PermissionReviewStarted", toolProfile(), true
 	case PermissionReviewCompleted:
 		return "PermissionReviewCompleted", toolProfile(), true
+	case ProcessStarted:
+		return "ProcessStarted", loopProfile(), true
+	case ProcessBackgrounded:
+		return "ProcessBackgrounded", loopProfile(), true
+	case ProcessCompleted:
+		return "ProcessCompleted", loopProfile(), true
+	case ProcessStopRequested:
+		return "ProcessStopRequested", loopProfile(), true
+	case ProcessLost:
+		return "ProcessLost", loopProfile(), true
 	case LoopIdle:
 		return "LoopIdle", loopProfile(), true
 	case LoopStarted:

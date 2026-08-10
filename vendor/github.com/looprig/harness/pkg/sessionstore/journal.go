@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"sync"
 	"time"
 
@@ -23,6 +24,12 @@ import (
 // keeps the serialized writer live. The value matches the journal's historical
 // per-append publish deadline, carried over to the storage-backed writer.
 const appendTimeout = 5 * time.Second
+
+// hydrateTimeout bounds OpenJournal's full-ledger walk to hydrate the idempotency
+// index, independent of the caller's context — a wedged backend must not hang Open
+// forever. It is more generous than appendTimeout because it may need to read and
+// (for every offloaded record) fetch a whole session's history, not one record.
+const hydrateTimeout = 30 * time.Second
 
 // blobsInfix is the name segment separating a session's ledger prefix from its
 // content-addressed offload blobs: a blob lands at "sessions/<uuid>/blobs/<sha>".
@@ -70,10 +77,34 @@ type sessionJournal struct {
 	// new seq). A stale writer whose trackedTip is behind the real tip is rejected
 	// by storage's CAS on append.
 	trackedTip uint64
+
+	// idx tracks every idempotency id already durable in this session's log —
+	// hydrated from the full ledger AFTER the opening fence has claimed ownership
+	// (see OpenJournalWithOpeningAppend and hydrateJournalIndexes) — so a
+	// redelivered Append/AppendIdempotent can be detected and deduplicated instead
+	// of writing a second frame. It is guarded by mu exactly like ready/trackedTip:
+	// only appendChecked reads or updates it once the journal is open, and Open
+	// itself holds mu across both the fence commit and the hydration that follows
+	// it, so no external caller can observe or mutate it before hydration finishes.
+	idx *journal.IdempotencyIndex
+	// deliveryTransitions indexes the logical request state for phased delegate
+	// commands. It is guarded by mu together with idx and is updated only after
+	// the corresponding physical frame commits.
+	deliveryTransitions map[uuid.UUID]deliveryTransition
 }
 
-// Compile-time proof that *sessionJournal honors the journal.SessionJournal contract.
-var _ journal.SessionJournal = (*sessionJournal)(nil)
+type deliveryTransition struct {
+	fingerprint journal.Fingerprint
+	intentSeq   uint64
+	fallbackSeq uint64
+}
+
+// Compile-time proofs that *sessionJournal honors both the plain journal.SessionJournal
+// contract and its optional idempotent extension.
+var (
+	_ journal.SessionJournal    = (*sessionJournal)(nil)
+	_ journal.IdempotentJournal = (*sessionJournal)(nil)
+)
 
 // OpenJournal binds a single-writer journal to session id's ledger and takes
 // ownership of the tip by writing the opening fence — a fence-kind envelope
@@ -112,16 +143,33 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	}
 
 	j := &sessionJournal{
-		id:         id,
-		lease:      lease,
-		ledger:     s.backend.Ledger,
-		blobs:      s.backend.Blobs,
-		name:       name,
-		threshold:  s.opts.OffloadThreshold,
-		trackedTip: tip,
+		id:                  id,
+		lease:               lease,
+		ledger:              s.backend.Ledger,
+		blobs:               s.backend.Blobs,
+		name:                name,
+		threshold:           s.opts.OffloadThreshold,
+		trackedTip:          tip,
+		idx:                 journal.NewIdempotencyIndex(),
+		deliveryTransitions: make(map[uuid.UUID]deliveryTransition),
 	}
 
-	// Take ownership: the first append is the opening fence, stamping the lease
+	// Take ownership FIRST, immediately after the tip read: on the middleware-free
+	// path there is no intervening I/O at all — the same tight tip-then-CAS
+	// coupling every later Append already has via trackedTip (writeLocked never
+	// re-reads the tip; it CASes on whatever is already tracked in memory). A
+	// caller-supplied AppendMiddleware (as both of internal/sessionruntime's own
+	// callers — Lifecycle.NewSession and restoreTopologySession — install via
+	// journal.HookMiddleware whenever a hook handles OperationJournalAppend) still
+	// runs between the tip read and the CAS below and could itself do I/O — that
+	// gap is real but bounded by whatever the hook does, not by a full-ledger
+	// walk, and it existed in this exact position in the pre-fix code too.
+	// Claiming the fence this early, BEFORE the idempotency-index hydration below,
+	// closes the window in which a still-live predecessor writer (a crash-path
+	// teardown append, or a parked goroutine unblocked by context cancellation —
+	// see handBackRequest) could land a write on this ledger and advance the tip
+	// out from under a tip value cached before a slow walk. The first append is
+	// the opening fence, stamping the lease
 	// epoch and fenced on the current tip. A stale prior owner (or higher-epoch
 	// successor) that advanced the ledger causes this CAS to conflict and Open to
 	// fail closed. Only once it commits is the journal ready.
@@ -137,7 +185,11 @@ func (s *Store) OpenJournalWithOpeningAppend(
 			return 0, errOpeningAppendMiddleware
 		}
 		// The middleware may derive context but cannot substitute the ownership
-		// record: construction always commits this exact fence.
+		// record: construction always commits this exact fence THROUGH THE RAW
+		// writeLocked path — never through appendChecked's idempotency gate — so
+		// even a repeated lease epoch (whose id would otherwise look like a prior
+		// duplicate) still physically advances the tip and fences out a stale
+		// writer.
 		fenceSeq, fenceErr = j.writeLocked(appendCtx, fence)
 		return fenceSeq, fenceErr
 	})
@@ -157,27 +209,267 @@ func (s *Store) OpenJournalWithOpeningAppend(
 	if fenceErr != nil {
 		return nil, fenceErr
 	}
+
+	// Now that ownership is claimed, hydrate the idempotency index from whatever
+	// is durable — including the fence just committed above, and anything else
+	// that lands on the ledger before this walk observes it, since a fresh
+	// full-ledger read has no dependency on the pre-fence tip snapshot. Deferring
+	// this SLOW walk until after the fence commits is what closes the race: no
+	// predecessor writer can land another append once the fence has fenced it out
+	// (its next CAS conflicts against the tip this fence already advanced), so
+	// hydration can safely take as long as it needs without widening the window
+	// the opening fence itself is exposed to. j.ready stays false and j is not
+	// yet returned to any caller, so nothing can call Append/AppendIdempotent
+	// through this instance and race the walk. A ledger that had nothing durable
+	// before this fence (tip 0, the common fresh-session case) has nothing more to
+	// hydrate beyond what the fence's own hygiene Observe below already records,
+	// so the walk is skipped entirely rather than performed for no reason.
+	if tip > 0 {
+		hydrateCtx, hydrateCancel := context.WithTimeout(ctx, hydrateTimeout)
+		idx, transitions, hydrateErr := hydrateJournalIndexes(hydrateCtx, s.backend.Ledger, s.backend.Blobs, name)
+		hydrateCancel()
+		if hydrateErr != nil {
+			// Accepted trade-off of hydrating after the fence: the fence above has
+			// already durably committed (the tip is advanced) even though Open now
+			// fails closed and returns this journal to no caller. That leaves an
+			// orphaned fence stamped with this lease's epoch sitting in the ledger —
+			// impossible in the pre-fix ordering, where nothing could fail once the
+			// fence's writeLocked succeeded. It is not a correctness problem: the
+			// caller's failure path releases the lease as usual, and the next Open
+			// simply reads a fresh tip past this stray fence and claims its own —
+			// the same self-healing the epoch/fencing design already relies on for
+			// any crash between a fence commit and full ownership. Surfacing it here
+			// so a future reader chasing an orphaned fence in production logs has a
+			// documented, expected cause rather than a mystery.
+			return nil, hydrateErr
+		}
+		j.idx = idx
+		j.deliveryTransitions = transitions
+	}
+	// Keep the index authoritative for the fence itself too. This is hygiene, not
+	// load-bearing: the fence always commits through the raw writeLocked path above
+	// regardless of what the index holds. It is also not redundant with the
+	// hydration walk above, which — for a fresh session (tip 0 before this fence)
+	// — is skipped and so never observes the fence on its own. A MarshalLeaseFence
+	// failure here is unreachable in practice (a LeaseFence is one uint64) and is
+	// simply not observed rather than failing a fence that has already durably
+	// committed.
+	if body, marshalErr := journal.MarshalLeaseFence(fence.Fence()); marshalErr == nil {
+		j.idx.Observe(fence.IdempotencyID(), fenceSeq, journal.NewFingerprint(string(kindFence), body))
+	}
 	j.ready = true
 	return j, nil
 }
 
+func hydrateJournalIndexes(ctx context.Context, ledger storage.Ledger, blobs storage.Blobs, name string) (*journal.IdempotencyIndex, map[uuid.UUID]deliveryTransition, error) {
+	idx := journal.NewIdempotencyIndex()
+	transitions := make(map[uuid.UUID]deliveryTransition)
+	cur, err := ledger.Read(ctx, name, 1)
+	if err != nil {
+		return nil, nil, &ReplayReadError{Name: name, Cause: err}
+	}
+	base := &baseCursor{name: name, blobs: blobs, cur: cur}
+	defer func() { _ = base.close() }()
+	for {
+		r, nextErr := base.next(ctx)
+		if errors.Is(nextErr, io.EOF) {
+			return idx, transitions, nil
+		}
+		if nextErr != nil {
+			return nil, nil, nextErr
+		}
+		idx.Observe(r.id, r.seq, journal.NewFingerprint(string(r.kind), r.body))
+		if err := observeHydratedDeliveryTransition(transitions, r); err != nil {
+			return nil, nil, err
+		}
+	}
+}
+
+// observeHydratedDeliveryTransition rebuilds the logical request index from
+// one durable command frame. A fallback is accepted only after its intent has
+// appeared earlier in ledger order with the same phase-normalized payload.
+func observeHydratedDeliveryTransition(transitions map[uuid.UUID]deliveryTransition, r resolved) error {
+	if r.kind != kindCommand {
+		return nil
+	}
+	decoded, err := command.UnmarshalCommand(r.body)
+	if err != nil {
+		return &ReplayDecodeError{Seq: r.seq, Cause: err}
+	}
+	input, ok := decoded.(command.UserInput)
+	if !ok || !input.DelegateDeliveryPhase.Valid() {
+		return nil
+	}
+	record := journal.NewCommandRecord(uuid.UUID{}, uuid.UUID{}, input)
+	if record.IdempotencyID() != r.id {
+		return &journal.DeliveryTransitionError{
+			CommandID: input.CommandID,
+			Phase:     input.DelegateDeliveryPhase,
+			Reason:    "physical id does not match command phase",
+		}
+	}
+	fingerprint, err := record.NormalizedDeliveryFingerprint()
+	if err != nil {
+		return err
+	}
+	logicalID := input.CommandID
+	prior, exists := transitions[logicalID]
+	switch input.DelegateDeliveryPhase {
+	case command.DelegateDeliveryPhaseIntent:
+		if exists {
+			if prior.fingerprint != fingerprint {
+				return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "intent payload changed"}
+			}
+			if prior.intentSeq != 0 {
+				return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "duplicate intent frame"}
+			}
+		}
+		transitions[logicalID] = deliveryTransition{fingerprint: fingerprint, intentSeq: r.seq}
+	case command.DelegateDeliveryPhaseFallbackQueued:
+		if !exists || prior.intentSeq == 0 {
+			return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "fallback precedes intent"}
+		}
+		if prior.fingerprint != fingerprint {
+			return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "fallback payload differs from intent"}
+		}
+		if prior.fallbackSeq != 0 {
+			return &journal.DeliveryTransitionError{CommandID: logicalID, Phase: input.DelegateDeliveryPhase, Reason: "duplicate fallback frame"}
+		}
+		prior.fallbackSeq = r.seq
+		transitions[logicalID] = prior
+	}
+	return nil
+}
+
 // Append serializes rec behind mu, refuses if the journal is not ready or its lease
-// is lost, then frames, offloads-if-large, and commits rec under CAS on the tracked
-// tip. The whole operation holds mu so the guard, offload, append, and tip advance
-// are one atomic step; the append carries its own per-append deadline so one stuck
-// call cannot wedge the queued writers. On success it returns the assigned ledger
-// sequence; sequences are strictly monotonic across calls.
+// is lost, then deduplicates by idempotency id, and — for a genuinely new record —
+// frames, offloads-if-large, and commits rec under CAS on the tracked tip. The whole
+// operation holds mu so the guard, dedup check, offload, append, tip advance, and
+// index update are one atomic step; the append carries its own per-append deadline so
+// one stuck call cannot wedge the queued writers. On success it returns the assigned
+// (or, for a deduplicated retry, the ORIGINAL) ledger sequence. Append and
+// AppendIdempotent share the same core (appendChecked); Append simply discards the
+// Appended flag for callers that only need the sequence/error — see AppendIdempotent
+// (journal.IdempotentJournal) for callers that need to distinguish a fresh append from
+// a deduplicated retry.
 func (b *sessionJournal) Append(ctx context.Context, rec journal.JournalRecord) (uint64, error) {
+	result, err := b.appendChecked(ctx, rec)
+	return result.Sequence, err
+}
+
+// AppendIdempotent is Append's richer counterpart (journal.IdempotentJournal): see
+// Append's doc for the shared mechanics. It exists so a caller that must react
+// differently to a fresh append versus a deduplicated retry (e.g. skip a live
+// broadcast for a duplicate) can observe that distinction via AppendResult.Appended.
+func (b *sessionJournal) AppendIdempotent(ctx context.Context, rec journal.JournalRecord) (journal.AppendResult, error) {
+	return b.appendChecked(ctx, rec)
+}
+
+// appendChecked is the shared serialized core behind Append and AppendIdempotent. It
+// guards readiness/lease exactly as the plain Append always has, then — under the
+// SAME lock — fingerprints rec's persisted (kind, body) via encodeRecordBody (the
+// same codec path writeLocked/frame already use to encode for the wire; it never
+// encodes a record's transient routing, e.g. CommandRecord's session/loop dispatch
+// target, so that routing can never enter the fingerprint) and consults the hydrated
+// IdempotencyIndex:
+//   - an id never seen before is written as a new record (writeLocked) and then
+//     observed into the index;
+//   - an id seen before with an IDENTICAL fingerprint is deduplicated: no second
+//     frame is written, and the ORIGINAL sequence is returned with Appended=false;
+//   - an id seen before with a DIFFERENT fingerprint fails closed with a typed
+//     *journal.IdempotencyCollisionError.
+func (b *sessionJournal) appendChecked(ctx context.Context, rec journal.JournalRecord) (journal.AppendResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if !b.ready {
-		return 0, &journal.JournalNotReadyError{SessionID: b.id}
+		return journal.AppendResult{}, &journal.JournalNotReadyError{SessionID: b.id}
 	}
 	if !b.leaseHeld() {
-		return 0, &journal.JournalLeaseLostError{SessionID: b.id, Epoch: b.lease.Epoch()}
+		return journal.AppendResult{}, &journal.JournalLeaseLostError{SessionID: b.id, Epoch: b.lease.Epoch()}
 	}
-	return b.writeLocked(ctx, rec)
+	var commandRecord journal.CommandRecord
+	var hasPhasedCommand bool
+	if candidate, ok := rec.(journal.CommandRecord); ok && candidate.DeliveryPhase() != "" {
+		if err := journal.ValidateCommandRecordRoute(candidate); err != nil {
+			return journal.AppendResult{}, err
+		}
+		commandRecord = candidate
+		hasPhasedCommand = true
+	}
+
+	k, body, err := b.encodeRecordBody(rec)
+	if err != nil {
+		return journal.AppendResult{}, err
+	}
+	id := rec.IdempotencyID()
+	fp := journal.NewFingerprint(string(k), body)
+	if seq, duplicate, checkErr := b.idx.Check(id, fp); checkErr != nil {
+		return journal.AppendResult{}, checkErr
+	} else if duplicate {
+		return journal.AppendResult{Sequence: seq, Appended: false}, nil
+	}
+
+	var transitionRecord *journal.CommandRecord
+	var pendingTransition deliveryTransition
+	if hasPhasedCommand && commandRecord.DeliveryPhase().Valid() {
+		pending, err := b.prepareDeliveryTransition(commandRecord)
+		if err != nil {
+			return journal.AppendResult{}, err
+		}
+		transitionRecord = &commandRecord
+		pendingTransition = pending
+	}
+
+	seq, err := b.writeLocked(ctx, rec)
+	if err != nil {
+		return journal.AppendResult{}, err
+	}
+	b.idx.Observe(id, seq, fp)
+	if transitionRecord != nil {
+		if b.deliveryTransitions == nil {
+			b.deliveryTransitions = make(map[uuid.UUID]deliveryTransition)
+		}
+		if transitionRecord.DeliveryPhase() == command.DelegateDeliveryPhaseIntent {
+			pendingTransition.intentSeq = seq
+		} else {
+			pendingTransition.fallbackSeq = seq
+		}
+		b.deliveryTransitions[transitionRecord.LogicalCommandID()] = pendingTransition
+	}
+	return journal.AppendResult{Sequence: seq, Appended: true}, nil
+}
+
+func (b *sessionJournal) prepareDeliveryTransition(record journal.CommandRecord) (deliveryTransition, error) {
+	fingerprint, err := record.NormalizedDeliveryFingerprint()
+	if err != nil {
+		return deliveryTransition{}, err
+	}
+	logicalID := record.LogicalCommandID()
+	prior, exists := b.deliveryTransitions[logicalID]
+	switch record.DeliveryPhase() {
+	case command.DelegateDeliveryPhaseIntent:
+		if exists {
+			if prior.fingerprint != fingerprint {
+				return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "intent payload changed"}
+			}
+			return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "intent already durable"}
+		}
+		return deliveryTransition{fingerprint: fingerprint}, nil
+	case command.DelegateDeliveryPhaseFallbackQueued:
+		if !exists || prior.intentSeq == 0 {
+			return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "fallback precedes intent"}
+		}
+		if prior.fingerprint != fingerprint {
+			return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "fallback payload differs from intent"}
+		}
+		if prior.fallbackSeq != 0 {
+			return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "fallback already durable"}
+		}
+		return prior, nil
+	default:
+		return deliveryTransition{}, &journal.DeliveryTransitionError{CommandID: logicalID, Phase: record.DeliveryPhase(), Reason: "unsupported delivery phase"}
+	}
 }
 
 // leaseHeld reports whether the ownership lease is still held: both its validity

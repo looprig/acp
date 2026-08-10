@@ -27,15 +27,16 @@ const (
 	CommandCompact           CommandName = "Compact"
 	CommandUnknown           CommandName = "Command"
 
-	FieldCommandID          CommandField = "CommandID"
-	FieldSessionID          CommandField = "SessionID"
-	FieldLoopID             CommandField = "LoopID"
-	FieldTargetCommandID    CommandField = "TargetCommandID"
-	FieldTargetLoopID       CommandField = "TargetLoopID"
-	FieldBackgroundHandBack CommandField = "BackgroundHandBack"
-	FieldToolExecutionID    CommandField = "ToolExecutionID"
-	FieldAgency             CommandField = "Agency"
-	FieldAction             CommandField = "Action"
+	FieldCommandID             CommandField = "CommandID"
+	FieldSessionID             CommandField = "SessionID"
+	FieldLoopID                CommandField = "LoopID"
+	FieldTargetCommandID       CommandField = "TargetCommandID"
+	FieldTargetLoopID          CommandField = "TargetLoopID"
+	FieldBackgroundHandBack    CommandField = "BackgroundHandBack"
+	FieldDelegateDeliveryPhase CommandField = "DelegateDeliveryPhase"
+	FieldToolExecutionID       CommandField = "ToolExecutionID"
+	FieldAgency                CommandField = "Agency"
+	FieldAction                CommandField = "Action"
 )
 
 // CommandValidationError reports that a command violates the ID fill matrix: Field
@@ -57,7 +58,8 @@ func (e *CommandValidationError) Error() string {
 // ValidateCommand checks cmd against the ID fill matrix and returns a typed
 // *CommandValidationError on the first violation, nil when cmd satisfies every
 // invariant. CommandID is required on every command; per-type addressing rules then
-// apply (SubagentResult/CancelQueuedInput coordinates and the gate-reply GateRoute).
+// apply (UserInput's machine delegate target/phase marker, SubagentResult/
+// CancelQueuedInput coordinates, and the gate-reply GateRoute).
 // Interrupt and Shutdown are session-wide control commands with no addressing today,
 // so they are not validated here (their Ack-channel contract is checked by their own
 // Validate). Fail-secure: a command type outside the addressed set passes only the
@@ -69,11 +71,22 @@ func ValidateCommand(cmd Command) error {
 	}
 	switch c := cmd.(type) {
 	case UserInput:
-		if c.BackgroundHandBack && (!c.NoFold || c.Agency != identity.AgencyMachine) {
+		if c.BackgroundHandBack && c.Agency != identity.AgencyMachine {
 			return &CommandValidationError{Command: CommandUserInput, Field: FieldBackgroundHandBack, Rule: RuleInvalid}
 		}
-		if c.NoFold && c.Agency == identity.AgencyMachine && c.TargetLoopID.IsZero() {
-			return &CommandValidationError{Command: CommandUserInput, Field: FieldTargetLoopID, Rule: RuleRequired}
+		if !c.DelegateDeliveryPhase.Valid() && c.DelegateDeliveryPhase != "" {
+			return &CommandValidationError{Command: CommandUserInput, Field: FieldDelegateDeliveryPhase, Rule: RuleInvalid}
+		}
+		if c.DelegateDeliveryPhase != "" && c.Agency != identity.AgencyMachine {
+			return &CommandValidationError{Command: CommandUserInput, Field: FieldDelegateDeliveryPhase, Rule: RuleInvalid}
+		}
+		if (c.NoFold && c.Agency == identity.AgencyMachine) || c.BackgroundHandBack || c.DelegateDeliveryPhase != "" {
+			if c.TargetLoopID.IsZero() {
+				return &CommandValidationError{Command: CommandUserInput, Field: FieldTargetLoopID, Rule: RuleRequired}
+			}
+		}
+		if c.BackgroundHandBack && !c.NoFold && c.DelegateDeliveryPhase == "" {
+			return &CommandValidationError{Command: CommandUserInput, Field: FieldBackgroundHandBack, Rule: RuleInvalid}
 		}
 		return nil
 	case SubagentResult:
@@ -93,6 +106,8 @@ func ValidateCommand(cmd Command) error {
 		return validateGateRoute(CommandDenyToolCall, c.GateRoute)
 	case ProvideUserInput:
 		return validateGateRoute(CommandProvideUserInput, c.GateRoute)
+	case ProcessNotification:
+		return validateProcessNotification(c)
 	default:
 		// UserInput, Interrupt, Shutdown, and any other command: only CommandID is
 		// required (already checked above).
@@ -150,6 +165,19 @@ func validateCancelDelegateRequest(c CancelDelegateRequest) error {
 	return nil
 }
 
+// validateProcessNotification requires the generic envelope CommandID to
+// exactly equal the wrapped DTO's own stable CommandID (Task 4's contract:
+// Harness never mints a replacement id) and delegates the closed
+// coordinates/handle/state-reason validation to the DTO's own Validate — the
+// SAME bounded/enum-only checks Task 4 already built, so the command layer
+// never re-derives (and risks drifting from) that invariant set.
+func validateProcessNotification(c ProcessNotification) error {
+	if c.Notification.CommandID.IsZero() || c.Notification.CommandID != c.Header.CommandID {
+		return &CommandValidationError{Command: CommandProcessNotification, Field: FieldNotification, Rule: RuleInvalid}
+	}
+	return c.Notification.Validate()
+}
+
 // validateApproveAction requires exactly one of the two approve actions.
 // gate.ApprovalDeny travels on DenyToolCall, so it is rejected here alongside
 // unknown and empty actions — fail-secure: a record that does not name a valid
@@ -198,6 +226,8 @@ func commandName(cmd Command) CommandName {
 		return CommandInterrupt
 	case Shutdown:
 		return CommandShutdown
+	case ProcessNotification:
+		return CommandProcessNotification
 	default:
 		return CommandUnknown
 	}

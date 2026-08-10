@@ -346,9 +346,15 @@ func (c *Conn) WaitForNotificationsThrough(ctx context.Context, receiveSequence 
 
 	// readLoop dispatches notifications under notifyOrderMu. Taking that
 	// mutex here closes the small gap between observing receiveThrough and
-	// recording the corresponding handler job in notifyPending.
+	// recording the corresponding handler job in notifyPending. Recheck the
+	// context after this potentially blocking ordering barrier so cancellation
+	// remains authoritative even when no tracked job is pending.
 	c.notifyOrderMu.Lock()
+	ctxErr := ctx.Err()
 	c.notifyOrderMu.Unlock()
+	if ctxErr != nil {
+		return ctxErr
+	}
 	for {
 		c.notifyStateMu.Lock()
 		pending := false
