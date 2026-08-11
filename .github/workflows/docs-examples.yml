@@ -1,0 +1,25 @@
+name: Documentation examples
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  docs-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache go test -race ./examples/composition -run '^Example_driveChild$' -count=1
+      - run: GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache go test -race ./agent/examples/host -run '^Example_exposeHost$' -count=1
+      - run: GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache go test -race ./examples/composition -run '^Example_proxyBacked$' -count=1
+      - run: GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache go test -race ./examples/composition -run '^Example_adapterConfiguration$' -count=1
+      - run: GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache go test ./examples -run '^TestDocumentationExampleArtifacts$' -count=1
+      - run: GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache make test build

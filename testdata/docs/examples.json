@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "repository": "acp",
+  "proofSources": [
+    {"id":"example-acp-drive-child-fixture","type":"executable-fixture","path":"examples/composition/example_test.go","symbol":"Example_driveChild"},
+    {"id":"example-acp-expose-host-fixture","type":"executable-fixture","path":"agent/examples/host/example_test.go","symbol":"Example_exposeHost"},
+    {"id":"example-acp-proxy-backed-fixture","type":"executable-fixture","path":"examples/composition/example_test.go","symbol":"Example_proxyBacked"},
+    {"id":"example-acp-adapter-configuration-fixture","type":"executable-fixture","path":"examples/composition/example_test.go","symbol":"Example_adapterConfiguration"},
+    {"id":"example-acp-installed-adapter-live-test","type":"test","path":"examples/composition/example_test.go","symbol":"TestInstalledAdapterLive"},
+    {"id":"example-acp-artifacts-contract-test","type":"test","path":"examples/docs_contract_test.go","symbol":"TestDocumentationExampleArtifacts"},
+    {"id":"example-acp-client-dial-source","type":"source","path":"client/client.go","symbol":"Dial"},
+    {"id":"example-acp-agent-register-source","type":"source","path":"agent/agent.go","symbol":"Register"},
+    {"id":"example-acp-managed-dial-source","type":"source","path":"launch/managed.go","symbol":"Dial"},
+    {"id":"example-acp-codex-configure-source","type":"source","path":"launch/codex.go","symbol":"ConfigureNative"}
+  ],
+  "examples": [
+    {
+      "id":"example-acp-drive-child",
+      "ecosystem":"go",
+      "owner":"acp",
+      "sourcePath":"examples/composition/example_test.go",
+      "availability":"source-workspace",
+      "versions":{"github.com/looprig/acp":"source-workspace"},
+      "offlineCommand":"GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache go test -race ./examples/composition -run '^Example_driveChild$' -count=1",
+      "assertion":"A Client spawns a deterministic ACP child over real stdio framing, negotiates initialize, creates a session, and closes the child cleanly.",
+      "workflowPath":".github/workflows/docs-examples.yml",
+      "jobId":"docs-examples",
+      "cleanup":"Client.Close terminates and reaps the helper subprocess; no persistent files or sockets are created.",
+      "liveGate":null,
+      "proofIds":["example-acp-drive-child-fixture","example-acp-client-dial-source","example-acp-artifacts-contract-test"]
+    },
+    {
+      "id":"example-acp-expose-host",
+      "ecosystem":"go",
+      "owner":"acp",
+      "sourcePath":"agent/examples/host/example_test.go",
+      "availability":"source-workspace",
+      "versions":{"github.com/looprig/acp":"source-workspace","github.com/looprig/harness":"source-workspace"},
+      "offlineCommand":"GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache go test -race ./agent/examples/host -run '^Example_exposeHost$' -count=1",
+      "assertion":"An Agent facade exposes a consumer-owned SessionHost over a real in-memory JSON-RPC connection, advertises authentication, authenticates, validates setup, and creates a Harness-shaped session.",
+      "workflowPath":".github/workflows/docs-examples.yml",
+      "jobId":"docs-examples",
+      "cleanup":"Both ends of the in-memory connection are closed with defer; the host retains process-local state only.",
+      "liveGate":null,
+      "proofIds":["example-acp-expose-host-fixture","example-acp-agent-register-source","example-acp-artifacts-contract-test"]
+    },
+    {
+      "id":"example-acp-proxy-backed-launch",
+      "ecosystem":"go",
+      "owner":"acp",
+      "sourcePath":"examples/composition/example_test.go",
+      "availability":"source-workspace",
+      "versions":{"github.com/looprig/acp":"source-workspace"},
+      "offlineCommand":"GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache go test -race ./examples/composition -run '^Example_proxyBacked$' -count=1",
+      "assertion":"launch.Dial starts an owned model proxy before the ACP child, passes only its binding to an adapter, returns a connected client, and closes the child before the proxy.",
+      "workflowPath":".github/workflows/docs-examples.yml",
+      "jobId":"docs-examples",
+      "cleanup":"ManagedClient.Close reaps the helper child and closes the process-local fake proxy exactly through the public lifecycle.",
+      "liveGate":null,
+      "proofIds":["example-acp-proxy-backed-fixture","example-acp-managed-dial-source","example-acp-artifacts-contract-test"]
+    },
+    {
+      "id":"example-acp-native-and-gateway-adapters",
+      "ecosystem":"go",
+      "owner":"acp",
+      "sourcePath":"examples/composition/example_test.go",
+      "availability":"source-workspace",
+      "versions":{"github.com/looprig/acp":"source-workspace"},
+      "offlineCommand":"GOWORK=off GOCACHE=/tmp/looprig-acp-docs-gocache go test -race ./examples/composition -run '^Example_adapterConfiguration$' -count=1",
+      "assertion":"The Codex connector emits explicit Looprig proxy provider configuration for gateway mode and omits it for native harness authentication without launching an installed adapter.",
+      "workflowPath":".github/workflows/docs-examples.yml",
+      "jobId":"docs-examples",
+      "cleanup":"Configuration is pure and creates no process; the optional installed-adapter test owns and closes its client when enabled.",
+      "liveGate":"ACP_ADAPTER_PATH must name a clean absolute installed ACP adapter path before TestInstalledAdapterLive is run explicitly.",
+      "proofIds":["example-acp-adapter-configuration-fixture","example-acp-installed-adapter-live-test","example-acp-codex-configure-source","example-acp-artifacts-contract-test"]
+    }
+  ]
+}
