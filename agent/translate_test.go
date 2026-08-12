@@ -517,6 +517,30 @@ func TestTranslateDropsInternalVisibilityEvents(t *testing.T) {
 	}
 }
 
+// CompactionCommitted is durable Harness bookkeeping, not an ACP update. The
+// retained suffix added by Harness is likewise runtime-owned context and must
+// not change that projection boundary.
+func TestTranslateCompactionCommittedIgnoresRetainedPayload(t *testing.T) {
+	legacy := event.CompactionCommitted{Header: testHeader(event.Public)}
+	if _, ok := newTestTranslator().Translate(legacy); ok {
+		t.Fatal("Translate(CompactionCommitted): ok = true, want false")
+	}
+
+	// Keep this regression source-compatible with the pre-retained Harness
+	// release used for the red pass. Once the additive field is present, prove a
+	// non-empty retained graph is ignored just like the legacy event.
+	withRetained := legacy
+	retainedField := reflect.ValueOf(&withRetained).Elem().FieldByName("Retained")
+	if !retainedField.IsValid() {
+		t.Log("Harness CompactionCommitted has no Retained field; legacy projection is unchanged")
+		return
+	}
+	retainedField.Set(reflect.ValueOf(content.AgenticMessages{userMessage("retained context")}))
+	if _, ok := newTestTranslator().Translate(withRetained); ok {
+		t.Fatal("Translate(CompactionCommitted with Retained): ok = true, want false")
+	}
+}
+
 // Confirms the Public case is not simply "always true" by construction: the
 // exact same event shape, differing only in Visibility, must translate.
 func TestTranslatePublicVisibilityCounterpartStillTranslates(t *testing.T) {

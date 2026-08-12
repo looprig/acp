@@ -10,7 +10,7 @@ tool (
 
 require (
 	github.com/looprig/core v0.5.1
-	github.com/looprig/harness v0.24.2
+	github.com/looprig/harness v0.25.0
 )
 
 require (
@@ -34,7 +34,7 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
-	github.com/looprig/inference v0.9.2 // indirect
+	github.com/looprig/inference v0.10.0 // indirect
 	github.com/looprig/storage v0.3.1 // indirect
 	github.com/openai/openai-go/v3 v3.50.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
