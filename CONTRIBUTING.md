@@ -68,7 +68,7 @@ make build     # boundary + CGO_ENABLED=0 go build -trimpath ./...
 make test      # boundary + go test -race ./...           (always -race)
 make secure    # lint + vuln:
                #   lint = boundary + fmt-check + go vet + staticcheck + gosec
-               #   vuln = vendor-check + go mod verify + govulncheck
+               #   vuln = go mod verify + govulncheck
 ```
 
 Two targets are specific to this repo beyond the usual `fmt`/`test`/`lint`/
@@ -77,7 +77,7 @@ Two targets are specific to this repo beyond the usual `fmt`/`test`/`lint`/
 - `make root-check` — fails if any `.go` file (or symlink) lives directly in
   the repository root; packages must live below it. Run automatically as
   part of `make boundary`.
-- `make boundary` — runs `root-check` and `vendor-check`, then runs the
+- `make boundary` — runs `root-check`, then runs the
   dependency/boundary test suite (`internal/boundary`, matching
   `Dependencies|Boundaries|Public|Scan`) that enforces the module's import
   and API-surface rules. As `protocol`, `transport/stdio`, `client`, and
@@ -88,10 +88,14 @@ Build with `CGO_ENABLED=0 go build -trimpath ./...` so binaries never leak
 local paths. Fuzz any code that parses untrusted wire or transcript data:
 `go test -fuzz=FuzzXxx ./path/to/pkg -fuzztime=30s`.
 
-The module **vendors** its dependency tree. Do not run `go get` casually;
-`make vendor` refreshes `vendor/`, scrubs VCS metadata only from the
-declared local Harness and Core replacements, and `make vendor-check`
-rejects any remaining embedded `.git` metadata.
+**Dependencies are pinned, not vendored.** `go.mod` pins exact versions and
+`go.sum` verifies their content hashes, which is what makes a build
+reproducible. This module deliberately has no `vendor/`: a vendor tree is
+ignored under a `go.work` but silently satisfies a `GOWORK=off` build, so a
+stale one lets standalone verification pass against the vendored copy rather
+than the version `go.mod` actually pins — defeating the purpose of verifying
+standalone. Run `GOWORK=off go test ./...` to check this module against its
+real pinned dependencies. Do not run `go get` casually.
 
 ## Tests
 

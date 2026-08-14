@@ -28,6 +28,9 @@
 # Claude Code project settings
 .claude/
 
-# The vendored dependency tree is committed in full and built offline. Keep this
-# negation last so broader artifact and secret patterns cannot omit vendor files.
-!/vendor/**
+# This module does not vendor. go.mod pins exact versions and go.sum verifies
+# their content hashes; a vendor tree would add only offline builds and
+# source-level dependency diffs, at the cost of masking which version a
+# GOWORK=off build actually resolves. Ignored so a stray `go mod vendor` cannot
+# be committed by accident.
+/vendor/

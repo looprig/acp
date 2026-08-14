@@ -99,11 +99,15 @@ invalid-input, cancellation, cleanup, and malformed-protocol-input paths. Code
 that parses untrusted wire or transcript data needs a fuzz target; run fuzzing
 with an explicit bound such as `-fuzztime=30s`.
 
-Commit `vendor/` and build, test, lint, and scan from it. `make vendor` refreshes
-the tree, scrubs VCS metadata only from the declared local Harness and Core
-replacements, and rejects any remaining embedded `.git` metadata. Never broaden
-the scrub to hide undeclared metadata.
+**Dependencies are pinned, not vendored.** `go.mod` pins exact versions and
+`go.sum` verifies their content hashes, which is what makes a build reproducible.
+This module deliberately has no `vendor/`: a vendor tree is ignored under a
+`go.work` but silently satisfies a `GOWORK=off` build, so a stale one lets
+standalone verification pass against the vendored copy rather than the version
+`go.mod` actually pins — defeating the purpose of verifying standalone. Run
+`GOWORK=off go test ./...` to check this module against its real pinned
+dependencies.
 
 Run `make secure` before each commit. It enforces the root-package boundary,
-formatting, vendor integrity, `go vet`, staticcheck, gosec, module verification,
+formatting, `go vet`, staticcheck, gosec, module verification,
 and govulncheck. Do not weaken or skip a failed check; diagnose the cause.
