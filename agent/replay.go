@@ -181,6 +181,24 @@ func (st *replayState) appendAssistantChunk(hdr event.Header, thought bool, text
 	})
 }
 
+// appendRefusalChunk records one refusal from the current turn's assistant
+// content. It mirrors appendAssistantChunk's non-thought path but stamps the
+// chunk's own _meta with the refusal marker, so a reloaded session reports the
+// turn as declined rather than as an ordinary answer — or, if the refusal were
+// dropped as it was before, as no answer at all. See refusalChunkMeta.
+func (st *replayState) appendRefusalChunk(hdr event.Header, text string) {
+	id := formatMessageID(st.sessionID, hdr.LoopID, st.currentTurnID, st.msgSeq.next(false))
+	st.assistantMessages = append(st.assistantMessages, protocol.SessionNotification{
+		SessionID: st.sessionID,
+		Update: protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{
+			Content:   protocol.ContentBlock{Text: &protocol.TextContent{Text: text}},
+			MessageID: &id,
+			Meta:      refusalChunkMeta(),
+		}},
+		Meta: replayMeta(hdr.EventID),
+	})
+}
+
 // appendToolCall records one already-resolved tool call: replay only ever
 // observes a tool call after StepDone commits it, so — unlike the live
 // translator's two-phase ToolCallStarted/ToolCallCompleted — there is no
@@ -211,8 +229,8 @@ func (st *replayState) appendToolCall(hdr event.Header, call *content.ToolUseBlo
 // appendStepDone walks one StepDone's Messages: content.AgenticMessages
 // documented as "the step's single AIMessage followed by its
 // ToolResultMessages" (event.go). Each AIMessage content block becomes
-// either an assistant/thought chunk (TextBlock/ThinkingBlock) or a pending
-// tool call awaiting its result (ToolUseBlock); each ToolResultMessage
+// either an assistant/thought chunk (TextBlock/RefusalBlock/ThinkingBlock) or
+// a pending tool call awaiting its result (ToolUseBlock); each ToolResultMessage
 // resolves the pending call with the matching ToolUseID and appends the
 // completed tool_call update. A ToolUseBlock with no matching
 // ToolResultMessage in this same StepDone is left unresolved and dropped:
@@ -229,6 +247,8 @@ func (st *replayState) appendStepDone(hdr event.Header, messages content.Agentic
 				switch block := b.(type) {
 				case *content.TextBlock:
 					st.appendAssistantChunk(hdr, false, block.Text)
+				case *content.RefusalBlock:
+					st.appendRefusalChunk(hdr, block.Text)
 				case *content.ThinkingBlock:
 					st.appendAssistantChunk(hdr, true, block.Thinking)
 				case *content.ToolUseBlock:

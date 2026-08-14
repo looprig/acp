@@ -132,8 +132,13 @@ func (t *liveTranslator) Translate(ev event.Event) (protocol.SessionNotification
 // translateTokenDelta classifies e.Chunk — the distinction between a text
 // and thinking update is not a field on TokenDelta itself, it lives in the
 // chunk's concrete type — into an agent_message_chunk or agent_thought_chunk
-// update. A ToolUseChunk (or any future Chunk variant) reports ok=false: ACP
-// has no streaming tool-argument-delta update to represent it as.
+// update. A ToolUseChunk reports ok=false: ACP has no streaming
+// tool-argument-delta update to represent it as. An ImageChunk likewise
+// reports ok=false, and deliberately so rather than as an image content
+// block: an ImageChunk is a byte FRAGMENT of one image (see its doc in
+// core/content), so forwarding a single delta as a standalone ACP image would
+// emit a truncated, undecodable payload; the client receives the image from
+// the step's completed ImageBlock instead.
 func (t *liveTranslator) translateTokenDelta(e event.TokenDelta) (protocol.SessionUpdate, bool) {
 	switch c := e.Chunk.(type) {
 	case *content.TextChunk:
@@ -141,6 +146,13 @@ func (t *liveTranslator) translateTokenDelta(e event.TokenDelta) (protocol.Sessi
 		return protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{
 			Content:   protocol.ContentBlock{Text: &protocol.TextContent{Text: c.Text}},
 			MessageID: &id,
+		}}, true
+	case *content.RefusalChunk:
+		id := t.messageID(false)
+		return protocol.SessionUpdate{AgentMessageChunk: &protocol.ContentChunk{
+			Content:   protocol.ContentBlock{Text: &protocol.TextContent{Text: c.Text}},
+			MessageID: &id,
+			Meta:      refusalChunkMeta(),
 		}}, true
 	case *content.ThinkingChunk:
 		id := t.messageID(true)
@@ -151,6 +163,29 @@ func (t *liveTranslator) translateTokenDelta(e event.TokenDelta) (protocol.Sessi
 	default:
 		return protocol.SessionUpdate{}, false
 	}
+}
+
+// chunkMeta is the wire shape stamped into an individual content chunk's own
+// _meta object, distinct from updateMeta, which describes the notification
+// carrying it. refusal marks a chunk whose text is the model DECLINING rather
+// than answering.
+type chunkMeta struct {
+	Refusal bool `json:"refusal,omitempty"`
+}
+
+// refusalChunkMeta marks an agent_message_chunk as a refusal. ACP has no
+// refusal content type, so the model's stated reason for declining either
+// travels as text or does not travel at all — and dropping it is the worse
+// failure, because a structured-output refusal arrives with no text parts at
+// all, leaving the client to render an empty answer for a turn the model
+// actively refused. The marker rides in the chunk's own _meta, the same
+// extensibility seam updateMeta.isReplay uses, so a capable client can render
+// "declined" while an unaware client still shows the refusal prose.
+//
+// json.Marshal cannot fail here: chunkMeta is a single bool.
+func refusalChunkMeta() json.RawMessage {
+	raw, _ := json.Marshal(chunkMeta{Refusal: true})
+	return raw
 }
 
 // messageID returns the deterministic message id for the current run of

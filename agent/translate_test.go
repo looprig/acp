@@ -96,6 +96,48 @@ func TestTranslateTokenDeltaThinkingChunk(t *testing.T) {
 	}
 }
 
+// A refusal reaches the client as an agent_message_chunk marked refusal in the
+// chunk's own _meta. ACP has no refusal content type, and dropping the chunk
+// would show an empty answer for a turn the model declined.
+func TestTranslateTokenDeltaRefusalChunk(t *testing.T) {
+	tr := newTestTranslator()
+	ev := event.TokenDelta{
+		Header: testHeader(event.Public),
+		Chunk:  &content.RefusalChunk{Text: "I cannot help with that."},
+	}
+
+	got, ok := tr.Translate(ev)
+	if !ok {
+		t.Fatal("Translate(refusal chunk): ok = false, want true")
+	}
+
+	want := `{"sessionId":"11111111-1111-4111-8111-111111111111",` +
+		`"update":{"_meta":{"refusal":true},` +
+		`"content":{"text":"I cannot help with that.","type":"text"},` +
+		`"messageId":"msg:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222:33333333-3333-4333-8333-333333333333:0",` +
+		`"sessionUpdate":"agent_message_chunk"},` +
+		wantMeta + `}`
+
+	if gotJSON := mustMarshal(t, got); gotJSON != want {
+		t.Errorf("Translate(refusal chunk) JSON =\n%s\nwant:\n%s", gotJSON, want)
+	}
+}
+
+// An ImageChunk is a byte fragment of one image, so there is no correct
+// standalone ACP image content block to emit for it; the completed ImageBlock
+// carries the image instead.
+func TestTranslateTokenDeltaImageChunkDropped(t *testing.T) {
+	tr := newTestTranslator()
+	ev := event.TokenDelta{
+		Header: testHeader(event.Public),
+		Chunk:  &content.ImageChunk{MediaType: content.MediaTypeImagePNG, Source: content.ImageSource{Data: []byte{1, 2, 3}}},
+	}
+
+	if _, ok := tr.Translate(ev); ok {
+		t.Fatal("Translate(image chunk): ok = true, want false (a fragment is not a renderable image)")
+	}
+}
+
 // ToolUseChunk is not called out by the design's mapping table (only text
 // and thinking chunks are); ACP has no streaming tool-argument-delta update
 // to represent it as, so it must be dropped, not guessed.

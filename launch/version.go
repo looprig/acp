@@ -199,7 +199,7 @@ func classifyCodexVersion(ctx context.Context, raw string, runErr error) CodexVe
 	if raw == "" {
 		return CodexVersionResult{Class: CodexVersionLegacyNoVersion, Raw: raw}
 	}
-	version, ok := parseCodexVersion(raw)
+	version, ok := ParseCodexVersion(raw)
 	if !ok {
 		return CodexVersionResult{Class: CodexVersionUnparseable, Raw: raw}
 	}
@@ -209,7 +209,7 @@ func classifyCodexVersion(ctx context.Context, raw string, runErr error) CodexVe
 	return CodexVersionResult{Class: CodexVersionModern, Version: version, Raw: raw}
 }
 
-// parseCodexVersion parses codex-acp's own "--version" output: package name
+// ParseCodexVersion parses codex-acp's own "--version" output: package name
 // and dotted version separated by whitespace, e.g.
 // "@agentclientprotocol/codex-acp 1.1.7" (the reference shape this
 // connector's contract was verified against -- see the design doc). The
@@ -217,7 +217,15 @@ func classifyCodexVersion(ctx context.Context, raw string, runErr error) CodexVe
 // exactly three non-negative, all-digit, dot-separated components. Partial
 // versions ("1.2") and prerelease/build tags ("1.2.0-rc1") both fail
 // closed as unparseable rather than being optimistically accepted.
-func parseCodexVersion(raw string) (CodexVersion, bool) {
+//
+// A bare dotted version ("1.1.7") -- the shape codex-acp reports in its ACP
+// initialize response's agentInfo.version, rather than on stdout -- parses
+// identically, because it is its own last whitespace-separated field. This
+// is exported so a caller gating behavior on an adapter-advertised version
+// (see foreignloops' ACP steering capability gate) reuses exactly this
+// strict, fail-closed parse instead of introducing a second, laxer version
+// comparison scheme.
+func ParseCodexVersion(raw string) (CodexVersion, bool) {
 	fields := strings.Fields(raw)
 	if len(fields) == 0 {
 		return CodexVersion{}, false

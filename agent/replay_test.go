@@ -234,6 +234,46 @@ func TestBuildReplayNotificationsNoDuplication(t *testing.T) {
 	}
 }
 
+// TestBuildReplayNotificationsCarriesRefusalBlocks pins that a reloaded
+// session still reports a declined turn. A RefusalBlock has no ACP content
+// type, so it replays as an agent_message_chunk marked refusal in the chunk's
+// own _meta; dropping it, as replay did before, left the client showing the
+// turn as unanswered.
+func TestBuildReplayNotificationsCarriesRefusalBlocks(t *testing.T) {
+	events := []event.Event{
+		event.TurnStarted{Header: replayHeader(replayTurn0ID, replayTurnStartedEventID, event.Public), TurnIndex: 0, Message: userMessage("do the thing")},
+		event.StepDone{
+			Header: replayHeader(replayTurn0ID, replayStepAEventID, event.Public),
+			Messages: content.AgenticMessages{
+				&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
+					&content.RefusalBlock{Text: "I will not do that."},
+				}}},
+			},
+		},
+	}
+
+	cur := newFakeEventCursor(events...)
+	got, err := buildReplayNotifications(context.Background(), testWireSessionID, cur, 0)
+	if err != nil {
+		t.Fatalf("buildReplayNotifications: %v", err)
+	}
+
+	var refusals int
+	for _, n := range got {
+		chunk := n.Update.AgentMessageChunk
+		if chunk == nil || chunk.Content.Text == nil || chunk.Content.Text.Text != "I will not do that." {
+			continue
+		}
+		refusals++
+		if string(chunk.Meta) != `{"refusal":true}` {
+			t.Errorf("refusal chunk _meta = %s, want {\"refusal\":true}", chunk.Meta)
+		}
+	}
+	if refusals != 1 {
+		t.Fatalf("refusal chunks = %d, want exactly 1", refusals)
+	}
+}
+
 // --- visibility defense in depth: a violating fake replayer ----------------
 
 // TestBuildReplayNotificationsSkipsInternalEventsEvenFromAViolatingReplayer

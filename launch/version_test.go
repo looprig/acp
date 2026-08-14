@@ -231,3 +231,38 @@ func TestCodexVersionLessOrdersMajorMinorPatch(t *testing.T) {
 		}
 	}
 }
+
+// TestParseCodexVersionAcceptsBareAdvertisedVersion pins the exported parse
+// against the second shape it now serves: the bare dotted version an ACP
+// adapter reports in agentInfo.version, with no package-name prefix. The
+// same strictness must hold there -- a partial, prerelease, signed, or empty
+// value fails closed so a caller gating behavior on it cannot fall through.
+func TestParseCodexVersionAcceptsBareAdvertisedVersion(t *testing.T) {
+	cases := map[string]struct {
+		raw    string
+		want   CodexVersion
+		wantOK bool
+	}{
+		"bare version":        {raw: "1.1.9", want: CodexVersion{1, 1, 9}, wantOK: true},
+		"bare newer version":  {raw: "1.2.0", want: CodexVersion{1, 2, 0}, wantOK: true},
+		"prefixed version":    {raw: "@agentclientprotocol/codex-acp 1.2.0", want: CodexVersion{1, 2, 0}, wantOK: true},
+		"partial":             {raw: "1.2"},
+		"prerelease":          {raw: "1.2.0-rc1"},
+		"build metadata":      {raw: "1.2.0+build7"},
+		"signed component":    {raw: "1.2.+0"},
+		"empty":               {raw: ""},
+		"whitespace only":     {raw: "   "},
+		"too many components": {raw: "1.2.3.4"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, ok := ParseCodexVersion(c.raw)
+			if ok != c.wantOK {
+				t.Fatalf("ParseCodexVersion(%q) ok = %v, want %v", c.raw, ok, c.wantOK)
+			}
+			if ok && got != c.want {
+				t.Fatalf("ParseCodexVersion(%q) = %+v, want %+v", c.raw, got, c.want)
+			}
+		})
+	}
+}
