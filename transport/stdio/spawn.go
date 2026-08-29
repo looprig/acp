@@ -252,9 +252,7 @@ func (p *Proc) teardown() error {
 	timer := time.NewTimer(closeGrace)
 	select {
 	case <-exited:
-		if !timer.Stop() {
-			<-timer.C
-		}
+		stopTimer(timer)
 		// The leader has exited but remains unreaped, so its pid still
 		// reserves the process-group id while any surviving descendants are
 		// killed.
@@ -267,6 +265,14 @@ func (p *Proc) teardown() error {
 	}
 
 	return p.Wait()
+}
+
+// stopTimer follows the synchronous channel contract in Go 1.23 and later:
+// after Stop returns, no stale value can be received from timer.C. Draining
+// after a false return can therefore block forever when the timer already
+// expired or was stopped.
+func stopTimer(timer *time.Timer) {
+	timer.Stop()
 }
 
 func (p *Proc) processGroupID() (int, error) {
